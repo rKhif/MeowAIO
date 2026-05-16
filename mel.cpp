@@ -262,6 +262,40 @@ namespace mel
     // ============================================================================
     // W REFLECT — per-enemy spell config built lazily once heroes are loaded
     // ============================================================================
+
+    // Defaults for known champions — [Q, W, E, R]. Curated to flag projectile /
+    // targeted burst ults that Mel's W can meaningfully reflect. Self-buffs,
+    // dashes, and pure ground-AOEs are intentionally left OFF.
+    static std::array<bool, 4> reflect_defaults_for_champ(const std::string& name)
+    {
+        static const std::unordered_map<std::string, std::array<bool, 4>> table = {
+            { "Riven",       { false, false, false, true  } }, // R: Wind Slash
+            { "Karthus",     { false, false, false, true  } }, // R: Requiem
+            { "Veigar",      { false, false, false, true  } }, // R: Primordial Burst
+            { "Lux",         { false, false, false, true  } }, // R: Final Spark
+            { "Brand",       { false, false, false, true  } }, // R: Pyroclasm
+            { "Syndra",      { false, false, false, true  } }, // R: Unleashed Power
+            { "Xerath",      { false, false, false, true  } }, // R: Rite of the Arcane
+            { "Ezreal",      { false, false, false, true  } }, // R: Trueshot Barrage
+            { "MissFortune", { false, false, false, true  } }, // R: Bullet Time
+            { "Lissandra",   { false, false, false, true  } }, // R: Frozen Tomb
+            { "Vex",         { false, false, false, true  } }, // R: Shadow Surge
+            { "Caitlyn",     { false, false, false, true  } }, // R: Ace in the Hole
+            { "Jhin",        { false, false, false, true  } }, // R: Curtain Call
+            { "Jinx",        { false, false, false, true  } }, // R: Super Mega Death Rocket
+            { "Vladimir",    { false, false, false, true  } }, // R: Hemoplague
+            { "Velkoz",      { false, false, false, true  } }, // R: Life Form Disintegration Ray
+            { "Ziggs",       { false, false, false, true  } }, // R: Mega Inferno Bomb
+            { "Varus",       { false, false, false, true  } }, // R: Chain of Corruption
+            { "Ashe",        { false, false, false, true  } }, // R: Enchanted Crystal Arrow
+            { "Draven",      { false, false, false, true  } }, // R: Whirling Death
+            { "Sona",        { false, false, false, true  } }, // R: Crescendo
+            { "Hwei",        { false, false, false, true  } }, // R: Spiraling Despair
+        };
+        auto it = table.find(name);
+        return it != table.end() ? it->second : std::array<bool, 4>{ false, false, false, false };
+    }
+
     static void build_reflect_menu_if_needed()
     {
         if (s_w_reflect_built || !s_w_reflect_menu) return;
@@ -279,7 +313,9 @@ namespace mel
 
             const uint32_t nid = h->get_network_id();
             if (s_w_reflect_map.find(nid) != s_w_reflect_map.end()) continue;
-            s_w_reflect_map[nid] = { false, false, false, false };
+
+            const auto defaults = reflect_defaults_for_champ(char_name);
+            s_w_reflect_map[nid] = defaults;
 
             // Unique element key per net-id; display the champion name
             const std::string key = "e_" + std::to_string(nid);
@@ -291,7 +327,7 @@ namespace mel
                 sub->add_checkbox(
                     std::string("s") + slot_names[i],
                     std::string("Reflect ") + slot_names[i],
-                    false,
+                    defaults[i],
                     [nid, i](bool v) {
                         auto it = s_w_reflect_map.find(nid);
                         if (it != s_w_reflect_map.end()) it->second[i] = v;
@@ -755,7 +791,7 @@ namespace mel
             s_w_reflect_menu->add_slider_int("dist", "Skillshot Trigger Distance", 100, 800, 25,
                 menu::w_reflect_distance, [](int v) { menu::w_reflect_distance = v; });
             s_w_reflect_menu->add_separator();
-            s_w_reflect_menu->add_label("Per-enemy spells (auto-populated):");
+            s_w_reflect_menu->add_label("Spells");
         }
 
         // E — Solar Snare
