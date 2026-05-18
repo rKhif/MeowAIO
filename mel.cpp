@@ -444,15 +444,28 @@ namespace mel
         return d <= margin;
     }
 
-    // Estimate the incoming damage this cast will deal to us. Returns 0 if
-    // unknown (SDK has no entry / unsupported). AAs go through calc_damage
-    // with the caster's AD as the raw value.
+    // Estimate the incoming damage this cast will deal to us.
+    //   Basic AA:   base AD through calc_damage (mitigation).
+    //   Special AA: try SDK first via the cast's spell slot (headshots & friends
+    //               often have a synthetic slot in the damage table); fall back
+    //               to (base AD * 2.5) so headshot-style amps still trigger
+    //               lethal blocks when the SDK is silent.
+    //   Spell:      direct sdk::damage->get_spell_damage.
     static float estimate_incoming_damage(game_object* caster, spell_cast* cast, game_object* p)
     {
         if (!sdk::damage || !caster || !cast || !p) return 0.f;
 
-        if (cast->is_basic_attack() || cast->is_special_attack()) {
+        if (cast->is_basic_attack()) {
             const float raw = caster->get_attack_damage();
+            return sdk::damage->calc_damage(dmg_sdk::damage_type::physical, caster, p, raw);
+        }
+
+        if (cast->is_special_attack()) {
+            const int sslot = cast->get_spell_slot();
+            float dmg = sdk::damage->get_spell_damage(caster, p, sslot);
+            if (dmg > 0.f) return dmg;
+            constexpr float special_aa_safety_multiplier = 2.5f;
+            const float raw = caster->get_attack_damage() * special_aa_safety_multiplier;
             return sdk::damage->calc_damage(dmg_sdk::damage_type::physical, caster, p, raw);
         }
 
