@@ -65,6 +65,7 @@ namespace mel
         inline int  combo_e_hitchance = pred_sdk::hitchance::high;
         inline int  combo_r_min_stacks = 5;         // R when target has N+ overwhelm stacks
         inline bool combo_r_killable  = true;       // R if execute lethal regardless of stacks
+        inline int  combo_r_min_kill_pct = 100;     // R dmg must be >= X% of target EHP to execute
 
         // --- Harass ---
         inline bool harass_use_q      = true;
@@ -85,11 +86,14 @@ namespace mel
         // --- W Rebuttal (reflect specific enemy spells) ---
         inline bool w_reflect_enabled       = true;
         inline bool w_reflect_targeted_only = false;  // only react to direct-target spells
-        inline int  w_reflect_distance      = 350;    // skillshot endpoint radius (ignored when targeted_only)
+
+        // --- W Smart Modes ---
+        inline bool w_mode_block_targeted = true; // fire W on any incoming spell/AA targeted on us
+        inline bool w_mode_block_lethal   = true; // fire W when predicted post-damage HP <= threshold
+        inline int  w_lethal_hp_pct       = 15;   // threshold: trigger if (hp+shields - dmg) <= max_hp * pct/100
 
         // --- Semi E (manual hold-to-cast on best target in range) ---
         inline bool semi_e_pressed    = false;
-        inline int  semi_e_hitchance  = pred_sdk::hitchance::low;
 
         // --- Auto Q (toggle: continuously fires Q on best target in range) ---
         inline bool auto_q_enabled    = false;
@@ -98,10 +102,7 @@ namespace mel
         // --- Drawings ---
         inline bool draw_q_range      = true;
         inline bool draw_e_range      = true;
-        inline bool draw_damage_bar   = true;
         inline bool draw_r_dmg_bar    = true;
-        inline bool draw_overwhelm    = true;
-        inline bool draw_brilliance   = true;
         inline bool draw_only_ready   = false;
 
         // --- Colors (ARGB) ---
@@ -124,6 +125,7 @@ namespace mel
     void __fastcall on_update();
     void __fastcall on_draw();
     void __fastcall on_process_cast(game_object* obj, spell_cast* cast);
+    void __fastcall on_basic_attack(game_object* obj, game_object* target, spell_cast* cast);
     void __fastcall on_buff_gain(game_object* obj, buff_instance* buff);
     void __fastcall on_buff_loss(game_object* obj, buff_instance* buff);
 

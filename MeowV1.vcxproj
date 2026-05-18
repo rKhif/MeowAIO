@@ -149,6 +149,7 @@
     <ClInclude Include="..\sm_sdk.hpp" />
     <ClInclude Include="..\ts_sdk.hpp" />
     <ClInclude Include="mel.h" />
+    <ClInclude Include="mel_spell_db.hpp" />
     <ClInclude Include="orianna.h" />
     <ClInclude Include="shyvana.h" />
     <ClInclude Include="syndra.h" />

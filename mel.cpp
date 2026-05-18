@@ -1,4 +1,5 @@
 #include "mel.h"
+#include "mel_spell_db.hpp"
 
 #include <cstdio>
 #include <cmath>
@@ -28,6 +29,12 @@ namespace mel
     static menu_category*                                       s_w_reflect_menu = nullptr;
     static std::unordered_map<uint32_t, std::array<bool, 4>>    s_w_reflect_map;
     static bool                                                 s_w_reflect_built = false;
+
+    // --- W whitelist: per-enemy [Q,W,E,R,AA] "ignore by smart modes" flags ---
+    static menu_category*                                       s_w_skip_menu  = nullptr;
+    static std::unordered_map<uint32_t, std::array<bool, 5>>    s_w_skip_map;
+    static bool                                                 s_w_skip_built = false;
+    static constexpr int SKIP_IDX_AA = 4;
 
     // ============================================================================
     // SPELL VALIDATION
@@ -146,25 +153,45 @@ namespace mel
     }
 
     // ============================================================================
-    // R DAMAGE — SDK fallback (Mel is missing from the native damage table; compute
-    // from DB constants when sdk::damage returns 0). Base + AP scaling, magic dmg.
+    // R DAMAGE — Golden Eclipse: base + AP + per-stack bonus from Overwhelm.
+    //   Base:       125 / 200 / 275 + 30% AP
+    //   Per stack:  (4 / 7 / 10) + 4% AP, multiplied by current Overwhelm stacks
+    // SDK is preferred for the base (handles per-target modifiers); stack bonus
+    // is always computed manually since the SDK damage table doesn't know stacks.
+    // Both buckets are mitigated as magical.
     // ============================================================================
     static float compute_r_damage(game_object* src, game_object* tgt)
     {
         if (!src || !tgt || !sdk::damage) return 0.f;
-        float dmg = sdk::damage->get_spell_damage(src, tgt, SLOT_R);
-        if (dmg > 0.f) return dmg;
 
         auto* r = src->get_spell(SLOT_R);
         if (!r) return 0.f;
         const int lvl = r->get_level();
         if (lvl <= 0) return 0.f;
 
-        // Mel R - Golden Eclipse: base 125/200/275 + 30% AP (magic)
-        static constexpr float r_base[3] = { 125.f, 200.f, 275.f };
-        const int idx = std::clamp(lvl - 1, 0, 2);
-        const float raw = r_base[idx] + 0.30f * src->get_ability_power();
-        return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, src, tgt, raw);
+        const int   idx = std::clamp(lvl - 1, 0, 2);
+        const float ap  = src->get_ability_power();
+
+        // Base damage — prefer SDK (post-mitigation), else compute & mitigate manually.
+        float base_dmg = sdk::damage->get_spell_damage(src, tgt, SLOT_R);
+        if (base_dmg <= 0.f) {
+            static constexpr float r_base[3] = { 125.f, 200.f, 275.f };
+            const float raw = r_base[idx] + 0.30f * ap;
+            base_dmg = sdk::damage->calc_damage(dmg_sdk::damage_type::magical, src, tgt, raw);
+        }
+
+        // Per-stack bonus — Overwhelm stacks on this target.
+        const int stacks = get_overwhelm_stacks(tgt);
+        if (stacks <= 0) return base_dmg;
+
+        static constexpr float r_stack_base[3] = { 4.f, 7.f, 10.f };
+        static constexpr float r_stack_ap      = 0.04f;
+        const float stack_raw = (r_stack_base[idx] + r_stack_ap * ap)
+                              * static_cast<float>(stacks);
+        const float stack_dmg = sdk::damage->calc_damage(
+            dmg_sdk::damage_type::magical, src, tgt, stack_raw);
+
+        return base_dmg + stack_dmg;
     }
 
     // ============================================================================
@@ -338,6 +365,110 @@ namespace mel
         if (added_any) s_w_reflect_built = true;
     }
 
+    // Whitelist (per-enemy) — slots a user wants Smart Modes to NEVER react to.
+    // Built lazily once heroes are present. Does not affect the per-enemy
+    // force-on override (s_w_reflect_map) — those still fire if user enabled them.
+    static void build_skip_menu_if_needed()
+    {
+        if (s_w_skip_built || !s_w_skip_menu) return;
+        auto p = g_sdk->object_manager->get_local_player();
+        if (!p) return;
+
+        bool added_any = false;
+        for (auto* h : g_sdk->object_manager->get_heroes()) {
+            if (!h || !h->is_valid() || !h->is_hero()) continue;
+            if (h == p) continue;
+            if (h->get_team_id() == p->get_team_id()) continue;
+
+            const std::string char_name = h->get_char_name();
+            if (char_name.empty()) continue;
+
+            const uint32_t nid = h->get_network_id();
+            if (s_w_skip_map.find(nid) != s_w_skip_map.end()) continue;
+            s_w_skip_map[nid] = { false, false, false, false, false };
+
+            const std::string key = "sk_" + std::to_string(nid);
+            auto* sub = s_w_skip_menu->add_sub_category(key, char_name);
+            if (!sub) continue;
+
+            static const char* labels[5] = { "Q", "W", "E", "R", "Auto Attack" };
+            for (int i = 0; i < 5; ++i) {
+                sub->add_checkbox(
+                    std::string("s") + std::to_string(i),
+                    std::string("Ignore ") + labels[i],
+                    false,
+                    [nid, i](bool v) {
+                        auto it = s_w_skip_map.find(nid);
+                        if (it != s_w_skip_map.end()) it->second[i] = v;
+                    });
+            }
+            added_any = true;
+        }
+        if (added_any) s_w_skip_built = true;
+    }
+
+    // Perpendicular distance from point P to segment [A,B] in the XZ plane.
+    // League skillshots are effectively 2D for collision so we drop Y.
+    static float distance_point_to_segment_2d(const math::vector3& p,
+                                              const math::vector3& a,
+                                              const math::vector3& b)
+    {
+        const float dx = b.x - a.x;
+        const float dz = b.z - a.z;
+        const float len_sq = dx * dx + dz * dz;
+        if (len_sq <= 1e-3f) {
+            const float px = p.x - a.x, pz = p.z - a.z;
+            return std::sqrt(px * px + pz * pz);
+        }
+        float t = ((p.x - a.x) * dx + (p.z - a.z) * dz) / len_sq;
+        t = std::clamp(t, 0.f, 1.f);
+        const float cx = a.x + t * dx;
+        const float cz = a.z + t * dz;
+        const float ex = p.x - cx, ez = p.z - cz;
+        return std::sqrt(ex * ex + ez * ez);
+    }
+
+    // Does this cast's geometry actually hit us? Targeted on us → yes;
+    // skillshot whose line passes within margin of us → yes.
+    static bool cast_hits_player(game_object* caster, spell_cast* cast, game_object* p)
+    {
+        if (auto* tgt = cast->get_target()) {
+            if (tgt->get_network_id() == p->get_network_id()) return true;
+        }
+        // Skillshot path test — same heuristic as before.
+        constexpr float path_width = 150.f;
+        const auto start  = caster->get_position();
+        const auto end    = cast->get_end_pos();
+        const float margin = p->get_bounding_radius() + path_width;
+        const float d = distance_point_to_segment_2d(p->get_position(), start, end);
+        return d <= margin;
+    }
+
+    // Estimate the incoming damage this cast will deal to us. Returns 0 if
+    // unknown (SDK has no entry / unsupported). AAs go through calc_damage
+    // with the caster's AD as the raw value.
+    static float estimate_incoming_damage(game_object* caster, spell_cast* cast, game_object* p)
+    {
+        if (!sdk::damage || !caster || !cast || !p) return 0.f;
+
+        if (cast->is_basic_attack() || cast->is_special_attack()) {
+            const float raw = caster->get_attack_damage();
+            return sdk::damage->calc_damage(dmg_sdk::damage_type::physical, caster, p, raw);
+        }
+
+        const int slot = cast->get_spell_slot();
+        if (slot < SLOT_Q || slot > SLOT_R) return 0.f;
+        return sdk::damage->get_spell_damage(caster, p, slot);
+    }
+
+    static bool cast_w_now()
+    {
+        if (!sdk::common) return false;
+        bool ok = sdk::common->cast_spell(SLOT_W);
+        if (ok) last_spell_cast_time = g_sdk->clock_facade->get_game_time();
+        return ok;
+    }
+
     static bool try_w_reflect(game_object* caster, spell_cast* cast)
     {
         if (!menu::w_reflect_enabled) return false;
@@ -349,26 +480,64 @@ namespace mel
         if (caster == p) return false;
         if (caster->get_team_id() == p->get_team_id()) return false;
 
-        const int slot = cast->get_spell_slot();
-        if (slot < SLOT_Q || slot > SLOT_R) return false;
+        const bool is_aa = cast->is_basic_attack() || cast->is_special_attack();
+        const int  slot  = cast->get_spell_slot();
+        if (!is_aa && (slot < SLOT_Q || slot > SLOT_R)) return false;
 
-        auto it = s_w_reflect_map.find(caster->get_network_id());
-        if (it == s_w_reflect_map.end() || !it->second[slot]) return false;
-
-        // Decide if this cast affects us. Targeted-only mode skips the skillshot heuristic.
-        bool affects_us = false;
-        if (auto* tgt = cast->get_target()) {
-            if (tgt->get_network_id() == p->get_network_id()) affects_us = true;
+        // --- Per-enemy force-on override (legacy path). Only applies to
+        //     Q/W/E/R; AAs are not covered by the slot-keyed map.
+        if (!is_aa) {
+            auto it = s_w_reflect_map.find(caster->get_network_id());
+            if (it != s_w_reflect_map.end() && it->second[slot]) {
+                if (auto* tgt = cast->get_target()) {
+                    if (tgt->get_network_id() == p->get_network_id()) return cast_w_now();
+                }
+                if (!menu::w_reflect_targeted_only && cast_hits_player(caster, cast, p)) {
+                    return cast_w_now();
+                }
+            }
         }
-        if (!affects_us && !menu::w_reflect_targeted_only) {
-            const float d = p->get_position().distance(cast->get_end_pos());
-            if (d <= (float)menu::w_reflect_distance) affects_us = true;
-        }
-        if (!affects_us) return false;
 
-        bool ok = sdk::common->cast_spell(SLOT_W);
-        if (ok) last_spell_cast_time = g_sdk->clock_facade->get_game_time();
-        return ok;
+        // --- Whitelist: user said "ignore this spell from auto." Bail before
+        //     Smart Modes run. Force-on overrides above are unaffected.
+        {
+            auto sit = s_w_skip_map.find(caster->get_network_id());
+            if (sit != s_w_skip_map.end()) {
+                const int idx = is_aa ? SKIP_IDX_AA : slot;
+                if (sit->second[idx]) return false;
+            }
+        }
+
+        // --- Smart Mode 1: Block targeted spells/AAs aimed at us.
+        //     Targeted casts always hit, so no geometry check needed.
+        auto* tgt = cast->get_target();
+        const bool targets_us = tgt && tgt->get_network_id() == p->get_network_id();
+        if (menu::w_mode_block_targeted && targets_us) return cast_w_now();
+
+        // --- Smart Mode 2: Block lethal — predicted HP after damage falls
+        //     to or below the configured threshold (% of max HP).
+        if (menu::w_mode_block_lethal && cast_hits_player(caster, cast, p)) {
+            const float dmg = estimate_incoming_damage(caster, cast, p);
+            if (dmg > 0.f) {
+                const float threshold = p->get_max_hp()
+                    * (static_cast<float>(menu::w_lethal_hp_pct) / 100.f);
+                const float post = (p->get_hp() + p->get_all_shield()) - dmg;
+                if (post <= threshold) return cast_w_now();
+            }
+        }
+
+        return false;
+    }
+
+    // R is global and hits any Overwhelmed enemy regardless of vision/targetability.
+    // Use a relaxed filter that only excludes dead / same-team heroes.
+    static bool is_r_eligible(game_object* h)
+    {
+        if (!h || !h->is_valid() || h->is_dead() || !h->is_hero()) return false;
+        auto p = g_sdk->object_manager->get_local_player();
+        if (!p) return false;
+        if (h->get_team_id() == p->get_team_id()) return false;
+        return true;
     }
 
     static bool try_r()
@@ -380,27 +549,42 @@ namespace mel
         auto p = g_sdk->object_manager->get_local_player();
         if (!p) return false;
 
-        // Killable check first — execute any enemy whose HP <= R damage from their stacks
+        // Killable check — execute the lowest-EHP killable target. Walking the full
+        // list and picking the lowest avoids being dependent on get_heroes() ordering
+        // when multiple enemies are simultaneously killable.
+        // Kill confidence: require R damage >= EHP * (min_kill_pct/100). Defaults to
+        // 100% (exact lethal); raise the menu value for a safety margin against
+        // mid-cast heals / shields.
         if (menu::combo_r_killable && sdk::damage) {
+            const float kill_ratio = static_cast<float>(menu::combo_r_min_kill_pct) / 100.f;
+            game_object* best_kill = nullptr;
+            float        best_ehp  = FLT_MAX;
             for (auto* h : g_sdk->object_manager->get_heroes()) {
-                if (!is_valid_target(h)) continue;
+                if (!is_r_eligible(h)) continue;
                 const int stacks = get_overwhelm_stacks(h);
                 if (stacks <= 0) continue;
                 if (venplus::utility::has_anti_burst_buff(h)) continue;
                 const float dmg = compute_r_damage(p, h);
                 const float ehp = h->get_hp() + h->get_all_shield();
-                if (dmg >= ehp) {
-                    bool ok = sdk::common->cast_spell(SLOT_R);
-                    if (ok) last_spell_cast_time = g_sdk->clock_facade->get_game_time();
-                    return ok;
+                if (dmg >= ehp * kill_ratio && ehp < best_ehp) {
+                    best_kill = h;
+                    best_ehp  = ehp;
                 }
+            }
+            if (best_kill) {
+                bool ok = sdk::common->cast_spell(SLOT_R);
+                if (ok) last_spell_cast_time = g_sdk->clock_facade->get_game_time();
+                return ok;
             }
         }
 
-        // Otherwise stack-threshold gate: best enemy must have >= min stacks
+        // Stack-threshold gate: best non-immune enemy must have >= min stacks.
+        // Skipping anti-burst-buffed targets here too — a Zhonya'd carrier with
+        // 10 stacks shouldn't make us blow R.
         int best = 0;
         for (auto* h : g_sdk->object_manager->get_heroes()) {
-            if (!is_valid_target(h)) continue;
+            if (!is_r_eligible(h)) continue;
+            if (venplus::utility::has_anti_burst_buff(h)) continue;
             best = std::max(best, get_overwhelm_stacks(h));
         }
         if (best >= menu::combo_r_min_stacks) {
@@ -448,10 +632,13 @@ namespace mel
         const float now = g_sdk->clock_facade->get_game_time();
         if (now - last_spell_cast_time < MIN_SPELL_DELAY) return;
 
+        // R is global — try before the in-range target gate so we can still
+        // execute a stacked enemy who's far away or in fog.
+        if (menu::combo_use_r && try_r()) return;
+
         auto* target = pick_hero_target(spell_data::e_range);
         if (!target) return;
 
-        if (menu::combo_use_r && try_r()) return;
         if (handle_eq_chain()) return;
 
         if (menu::combo_use_e && try_e(target, menu::combo_e_hitchance)) return;
@@ -537,6 +724,7 @@ namespace mel
         if (!p || p->is_dead()) return;
 
         build_reflect_menu_if_needed();
+        build_skip_menu_if_needed();
 
         // Expire brilliance stacks if past the duration
         const float now = g_sdk->clock_facade->get_game_time();
@@ -548,7 +736,7 @@ namespace mel
         // Semi E (hotkey hold) — root the best target in range, any orbwalker mode
         if (menu::semi_e_pressed && is_spell_ready(SLOT_E) && has_enough_mana(SLOT_E)) {
             if (auto* t = pick_hero_target(spell_data::e_range)) {
-                if (try_e(t, menu::semi_e_hitchance)) return;
+                if (try_e(t, pred_sdk::hitchance::low)) return;
             }
         }
 
@@ -566,22 +754,6 @@ namespace mel
         else if (sdk::orbwalker->harass()) harass();
         else if (sdk::orbwalker->clear())  clear();
         else if (sdk::orbwalker->flee())   flee();
-    }
-
-    static float get_combo_damage(game_object* target)
-    {
-        auto p = g_sdk->object_manager->get_local_player();
-        if (!p || !target || !sdk::damage) return 0.f;
-
-        float total = 0.f;
-        if (is_spell_ready(SLOT_Q)) total += sdk::damage->get_spell_damage(p, target, SLOT_Q);
-        if (is_spell_ready(SLOT_E)) total += sdk::damage->get_spell_damage(p, target, SLOT_E);
-        if (is_spell_ready(SLOT_R)) total += compute_r_damage(p, target);
-        // 2 AAs of follow-up
-        const float aa = sdk::damage->calc_damage(dmg_sdk::damage_type::physical, p, target,
-                                                  p->get_attack_damage());
-        total += aa * 2.f;
-        return total;
     }
 
     void __fastcall on_draw()
@@ -612,17 +784,7 @@ namespace mel
             if (c) draw_circle(pos, spell_data::e_range, c);
         }
 
-        // Brilliance counter above player
-        if (menu::draw_brilliance && brilliance_stacks > 0 && g_sdk->renderer) {
-            const auto screen = g_sdk->renderer->world_to_screen(pos);
-            char buf[24];
-            std::snprintf(buf, sizeof(buf), "Brilliance %d/%d",
-                brilliance_stacks, spell_data::brilliance_max_stacks);
-            g_sdk->renderer->add_text(buf, 14.f, { screen.x, screen.y - 60.f }, 1, 0xFFFFE060u);
-        }
-
-        if ((menu::draw_damage_bar || menu::draw_overwhelm || menu::draw_r_dmg_bar)
-            && sdk::damage && g_sdk->renderer) {
+        if (menu::draw_r_dmg_bar && sdk::damage && g_sdk->renderer) {
             const bool r_learned = is_spell_learned(SLOT_R);
             const float scale = (float)g_sdk->renderer->get_window_height() / 1080.f;
             const float ox = -45.6f * scale, oy = 15.5f * scale;
@@ -630,28 +792,13 @@ namespace mel
             for (auto* h : g_sdk->object_manager->get_heroes()) {
                 if (!is_valid_target(h)) continue;
 
-                if (menu::draw_damage_bar) {
-                    const float dmg = get_combo_damage(h);
-                    if (dmg > 0.f) g_sdk->renderer->add_damage_indicator(h, dmg);
-                }
-
-                if (menu::draw_overwhelm) {
-                    const int s = get_overwhelm_stacks(h);
-                    if (s > 0) {
-                        const auto hbar = h->get_health_bar_position();
-                        if (hbar.x < 1.f && hbar.y < 1.f) continue;
-                        char buf[16];
-                        std::snprintf(buf, sizeof(buf), "OVW: %d", s);
-                        g_sdk->renderer->add_text(buf, 12.f,
-                            { hbar.x, hbar.y + 18.f }, 1, menu::color_overwhelm);
-                    }
-                }
-
-                // R EXECUTE indicator — would R kill this target now?
+                // R EXECUTE indicator — would R kill this target now? Matches the
+                // try_r() kill-confidence threshold so the indicator and cast agree.
                 if (is_spell_ready(SLOT_R) && get_overwhelm_stacks(h) > 0) {
                     const float dmg = compute_r_damage(p, h);
                     const float ehp = h->get_hp() + h->get_all_shield();
-                    if (dmg >= ehp) {
+                    const float kill_ratio = static_cast<float>(menu::combo_r_min_kill_pct) / 100.f;
+                    if (dmg >= ehp * kill_ratio) {
                         const auto hbar = h->get_health_bar_position();
                         if (!(hbar.x < 1.f && hbar.y < 1.f)) {
                             g_sdk->renderer->add_text("R EXECUTE", 13.f,
@@ -681,6 +828,16 @@ namespace mel
                 }
             }
         }
+    }
+
+    void __fastcall on_basic_attack(game_object* obj, game_object* /*target*/, spell_cast* cast)
+    {
+        if (!obj || !cast) return;
+        auto p = g_sdk->object_manager->get_local_player();
+        if (!p) return;
+        if (obj->get_network_id() == p->get_network_id()) return;
+        if (obj->get_team_id() == p->get_team_id()) return;
+        try_w_reflect(obj, cast);
     }
 
     void __fastcall on_process_cast(game_object* obj, spell_cast* cast)
@@ -764,7 +921,7 @@ namespace mel
         q_menu->add_slider_int("c_min", "  Clear Min Minions", 1, 7, 1, menu::clear_q_min,
             [](int v) { menu::clear_q_min = v; });
         q_menu->add_separator();
-        q_menu->add_slider_int("c_hc", "Combo Hitchance",  0, 100, 5, menu::combo_q_hitchance,
+        q_menu->add_slider_int("c_hc", "Hitchance",  0, 100, 5, menu::combo_q_hitchance,
             [](int v) { menu::combo_q_hitchance = v; });
         q_menu->add_slider_int("h_hc", "Harass Hitchance", 0, 100, 5, menu::harass_q_hitchance,
             [](int v) { menu::harass_q_hitchance = v; });
@@ -780,19 +937,28 @@ namespace mel
         // W — Rebuttal
         auto w_menu = s_menu->add_sub_category("w_rebuttal", "W - Rebuttal");
 
-        // Reflect: per-enemy spell picker (populated lazily once heroes load)
-        s_w_reflect_menu = w_menu->add_sub_category("reflect", "Reflect Spells");
-        if (s_w_reflect_menu) {
-            s_w_reflect_menu->add_checkbox("on", "Enable Reflect", menu::w_reflect_enabled,
-                [](bool v) { menu::w_reflect_enabled = v; });
-            s_w_reflect_menu->add_checkbox("targeted_only", "Targeted Spells Only",
-                menu::w_reflect_targeted_only,
-                [](bool v) { menu::w_reflect_targeted_only = v; });
-            s_w_reflect_menu->add_slider_int("dist", "Skillshot Trigger Distance", 100, 800, 25,
-                menu::w_reflect_distance, [](int v) { menu::w_reflect_distance = v; });
-            s_w_reflect_menu->add_separator();
-            s_w_reflect_menu->add_label("Spells");
-        }
+        w_menu->add_checkbox("on", "Enable Reflect", menu::w_reflect_enabled,
+            [](bool v) { menu::w_reflect_enabled = v; });
+        w_menu->add_checkbox("targeted_only", "Force-on Overrides: Targeted Only",
+            menu::w_reflect_targeted_only,
+            [](bool v) { menu::w_reflect_targeted_only = v; });
+        w_menu->add_separator();
+        w_menu->add_checkbox("blk_targeted", "Block Targeted Spells",
+            menu::w_mode_block_targeted,
+            [](bool v) { menu::w_mode_block_targeted = v; });
+        w_menu->add_checkbox("blk_lethal", "Block Lethal",
+            menu::w_mode_block_lethal,
+            [](bool v) { menu::w_mode_block_lethal = v; });
+        w_menu->add_slider_int("lethal_hp", "  Lethal Health %", 0, 50, 1,
+            menu::w_lethal_hp_pct,
+            [](int v) { menu::w_lethal_hp_pct = v; });
+        w_menu->add_separator();
+
+        // Per-enemy override list — force W on for specific slots regardless of Smart Modes.
+        s_w_reflect_menu = w_menu->add_sub_category("reflect", "Force Reflect (per enemy)");
+
+        // Per-enemy whitelist — make Smart Modes ignore specific slots/AA per enemy.
+        s_w_skip_menu = w_menu->add_sub_category("whitelist", "Whitelist (ignore per enemy)");
 
         // E — Solar Snare
         auto e_menu = s_menu->add_sub_category("e_solar_snare", "E - Solar Snare");
@@ -809,10 +975,8 @@ namespace mel
         e_menu->add_checkbox("eq_chain", "Auto E→Q on Rooted", menu::combo_eq_chain,
             [](bool v) { menu::combo_eq_chain = v; });
         e_menu->add_separator();
-        e_menu->add_hotkey("semi_e", "Semi E (HOLD)", 'T', false, false,
+        e_menu->add_hotkey("semi_e", "Semi E", 'T', false, false,
             [](std::string*, bool pressed) { menu::semi_e_pressed = pressed; });
-        e_menu->add_slider_int("semi_hc", "  Semi E Hitchance", 0, 100, 5, menu::semi_e_hitchance,
-            [](int v) { menu::semi_e_hitchance = v; });
         e_menu->add_separator();
         e_menu->add_checkbox("draw_range", "Draw Range", menu::draw_e_range,
             [](bool v) { menu::draw_e_range = v; });
@@ -823,8 +987,10 @@ namespace mel
             [](bool v) { menu::combo_use_r = v; });
         r_menu->add_slider_int("min", "Min Overwhelm Stacks on Target", 1, 20, 1, menu::combo_r_min_stacks,
             [](int v) { menu::combo_r_min_stacks = v; });
-        r_menu->add_checkbox("kill", "R if Killable (overrides stacks)", menu::combo_r_killable,
+        r_menu->add_checkbox("kill", "R if Killable", menu::combo_r_killable,
             [](bool v) { menu::combo_r_killable = v; });
+        r_menu->add_slider_int("kill_pct", "  Min Kill %", 100, 200, 5, menu::combo_r_min_kill_pct,
+            [](int v) { menu::combo_r_min_kill_pct = v; });
 
         // Mana
         auto mana_menu = s_menu->add_sub_category("mana", "Mana Thresholds");
@@ -837,14 +1003,8 @@ namespace mel
         auto draw_menu = s_menu->add_sub_category("drawings", "Drawings");
         draw_menu->add_checkbox("only_ready", "Only Ready Spells", menu::draw_only_ready,
             [](bool v) { menu::draw_only_ready = v; });
-        draw_menu->add_checkbox("dmg",        "Combo Damage Indicator", menu::draw_damage_bar,
-            [](bool v) { menu::draw_damage_bar = v; });
         draw_menu->add_checkbox("r_dmg_bar", "R Damage Indicator", menu::draw_r_dmg_bar,
             [](bool v) { menu::draw_r_dmg_bar = v; });
-        draw_menu->add_checkbox("overwhelm",  "Overwhelm Stacks on Enemies", menu::draw_overwhelm,
-            [](bool v) { menu::draw_overwhelm = v; });
-        draw_menu->add_checkbox("brilliance", "Brilliance Counter (self)", menu::draw_brilliance,
-            [](bool v) { menu::draw_brilliance = v; });
         draw_menu->add_separator();
         draw_menu->add_colorpicker("col_q", "Q Color", menu::color_q,
             [](uint32_t c) { menu::color_q = c; });
@@ -863,6 +1023,8 @@ namespace mel
             reinterpret_cast<void*>(on_draw));
         g_sdk->event_manager->register_callback(event_manager::event::process_cast,
             reinterpret_cast<void*>(on_process_cast));
+        g_sdk->event_manager->register_callback(event_manager::event::basic_attack,
+            reinterpret_cast<void*>(on_basic_attack));
         g_sdk->event_manager->register_callback(event_manager::event::buff_gain,
             reinterpret_cast<void*>(on_buff_gain));
         g_sdk->event_manager->register_callback(event_manager::event::buff_loss,
@@ -880,6 +1042,8 @@ namespace mel
                 reinterpret_cast<void*>(on_draw));
             g_sdk->event_manager->unregister_callback(event_manager::event::process_cast,
                 reinterpret_cast<void*>(on_process_cast));
+            g_sdk->event_manager->unregister_callback(event_manager::event::basic_attack,
+                reinterpret_cast<void*>(on_basic_attack));
             g_sdk->event_manager->unregister_callback(event_manager::event::buff_gain,
                 reinterpret_cast<void*>(on_buff_gain));
             g_sdk->event_manager->unregister_callback(event_manager::event::buff_loss,
@@ -890,6 +1054,9 @@ namespace mel
         s_w_reflect_menu = nullptr;
         s_w_reflect_map.clear();
         s_w_reflect_built = false;
+        s_w_skip_menu = nullptr;
+        s_w_skip_map.clear();
+        s_w_skip_built = false;
         brilliance_stacks = 0;
         brilliance_expire = 0.f;
         eq_pending = false;
