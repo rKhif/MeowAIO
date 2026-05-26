@@ -99,6 +99,10 @@ namespace orianna
         inline int  harass_q_hitchance = pred_sdk::hitchance::medium;
         inline int  harass_mana_pct   = 40;
 
+        // --- Lasthit ---
+        inline bool lasthit_use_q     = true;
+        inline bool lasthit_use_w     = false;
+
         // --- Clear ---
         inline bool clear_use_q       = true;
         inline bool clear_use_w       = true;

@@ -431,7 +431,10 @@ namespace orianna
     {
         pred_sdk::spell_data spell{};
         spell.spell_type         = pred_sdk::spell_type::circular;
-        spell.targetting_type    = pred_sdk::targetting_type::center;
+        // center_to_edge — the AOE has a 175u effect radius, so targets near
+        // the edge of Q range are still reachable without the predictor
+        // pushing the cast point past 825u (which we'd then clamp and miss).
+        spell.targetting_type    = pred_sdk::targetting_type::center_to_edge;
         spell.spell_slot         = SLOT_Q;
         spell.range              = spell_data::q_range;
         spell.radius             = spell_data::q_radius;
@@ -795,23 +798,80 @@ namespace orianna
         // E from on_self moves nothing meaningful — line collapses to a point.
         if (g_ball_state == ball_state::on_self) return false;
 
-        // Find the ally in E range who is closest to the combo target.
-        // Fire only if that ally is within R radius of the target — this sets up
-        // a W/R play without requiring the rare e_path_clips geometry.
+        // Don't pre-empt Q. If Q is up and the combo target is in Q range, let
+        // the Q→W flow play out first — E only earns its slot when Q can't fire
+        // or won't connect.
+        const bool q_available = is_spell_ready(SLOT_Q) && has_enough_mana(SLOT_Q);
+        if (q_available && sdk::prediction
+            && p->get_position().distance(combo_target->get_position())
+               <= spell_data::q_range) {
+            auto pred = predict_q(combo_target, menu::combo_q_hitchance);
+            if (pred.is_valid && pred.hitchance >= menu::combo_q_hitchance)
+                return false;
+        }
+
+        // Score candidates (self + allies) by how much impact E will produce:
+        //   +2 if the E ball line clips the combo target (or any enemy)
+        //   +1 if the destination lands the ball within W radius of an enemy
+        // Self is a valid destination — recalling the ball back through the
+        // enemy is the classic Orianna pattern, and lets W fire on the player
+        // position immediately after E lands.
+        const float w_r = spell_data::w_effect_radius;
+        const float w_r_sq = w_r * w_r;
+
         game_object* best = nullptr;
+        int best_score = 0;
         float best_dist = FLT_MAX;
 
+        auto score_dest = [&](game_object* dest, const math::vector3& dest_pos) {
+            int score = 0;
+
+            // Line clip — prefer the combo target, but any enemy hero counts.
+            if (e_path_clips(dest_pos, combo_target)) {
+                score += 2;
+            } else {
+                for (auto* e : g_sdk->object_manager->get_heroes()) {
+                    if (!is_valid_target(e)) continue;
+                    if (e_path_clips(dest_pos, e)) { score += 2; break; }
+                }
+            }
+
+            // W follow-up: any enemy hero within W radius of the landing point?
+            for (auto* e : g_sdk->object_manager->get_heroes()) {
+                if (!is_valid_target(e)) continue;
+                const auto ep = e->get_position();
+                const float dx = ep.x - dest_pos.x;
+                const float dz = ep.z - dest_pos.z;
+                if (dx * dx + dz * dz <= w_r_sq) { score += 1; break; }
+            }
+            return score;
+        };
+
+        auto consider = [&](game_object* dest, const math::vector3& dest_pos) {
+            const int score = score_dest(dest, dest_pos);
+            if (score <= 0) return;
+            const float d = dest_pos.distance(combo_target->get_position());
+            if (score > best_score || (score == best_score && d < best_dist)) {
+                best_score = score;
+                best_dist  = d;
+                best       = dest;
+            }
+        };
+
+        // Self as a candidate (recall) — only meaningful when ball is elsewhere,
+        // which we already enforced above.
+        consider(p, p->get_position());
+
+        // Allies as candidates.
         for (auto* h : g_sdk->object_manager->get_heroes()) {
             if (!h || !h->is_valid() || h->is_dead() || !h->is_visible()) continue;
             if (h == p || h->get_team_id() != p->get_team_id()) continue;
             if (p->get_position().distance(h->get_position()) > spell_data::e_range) continue;
             if (!is_ally_shieldable(h)) continue;
-
-            const float d = h->get_position().distance(combo_target->get_position());
-            if (d < best_dist) { best_dist = d; best = h; }
+            consider(h, h->get_position());
         }
 
-        if (!best || best_dist > spell_data::r_effect_radius) return false;
+        if (!best) return false;
         return try_shield_ally_cast(best);
     }
 
@@ -829,6 +889,23 @@ namespace orianna
         game_object* best = nullptr;
         float best_pct = 1.f;
 
+        // Only shield allies that actually have an enemy hero threatening
+        // them — otherwise E gets burned on chip-damage allies (DoTs, jungle
+        // camps) who aren't in any real danger.
+        constexpr float ALLY_THREAT_RANGE = 900.f;
+        const float thr_sq = ALLY_THREAT_RANGE * ALLY_THREAT_RANGE;
+
+        auto has_enemy_near = [&](const math::vector3& pos) {
+            for (auto* e : g_sdk->object_manager->get_heroes()) {
+                if (!is_valid_target(e)) continue;
+                const auto ep = e->get_position();
+                const float dx = ep.x - pos.x;
+                const float dz = ep.z - pos.z;
+                if (dx * dx + dz * dz <= thr_sq) return true;
+            }
+            return false;
+        };
+
         for (auto* h : g_sdk->object_manager->get_heroes()) {
             if (!h || !h->is_valid() || h->is_dead() || !h->is_visible()) continue;
             if (h == p || h->get_team_id() != p->get_team_id()) continue;
@@ -837,11 +914,94 @@ namespace orianna
 
             const float pct = h->get_max_hp() > 0.f ? h->get_hp() / h->get_max_hp() : 1.f;
             if (pct >= threshold) continue;
+            if (!has_enemy_near(h->get_position())) continue;
             if (pct < best_pct) { best_pct = pct; best = h; }
         }
 
         if (!best) return false;
         return try_shield_ally_cast(best);
+    }
+
+    // ============================================================================
+    // LASTHIT
+    // ============================================================================
+    static bool try_lasthit_q()
+    {
+        if (!menu::lasthit_use_q) return false;
+        if (!sdk::common || !sdk::damage) return false;
+        if (!is_spell_ready(SLOT_Q) || !has_enough_mana(SLOT_Q)) return false;
+        if (g_ball_state == ball_state::in_transit_e) return false;
+        if (sdk::orbwalker && sdk::orbwalker->would_cancel_attack()) return false;
+
+        auto p = g_sdk->object_manager->get_local_player();
+        if (!p) return false;
+
+        const auto ppos = p->get_position();
+        const float r_sq = spell_data::q_range * spell_data::q_range;
+
+        for (auto* m : g_sdk->object_manager->get_minions()) {
+            if (!is_valid_enemy_minion(m)) continue;
+            const auto mp = m->get_position();
+            const float dx = mp.x - ppos.x;
+            const float dz = mp.z - ppos.z;
+            if (dx * dx + dz * dz > r_sq) continue;
+
+            const float dmg = sdk::damage->get_spell_damage(p, m, SLOT_Q);
+            if (dmg < m->get_hp()) continue;
+
+            // Skip minions an auto-attack will already kill — saves mana.
+            const float aa = sdk::damage->get_aa_damage(p, m);
+            if (aa >= m->get_hp() && sdk::orbwalker
+                && sdk::orbwalker->is_in_auto_attack_range(p, m)) continue;
+
+            return cast_q_at(mp);
+        }
+        return false;
+    }
+
+    static bool try_lasthit_w()
+    {
+        if (!menu::lasthit_use_w) return false;
+        if (!sdk::common || !sdk::damage) return false;
+        if (!is_spell_ready(SLOT_W) || !has_enough_mana(SLOT_W)) return false;
+        if (is_ball_in_transit()) return false;
+
+        auto p = g_sdk->object_manager->get_local_player();
+        if (!p) return false;
+
+        const auto bp = get_ball_position();
+        const float r_sq = spell_data::w_effect_radius * spell_data::w_effect_radius;
+
+        bool any_killable = false;
+        for (auto* m : g_sdk->object_manager->get_minions()) {
+            if (!is_valid_enemy_minion(m)) continue;
+            const auto mp = m->get_position();
+            const float dx = mp.x - bp.x;
+            const float dz = mp.z - bp.z;
+            if (dx * dx + dz * dz > r_sq) continue;
+
+            const float dmg = sdk::damage->get_spell_damage(p, m, SLOT_W);
+            if (dmg >= m->get_hp()) { any_killable = true; break; }
+        }
+        if (!any_killable) return false;
+
+        if (!sdk::common->cast_spell(SLOT_W)) return false;
+        last_spell_cast_time = g_sdk->clock_facade->get_game_time();
+        return true;
+    }
+
+    static void lasthit_mode()
+    {
+        auto p = g_sdk->object_manager->get_local_player();
+        if (!p || p->is_dead()) return;
+        if (is_casting()) return;
+
+        const float now = g_sdk->clock_facade->get_game_time();
+        if (now - last_spell_cast_time < MIN_SPELL_DELAY) return;
+
+        // W first (AOE) so a single cast can secure multiple minions.
+        if (try_lasthit_w()) return;
+        if (try_lasthit_q()) return;
     }
 
     // ============================================================================
@@ -862,17 +1022,17 @@ namespace orianna
 
         auto* target = pick_hero_target(spell_data::q_range);
 
-        // W fires if ball already landed on/near enemies.
-        if (menu::combo_use_w && try_w()) return;
-
-        // Q positions the ball — must come before E so E only fires once the
-        // ball is already near enemies, not on the first frame of combo press.
+        // Q first — places the ball on the enemy and does poke damage.
         if (menu::combo_use_q && target) {
             if (try_q(target, menu::combo_q_hitchance)) return;
         }
 
-        // E dispatch after W+Q — aggressive E has its own enemy-near-ball guard
-        // so it won't fire until the ball has actually landed on someone.
+        // W second — fires at the ball position (after Q, ball is on enemy).
+        if (menu::combo_use_w && try_w()) return;
+
+        // E last (Q → W → E). E either recalls the ball through enemies or
+        // sends it to an ally for an engage; only fires when it actually
+        // impacts (line clip / W follow-up). See try_combo_aggressive_e.
         const int em = menu::combo_e_mode;
         if (em == 2) {
             if (try_combo_engage_e()) return;
@@ -887,8 +1047,21 @@ namespace orianna
             if (target && try_combo_aggressive_e(target)) return;
         }
 
-        // Self-shield only when E Mode is Off — any active mode owns E in combo.
-        if (menu::combo_e_mode == 0 && menu::shield_combo_self) try_self_shield();
+        // Self-shield only when E Mode is Off, the option is on, AND there's
+        // an enemy hero close enough to threaten us. Pressing combo with no
+        // enemies nearby should not burn E on a free self-shield.
+        if (menu::combo_e_mode == 0 && menu::shield_combo_self) {
+            constexpr float SELF_SHIELD_THREAT_RANGE = 700.f;
+            const float thr_sq = SELF_SHIELD_THREAT_RANGE * SELF_SHIELD_THREAT_RANGE;
+            const auto ppos = p->get_position();
+            for (auto* h : g_sdk->object_manager->get_heroes()) {
+                if (!is_valid_target(h)) continue;
+                const auto hp = h->get_position();
+                const float dx = hp.x - ppos.x;
+                const float dz = hp.z - ppos.z;
+                if (dx * dx + dz * dz <= thr_sq) { try_self_shield(); break; }
+            }
+        }
     }
 
     void harass()
@@ -900,8 +1073,6 @@ namespace orianna
 
         const float now = g_sdk->clock_facade->get_game_time();
         if (now - last_spell_cast_time < MIN_SPELL_DELAY) return;
-
-        if (menu::harass_use_w && try_w()) return;
 
         auto* target = pick_hero_target(spell_data::q_range);
         if (menu::harass_use_q && target) {
@@ -993,16 +1164,29 @@ namespace orianna
     {
         auto p = g_sdk->object_manager->get_local_player();
         if (!p) return;
-        const auto bp = get_ball_position();
 
-        if (menu::flee_use_w && is_spell_ready(SLOT_W) && has_enough_mana(SLOT_W)
-            && p->get_position().distance(bp) <= spell_data::w_effect_radius) {
-            sdk::common->cast_spell(SLOT_W);
+        // E first — recall the ball to self so W's MS field lands on us, not
+        // wherever the ball was sitting (otherwise W's haste is wasted).
+        const bool e_ready = menu::flee_use_e
+                          && is_spell_ready(SLOT_E)
+                          && has_enough_mana(SLOT_E)
+                          && !e_recently_cast();
+        const bool ball_recallable = g_ball_state != ball_state::on_self
+                                  && !is_ball_in_transit();
+        if (e_ready && ball_recallable) {
+            if (sdk::common->cast_spell(SLOT_E, p)) {
+                stamp_e_cast();
+                return;
+            }
         }
 
-        if (menu::flee_use_e && is_spell_ready(SLOT_E) && has_enough_mana(SLOT_E)
-            && g_ball_state != ball_state::on_self && !is_ball_in_transit()) {
-            sdk::common->cast_spell(SLOT_E, p);
+        // W only when the ball is on us (or arriving) — otherwise the haste
+        // field lands at the ball, not at the player, and gets wasted.
+        if (menu::flee_use_w && is_spell_ready(SLOT_W) && has_enough_mana(SLOT_W)
+            && !is_ball_in_transit()
+            && g_ball_state == ball_state::on_self) {
+            if (sdk::common->cast_spell(SLOT_W))
+                last_spell_cast_time = g_sdk->clock_facade->get_game_time();
         }
     }
 
@@ -1031,6 +1215,7 @@ namespace orianna
         else if (sdk::orbwalker->harass())     harass();
         else if (sdk::orbwalker->fast_clear()) fast_clear();
         else if (sdk::orbwalker->clear())      clear();
+        else if (sdk::orbwalker->lasthit())    lasthit_mode();
         else if (sdk::orbwalker->flee())       flee();
     }
 
@@ -1048,23 +1233,20 @@ namespace orianna
             else if (g_sdk->renderer) g_sdk->renderer->add_circle_3d(c, r, 2.f, clr);
         };
 
+        auto draw_circle_rgb = [&](math::vector3 const& c, float r, uint32_t clr) {
+            if (sdk::shaders) {
+                sdk::shaders->draw_world_circle(c, r, 2.f, clr,
+                    shaders_sdk::world_circle_style::rgb);
+            } else {
+                draw_circle(c, r, clr);
+            }
+        };
+
         auto get_draw_color = [&](int slot, uint32_t clr) -> uint32_t {
             auto sp = p->get_spell(slot);
             if (!sp || sp->get_level() == 0) return 0u;
             if (menu::draw_only_ready && sp->get_cooldown() > 0.f) return 0u;
             return sp->get_cooldown() <= 0.f ? clr : ((clr & 0x00FFFFFFu) | 0x40000000u);
-        };
-
-        // RGB rainbow — three sin waves 120° out of phase, ~3.1s period.
-        auto rainbow_color = [&]() -> uint32_t {
-            const float t = g_sdk->clock_facade->get_game_time() * 2.f;
-            auto wave = [](float x) {
-                return (uint32_t)((std::sin(x) * 0.5f + 0.5f) * 255.f);
-            };
-            const uint32_t r = wave(t);
-            const uint32_t g = wave(t + 2.0944f);  // +120°
-            const uint32_t b = wave(t + 4.1888f);  // +240°
-            return 0xFF000000u | (r << 16) | (g << 8) | b;
         };
 
         if (menu::draw_q_range) {
@@ -1076,23 +1258,22 @@ namespace orianna
             if (c) draw_circle(ppos, spell_data::e_range, c);
         }
         if (menu::draw_w_range) {
-            const uint32_t base = menu::draw_w_rgb ? rainbow_color() : menu::color_w;
-            const uint32_t cw = get_draw_color(SLOT_W, base);
+            const uint32_t cw = get_draw_color(SLOT_W, menu::color_w);
             if (cw) {
                 // Draw W where it would actually land:
                 //   ball on self  → at the player
                 //   ball mid-flight from Q / on ground / on ally → at the ball
-                if (g_ball_state == ball_state::on_self) {
-                    draw_circle(ppos, spell_data::w_effect_radius, cw);
-                } else {
-                    draw_circle(bp, spell_data::w_effect_radius, cw);
-                }
+                const auto& wpos = (g_ball_state == ball_state::on_self) ? ppos : bp;
+                if (menu::draw_w_rgb) draw_circle_rgb(wpos, spell_data::w_effect_radius, cw);
+                else                  draw_circle    (wpos, spell_data::w_effect_radius, cw);
             }
         }
         if (menu::draw_r_range) {
-            const uint32_t base = menu::draw_r_rgb ? rainbow_color() : menu::color_r;
-            const uint32_t cr = get_draw_color(SLOT_R, base);
-            if (cr) draw_circle(bp, spell_data::r_effect_radius, cr);
+            const uint32_t cr = get_draw_color(SLOT_R, menu::color_r);
+            if (cr) {
+                if (menu::draw_r_rgb) draw_circle_rgb(bp, spell_data::r_effect_radius, cr);
+                else                  draw_circle    (bp, spell_data::r_effect_radius, cr);
+            }
         }
 
         // Auto Q / Auto R / E Mode indicators stacked above the player
@@ -1333,6 +1514,8 @@ namespace orianna
         q_menu->add_checkbox("harass", "Use in Harass", menu::harass_use_q, [](bool v) { menu::harass_use_q = v; });
         q_menu->add_checkbox("ks_q", "Killsteal", menu::ks_use_q,
             [](bool v) { menu::ks_use_q = v; });
+        q_menu->add_checkbox("lasthit", "Use in Lasthit", menu::lasthit_use_q,
+            [](bool v) { menu::lasthit_use_q = v; });
         q_menu->add_checkbox("clear",  "Use in Clear",  menu::clear_use_q,  [](bool v) { menu::clear_use_q = v; });
         q_menu->add_slider_int("clr_min", "  Clear Min Minions", 1, 6, 1, menu::clear_q_min,
             [](int v) { menu::clear_q_min = v; });
@@ -1359,6 +1542,8 @@ namespace orianna
             [](bool v) { menu::auto_w_enabled = v; });
         w_menu->add_checkbox("flee", "Use in Flee", menu::flee_use_w,
             [](bool v) { menu::flee_use_w = v; });
+        w_menu->add_checkbox("lasthit", "Use in Lasthit", menu::lasthit_use_w,
+            [](bool v) { menu::lasthit_use_w = v; });
         w_menu->add_checkbox("clear",  "Use in Clear",  menu::clear_use_w,  [](bool v) { menu::clear_use_w = v; });
         w_menu->add_slider_int("c_min", "  Clear Min Minions", 1, 7, 1, menu::clear_w_min,
             [](int v) { menu::clear_w_min = v; });

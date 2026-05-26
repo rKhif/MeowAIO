@@ -2507,16 +2507,30 @@ namespace viktor
         math::vector3 fp = pred.first_cast_position;
         math::vector3 cp = pred.cast_position;
 
-        if (ppos.distance(fp) > first_click)
-            fp = ppos + (fp - ppos).to_direction() * first_click;
-
-        const auto beam_dir = (cp - fp).to_direction();
-        const float beam_dir_sq = beam_dir.x * beam_dir.x + beam_dir.z * beam_dir.z;
+        auto beam_dir = (cp - fp).to_direction();
+        float beam_dir_sq = beam_dir.x * beam_dir.x + beam_dir.z * beam_dir.z;
         if (beam_dir_sq < 0.01f)
         {
-            log_e("[E] reject: zero beam dir tgt=%s", target->get_char_name().c_str());
-            return false;
+            // Fall back to ppos -> predicted target direction.
+            beam_dir = (pred.predicted_position - ppos).to_direction();
+            beam_dir_sq = beam_dir.x * beam_dir.x + beam_dir.z * beam_dir.z;
+            if (beam_dir_sq < 0.01f)
+            {
+                log_e("[E] reject: zero beam dir tgt=%s", target->get_char_name().c_str());
+                return false;
+            }
         }
+
+        // Reposition FP along beam_dir so the predicted target sits inside the
+        // beam segment. SDK sometimes returns FP near the player, making the
+        // beam fall short when target is past first_click. Center the target
+        // within the beam, clamped to [0, first_click].
+        const auto& pp_pred = pred.predicted_position;
+        const float tgt_t = (pp_pred.x - ppos.x) * beam_dir.x
+                          + (pp_pred.z - ppos.z) * beam_dir.z;
+        const float ideal_fp_dist = tgt_t - beam_len * 0.5f;
+        const float fp_dist = std::clamp(ideal_fp_dist, 0.f, first_click);
+        fp = ppos + beam_dir * fp_dist;
 
         // Re-extend CP from FP so the beam length is exact.
         cp = fp + beam_dir * beam_len;
