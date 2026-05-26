@@ -795,24 +795,24 @@ namespace orianna
         // E from on_self moves nothing meaningful — line collapses to a point.
         if (g_ball_state == ball_state::on_self) return false;
 
-        // Self first.
-        if (e_path_clips(p->get_position(), combo_target)) {
-            const bool ok = sdk::common->cast_spell(SLOT_E, p);
-            if (ok) stamp_e_cast();
-            return ok;
-        }
+        // Find the ally in E range who is closest to the combo target.
+        // Fire only if that ally is within R radius of the target — this sets up
+        // a W/R play without requiring the rare e_path_clips geometry.
+        game_object* best = nullptr;
+        float best_dist = FLT_MAX;
 
-        // Then allies (filter by per-ally checkbox).
         for (auto* h : g_sdk->object_manager->get_heroes()) {
             if (!h || !h->is_valid() || h->is_dead() || !h->is_visible()) continue;
             if (h == p || h->get_team_id() != p->get_team_id()) continue;
             if (p->get_position().distance(h->get_position()) > spell_data::e_range) continue;
             if (!is_ally_shieldable(h)) continue;
 
-            if (e_path_clips(h->get_position(), combo_target))
-                return try_shield_ally_cast(h);
+            const float d = h->get_position().distance(combo_target->get_position());
+            if (d < best_dist) { best_dist = d; best = h; }
         }
-        return false;
+
+        if (!best || best_dist > spell_data::r_effect_radius) return false;
+        return try_shield_ally_cast(best);
     }
 
     static bool try_shield_ally()
@@ -857,23 +857,27 @@ namespace orianna
         const float now = g_sdk->clock_facade->get_game_time();
         if (now - last_spell_cast_time < MIN_SPELL_DELAY) return;
 
-        if (menu::shield_combo_self) try_self_shield();
-
         if (menu::combo_use_r && !is_ball_in_transit() && try_r())
             return;
 
-        // Pick combo target up front — needed by aggressive E and Q.
         auto* target = pick_hero_target(spell_data::q_range);
 
-        // Combo E mode dispatch: 0=Off, 1=Aggressive, 2=Engage, 3=Smart
+        // W fires if ball already landed on/near enemies.
+        if (menu::combo_use_w && try_w()) return;
+
+        // Q positions the ball — must come before E so E only fires once the
+        // ball is already near enemies, not on the first frame of combo press.
+        if (menu::combo_use_q && target) {
+            if (try_q(target, menu::combo_q_hitchance)) return;
+        }
+
+        // E dispatch after W+Q — aggressive E has its own enemy-near-ball guard
+        // so it won't fire until the ball has actually landed on someone.
         const int em = menu::combo_e_mode;
         if (em == 2) {
-            // Pure engage — no fallback.
             if (try_combo_engage_e()) return;
         }
         else if (em == 3) {
-            // Smart: allies in range AND cluster meets threshold → Engage.
-            // No allies in range → skip Engage entirely, default to Aggressive.
             if (has_ally_in_e_range()) {
                 if (try_combo_engage_e()) return;
             }
@@ -883,13 +887,8 @@ namespace orianna
             if (target && try_combo_aggressive_e(target)) return;
         }
 
-        // W before Q so a ball already on a target gets dropped first.
-        // Auto W (always-on) handles the post-Q W timing.
-        if (menu::combo_use_w && try_w()) return;
-
-        if (menu::combo_use_q && target) {
-            if (try_q(target, menu::combo_q_hitchance)) return;
-        }
+        // Self-shield only when E Mode is Off — any active mode owns E in combo.
+        if (menu::combo_e_mode == 0 && menu::shield_combo_self) try_self_shield();
     }
 
     void harass()
