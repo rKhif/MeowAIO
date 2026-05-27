@@ -130,6 +130,7 @@ namespace orianna
     static bool is_valid_enemy_minion(game_object* m)
     {
         if (!m || !m->is_valid() || m->is_dead() || !m->is_targetable()) return false;
+        if (!m->is_visible()) return false;
         auto p = g_sdk->object_manager->get_local_player();
         if (!p) return false;
         if (m->get_team_id() == p->get_team_id()) return false;
@@ -291,6 +292,40 @@ namespace orianna
     }
 
     // ============================================================================
+    // MOVEMENT PREDICTION (lightweight, path-based)
+    // ============================================================================
+    // Walks the target's path waypoints from its current path index, summing
+    // segment distances until `dt * move_speed` units have been consumed, and
+    // returns the interpolated world position. Used to estimate where an
+    // enemy will be after R's wind-up so we don't burn ult on a stale snapshot.
+    static math::vector3 predict_position(game_object* h, float dt)
+    {
+        if (!h) return {};
+        const auto cur_pos = h->get_position();
+        if (dt <= 0.f) return cur_pos;
+
+        auto path = h->get_path();
+        if (path.empty()) return cur_pos;
+
+        const float ms = h->get_move_speed();
+        if (ms <= 0.f) return cur_pos;
+
+        float remaining = ms * dt;
+        const uint8_t idx = h->get_current_path_index();
+        const size_t start = (idx < path.size()) ? idx : 0;
+
+        math::vector3 cur = cur_pos;
+        for (size_t i = start; i < path.size(); ++i) {
+            const auto& wp = path[i];
+            const float seg = cur.distance(wp);
+            if (seg >= remaining) return cur.extended(wp, remaining);
+            remaining -= seg;
+            cur = wp;
+        }
+        return cur;  // ran out of path — last waypoint
+    }
+
+    // ============================================================================
     // QUERIES
     // ============================================================================
     static int count_enemies_near(const math::vector3& pos, float radius)
@@ -403,6 +438,11 @@ namespace orianna
         return dmg >= target->get_hp() + target->get_all_shield();
     }
 
+    // R has a ~0.5s wind-up. Use predicted positions when checking who'll
+    // actually be inside the AOE when it lands, otherwise we burn ult on
+    // enemies who walked out during the cast.
+    static constexpr float R_CAST_DELAY = 0.5f;
+
     static int score_r_cast()
     {
         const auto bp = get_ball_position();
@@ -410,7 +450,7 @@ namespace orianna
         int score = 0;
         for (auto* h : g_sdk->object_manager->get_heroes()) {
             if (!is_valid_target(h)) continue;
-            const auto hp = h->get_position();
+            const auto hp = predict_position(h, R_CAST_DELAY);
             const float dx = hp.x - bp.x;
             const float dz = hp.z - bp.z;
             if (dx * dx + dz * dz > r_sq) continue;
@@ -438,9 +478,29 @@ namespace orianna
         spell.spell_slot         = SLOT_Q;
         spell.range              = spell_data::q_range;
         spell.radius             = spell_data::q_radius;
-        spell.delay              = 0.25f;     // approx — ball travel adds more
-        spell.projectile_speed   = spell_data::ball_q_missile_speed;
         spell.expected_hitchance = hitchance;
+
+        // Total time before the AOE detonates =
+        //   cast time + (ball-to-cast-point travel at ball_q_missile_speed)
+        // When the ball is on the player, pred handles the second term itself
+        // via projectile_speed (caster → cast point). When the ball is on the
+        // ground / on an ally, the missile flies from the ball — not the
+        // player — so we bake the ball→target distance into `delay` and tell
+        // pred the rest is instant.
+        constexpr float Q_CAST_TIME = 0.25f;
+        if (g_ball_state == ball_state::on_self) {
+            spell.delay            = Q_CAST_TIME;
+            spell.projectile_speed = spell_data::ball_q_missile_speed;
+        } else if (target) {
+            const auto bp = get_ball_position();
+            const float ball_to_target = bp.distance(target->get_position());
+            spell.delay            = Q_CAST_TIME
+                                   + ball_to_target / spell_data::ball_q_missile_speed;
+            spell.projectile_speed = FLT_MAX;
+        } else {
+            spell.delay            = Q_CAST_TIME;
+            spell.projectile_speed = spell_data::ball_q_missile_speed;
+        }
 
         pred_sdk::pred_data pred{};
         try { pred = sdk::prediction->predict(target, spell); }
@@ -518,7 +578,7 @@ namespace orianna
             const float r_sq = spell_data::r_effect_radius * spell_data::r_effect_radius;
             for (auto* h : g_sdk->object_manager->get_heroes()) {
                 if (!is_valid_target(h)) continue;
-                const auto hp = h->get_position();
+                const auto hp = predict_position(h, R_CAST_DELAY);
                 const float dx = hp.x - bp.x;
                 const float dz = hp.z - bp.z;
                 if (dx * dx + dz * dz > r_sq) continue;
@@ -587,7 +647,7 @@ namespace orianna
 
         for (auto* h : g_sdk->object_manager->get_heroes()) {
             if (!is_valid_target(h)) continue;
-            const auto hp = h->get_position();
+            const auto hp = predict_position(h, R_CAST_DELAY);
             const float dx = hp.x - bp.x;
             const float dz = hp.z - bp.z;
             if (dx * dx + dz * dz > r_sq) continue;
@@ -666,6 +726,11 @@ namespace orianna
         if (!sdk::common) return false;
         if (!is_spell_ready(SLOT_W) || !has_enough_mana(SLOT_W)) return false;
         if (is_ball_in_transit() || is_casting()) return false;
+
+        // Don't pre-empt flee — flee wants to E recall first and only W after
+        // the ball is back on self. Letting auto-W fire here on a Q-grounded
+        // ball would burn W on the enemy and skip the recall entirely.
+        if (sdk::orbwalker && sdk::orbwalker->flee()) return false;
 
         const float now = g_sdk->clock_facade->get_game_time();
         if (now - last_spell_cast_time < MIN_SPELL_DELAY) return false;
@@ -775,8 +840,19 @@ namespace orianna
             if (p->get_position().distance(h->get_position()) > spell_data::e_range) continue;
             if (!is_ally_shieldable(h)) continue;
 
-            const int hits = count_enemies_near(h->get_position(),
-                                                spell_data::r_effect_radius);
+            // Count enemies likely to still be near this ally after E travels
+            // and R winds up. We don't know E travel time precisely; use the
+            // R wind-up alone as a conservative estimate.
+            const auto ally_pos = h->get_position();
+            const float r_sq = spell_data::r_effect_radius * spell_data::r_effect_radius;
+            int hits = 0;
+            for (auto* e : g_sdk->object_manager->get_heroes()) {
+                if (!is_valid_target(e)) continue;
+                const auto ep = predict_position(e, R_CAST_DELAY);
+                const float dx = ep.x - ally_pos.x;
+                const float dz = ep.z - ally_pos.z;
+                if (dx * dx + dz * dz <= r_sq) ++hits;
+            }
             if (hits > best_hits) { best_hits = hits; best = h; }
         }
 
@@ -1030,36 +1106,39 @@ namespace orianna
         // W second — fires at the ball position (after Q, ball is on enemy).
         if (menu::combo_use_w && try_w()) return;
 
-        // E last (Q → W → E). E either recalls the ball through enemies or
-        // sends it to an ally for an engage; only fires when it actually
-        // impacts (line clip / W follow-up). See try_combo_aggressive_e.
-        const int em = menu::combo_e_mode;
-        if (em == 2) {
-            if (try_combo_engage_e()) return;
-        }
-        else if (em == 3) {
-            if (has_ally_in_e_range()) {
+        // E last (Q → W → E). The "Use in Combo" master toggle gates the
+        // entire E-in-combo block — E Mode then decides the flavour:
+        //   0 Off        → threat-gated self-shield
+        //   1 Aggressive → recall ball through enemies / E-to-ally for impact
+        //   2 Engage     → send ball to ally with most enemies near them
+        //   3 Smart      → engage if ally in range, else aggressive
+        if (menu::shield_combo_self) {
+            const int em = menu::combo_e_mode;
+            if (em == 2) {
                 if (try_combo_engage_e()) return;
             }
-            if (target && try_combo_aggressive_e(target)) return;
-        }
-        else if (em == 1) {
-            if (target && try_combo_aggressive_e(target)) return;
-        }
-
-        // Self-shield only when E Mode is Off, the option is on, AND there's
-        // an enemy hero close enough to threaten us. Pressing combo with no
-        // enemies nearby should not burn E on a free self-shield.
-        if (menu::combo_e_mode == 0 && menu::shield_combo_self) {
-            constexpr float SELF_SHIELD_THREAT_RANGE = 700.f;
-            const float thr_sq = SELF_SHIELD_THREAT_RANGE * SELF_SHIELD_THREAT_RANGE;
-            const auto ppos = p->get_position();
-            for (auto* h : g_sdk->object_manager->get_heroes()) {
-                if (!is_valid_target(h)) continue;
-                const auto hp = h->get_position();
-                const float dx = hp.x - ppos.x;
-                const float dz = hp.z - ppos.z;
-                if (dx * dx + dz * dz <= thr_sq) { try_self_shield(); break; }
+            else if (em == 3) {
+                if (has_ally_in_e_range()) {
+                    if (try_combo_engage_e()) return;
+                }
+                if (target && try_combo_aggressive_e(target)) return;
+            }
+            else if (em == 1) {
+                if (target && try_combo_aggressive_e(target)) return;
+            }
+            else /* em == 0 */ {
+                // Threat-gated self-shield — only when an enemy is close
+                // enough to actually threaten us.
+                constexpr float SELF_SHIELD_THREAT_RANGE = 700.f;
+                const float thr_sq = SELF_SHIELD_THREAT_RANGE * SELF_SHIELD_THREAT_RANGE;
+                const auto ppos = p->get_position();
+                for (auto* h : g_sdk->object_manager->get_heroes()) {
+                    if (!is_valid_target(h)) continue;
+                    const auto hp = h->get_position();
+                    const float dx = hp.x - ppos.x;
+                    const float dz = hp.z - ppos.z;
+                    if (dx * dx + dz * dz <= thr_sq) { try_self_shield(); break; }
+                }
             }
         }
     }

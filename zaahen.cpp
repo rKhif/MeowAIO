@@ -260,19 +260,145 @@ namespace zaahen
         return ok;
     }
 
-    // Predict where `target` will be when our E lands (~ e_range / e_dash_speed seconds).
-    // Wrapped in try/catch — predict_on_path returns vector3 by value so it's safe from
-    // the heap-cross trap, but the SDK may still throw internally on bad target state.
-    static math::vector3 predict_e_target_pos(game_object* target)
+    // Server-tick padding added to E dash time so the predicted target pos
+    // accounts for the small lag between issuing the cast and the dash starting.
+    static constexpr float E_DASH_TIME_BUFFER = 0.066f;
+
+    // Angle offsets (deg) swept by the sweet-spot solver so we can find a
+    // landing when the target is strafing perpendicular to the player↔target axis.
+    static constexpr float E_ANGLE_OFFSETS_DEG[] = {
+        0.f, 15.f, -15.f, 30.f, -30.f, 45.f, -45.f
+    };
+
+    // Rotate a vector around the world Y axis (XZ plane). Preserves length.
+    static math::vector3 rotate_xz(const math::vector3& v, float rad)
+    {
+        const float c = std::cos(rad), s = std::sin(rad);
+        math::vector3 out;
+        out.x = v.x * c - v.z * s;
+        out.y = v.y;
+        out.z = v.x * s + v.z * c;
+        return out;
+    }
+
+    // Predict where `target` will be after `dash_time` seconds (+ tick buffer).
+    // Wrapped in try/catch — predict_on_path returns vector3 by value so it's safe
+    // from the heap-cross trap, but the SDK may still throw internally on bad
+    // target state.
+    static math::vector3 predict_e_target_pos_at(game_object* target, float dash_time)
     {
         const auto fallback = target ? target->get_position() : math::vector3{};
         if (!target || !sdk::prediction) return fallback;
-        const float dash_time = spell_data::e_range / spell_data::e_dash_speed;
+        if (dash_time < 0.f) dash_time = 0.f;
         try {
-            return sdk::prediction->predict_on_path(target, dash_time, false);
+            return sdk::prediction->predict_on_path(target, dash_time + E_DASH_TIME_BUFFER, false);
         } catch (...) {
             return fallback;
         }
+    }
+
+    // Back-compat wrapper: full-range dash time (~0.39s).
+    static math::vector3 predict_e_target_pos(game_object* target)
+    {
+        return predict_e_target_pos_at(target, spell_data::e_range / spell_data::e_dash_speed);
+    }
+
+    // Sweet-spot landing solver.
+    // 1. Iterates dash-time vs. axial dash-distance twice so the predicted
+    //    position matches the actually-chosen dash duration (fixes consistent
+    //    miss when the chosen dash is much shorter than full range).
+    // 2. Sweeps a small set of angle offsets around the player↔predicted axis
+    //    so a target strafing perpendicular can still be placed in the ring.
+    // 3. Scores each candidate by closeness of |landing - predicted| to IDEAL,
+    //    tie-broken on smaller dash magnitude (avoid over-committing position).
+    // Falls through to a midpoint-window pick if no scored candidate fits.
+    // Returns false if no sweet-spot-compliant landing exists — caller refuses cast.
+    static bool solve_e_landing(const math::vector3& player_pos,
+                                game_object* target,
+                                math::vector3& out_landing)
+    {
+        if (!target) return false;
+        const float er = spell_data::e_range;
+
+        // 1. First-pass + 2-iter dash-time convergence on the axis.
+        const float full_t = er / spell_data::e_dash_speed;
+        math::vector3 predicted = predict_e_target_pos_at(target, full_t);
+
+        for (int it = 0; it < 2; ++it) {
+            const math::vector3 d_vec = predicted - player_pos;
+            const float d = d_vec.magnitude();
+            if (d <= 0.f) break;
+            const float cand_a = d - E_SWEETSPOT_IDEAL;
+            const float cand_b = d + E_SWEETSPOT_IDEAL;
+            float pick = (std::fabs(cand_a) <= std::fabs(cand_b)) ? cand_a : cand_b;
+            if (std::fabs(pick) < 1.f) pick = (pick < 0.f ? -1.f : 1.f);
+            if (pick >  er) pick =  er;
+            if (pick < -er) pick = -er;
+            const float new_t = std::fabs(pick) / spell_data::e_dash_speed;
+            predicted = predict_e_target_pos_at(target, new_t);
+        }
+
+        const math::vector3 delta = predicted - player_pos;
+        const float d_axis = delta.magnitude();
+        if (d_axis <= 0.f) return false;
+        const math::vector3 axis_dir = delta.normalized();
+
+        // 2. Angle scan.
+        bool          best_found = false;
+        float         best_score = -FLT_MAX;
+        float         best_dash_mag = FLT_MAX;
+        math::vector3 best_landing{};
+
+        for (float deg : E_ANGLE_OFFSETS_DEG) {
+            const float rad = deg * 3.14159265358979323846f / 180.f;
+            const math::vector3 dir = rotate_xz(axis_dir, rad);
+
+            // Axial component of (predicted - player) onto this direction.
+            const float d_k = dir.x * delta.x + dir.y * delta.y + dir.z * delta.z;
+            const float cands[2] = { d_k - E_SWEETSPOT_IDEAL, d_k + E_SWEETSPOT_IDEAL };
+
+            for (float dash : cands) {
+                const float mag = std::fabs(dash);
+                if (mag < 1.f || mag > er) continue;
+
+                math::vector3 landing;
+                landing.x = player_pos.x + dir.x * dash;
+                landing.y = player_pos.y + dir.y * dash;
+                landing.z = player_pos.z + dir.z * dash;
+
+                const float to_target = landing.distance(predicted);
+                if (to_target < E_SWEETSPOT_MIN || to_target > E_SWEETSPOT_MAX) continue;
+
+                const float score = -std::fabs(to_target - E_SWEETSPOT_IDEAL);
+                if (score > best_score
+                    || (score == best_score && mag < best_dash_mag)) {
+                    best_score = score;
+                    best_dash_mag = mag;
+                    best_landing = landing;
+                    best_found = true;
+                }
+            }
+        }
+
+        if (best_found) { out_landing = best_landing; return true; }
+
+        // 3. Fallback: midpoint of any feasible signed window along the axis.
+        auto pick_window = [&](float lo, float hi) -> bool {
+            if (lo < -er) lo = -er;
+            if (hi >  er) hi =  er;
+            if (lo > hi) return false;
+            float mid = (lo + hi) * 0.5f;
+            if (std::fabs(mid) < 1.f) mid = (mid < 0.f ? -1.f : 1.f);
+            const float to_target = std::fabs(mid - d_axis);
+            if (to_target < E_SWEETSPOT_MIN || to_target > E_SWEETSPOT_MAX) return false;
+            out_landing.x = player_pos.x + axis_dir.x * mid;
+            out_landing.y = player_pos.y + axis_dir.y * mid;
+            out_landing.z = player_pos.z + axis_dir.z * mid;
+            return true;
+        };
+        if (pick_window(d_axis - E_SWEETSPOT_MAX, d_axis - E_SWEETSPOT_MIN)) return true;
+        if (pick_window(d_axis + E_SWEETSPOT_MIN, d_axis + E_SWEETSPOT_MAX)) return true;
+        return false;
     }
 
     bool cast_e(game_object* target)
@@ -284,77 +410,26 @@ namespace zaahen
         auto p = g_sdk->object_manager->get_local_player();
         if (!p) return false;
 
-        math::vector3 player_pos = p->get_position();
-        math::vector3 target_pos = predict_e_target_pos(target);
-        math::vector3 delta = target_pos - player_pos;
-        float dist = delta.magnitude();
-        if (dist <= 0.f) return false;
-
-        math::vector3 dir = delta.normalized();
-
-        // Default: dash full range toward target.
-        // Signed: + dash_dist = toward target, - dash_dist = away from target.
-        float dash_dist = spell_data::e_range;
-
-        // Sweet-spot aiming: place landing pos so |landing - target| lands in the outer ring.
-        // Along the player↔target axis there are two ideal solutions:
-        //   cand_a = dist - IDEAL  → forward-short when dist > IDEAL, BACKWARD (away from
-        //                            target) when dist < IDEAL
-        //   cand_b = dist + IDEAL  → forward, past the target
-        // Prefer the smaller-magnitude dash — keeps us from over-committing position, and
-        // naturally back-pedals away from a target that's on top of us instead of dashing
-        // through them into their team.
-        if (menu::e_sweetspot) {
-            bool placed = false;
-            auto try_place = [&](float cand) -> bool {
-                const float mag = std::fabs(cand);
-                if (mag <= 0.f || mag > spell_data::e_range) return false;
-                const float to_target = std::fabs(cand - dist);
-                if (to_target < E_SWEETSPOT_MIN || to_target > E_SWEETSPOT_MAX) return false;
-                dash_dist = cand;
-                placed = true;
-                return true;
-            };
-
-            const float cand_a = dist - E_SWEETSPOT_IDEAL;
-            const float cand_b = dist + E_SWEETSPOT_IDEAL;
-            const bool a_shorter = std::fabs(cand_a) <= std::fabs(cand_b);
-            if (a_shorter) { if (!try_place(cand_a)) try_place(cand_b); }
-            else           { if (!try_place(cand_b)) try_place(cand_a); }
-
-            if (!placed) {
-                // Neither ideal fits — pick the midpoint of any feasible signed window.
-                // Critical: re-verify the chosen midpoint actually places target inside
-                // [SWEETSPOT_MIN, SWEETSPOT_MAX]. Without this check the clamping to ±e_range
-                // can produce a midpoint where target lands outside the outer ring,
-                // resulting in a wasted E that misses the sweet-spot at long range.
-                auto pick_window = [&](float lo, float hi) -> bool {
-                    const float er = spell_data::e_range;
-                    if (lo < -er) lo = -er;
-                    if (hi >  er) hi =  er;
-                    if (lo > hi) return false;
-                    float mid = (lo + hi) * 0.5f;
-                    if (std::fabs(mid) < 1.f) mid = (mid < 0.f ? -1.f : 1.f);
-                    const float to_target = std::fabs(mid - dist);
-                    if (to_target < E_SWEETSPOT_MIN || to_target > E_SWEETSPOT_MAX) return false;
-                    dash_dist = mid;
-                    placed = true;
-                    return true;
-                };
-                if (!pick_window(dist - E_SWEETSPOT_MAX, dist - E_SWEETSPOT_MIN))
-                    pick_window(dist + E_SWEETSPOT_MIN, dist + E_SWEETSPOT_MAX);
-            }
-
-            // Sweet-spot is mandatory when toggle is on. If no signed dash can place
-            // target in the [200, 375] outer ring, refuse the cast entirely instead
-            // of dashing forward and missing the bonus damage AOE.
-            if (!placed) return false;
-        }
-
+        const math::vector3 player_pos = p->get_position();
         math::vector3 cast_pos;
-        cast_pos.x = player_pos.x + dir.x * dash_dist;
-        cast_pos.y = player_pos.y + dir.y * dash_dist;
-        cast_pos.z = player_pos.z + dir.z * dash_dist;
+
+        if (menu::e_sweetspot) {
+            // Sweet-spot is mandatory when toggle is on: solver runs dash-time-
+            // correct prediction + angle scan, refuses if no landing fits the
+            // [E_SWEETSPOT_MIN, E_SWEETSPOT_MAX] outer ring window.
+            if (!solve_e_landing(player_pos, target, cast_pos)) return false;
+        } else {
+            // Non-sweetspot: dash full range toward predicted target pos.
+            const math::vector3 target_pos = predict_e_target_pos(target);
+            const math::vector3 delta = target_pos - player_pos;
+            const float dist = delta.magnitude();
+            if (dist <= 0.f) return false;
+            const math::vector3 dir = delta.normalized();
+            const float dash_dist = spell_data::e_range;
+            cast_pos.x = player_pos.x + dir.x * dash_dist;
+            cast_pos.y = player_pos.y + dir.y * dash_dist;
+            cast_pos.z = player_pos.z + dir.z * dash_dist;
+        }
 
         bool ok = sdk::common->cast_spell(SLOT_E, cast_pos);
         if (ok) last_spell_cast_time = g_sdk->clock_facade->get_game_time();
@@ -603,33 +678,56 @@ namespace zaahen
         if (preds.size() < 2) return false;
 
         int           best_hits = 0;
+        float         best_depth = 0.f;   // tie-break: prefer landings deeper in ring
         math::vector3 best_landing{};
 
         for (const auto& anchor : preds) {
-            const auto delta = anchor.pos - player_pos;
-            const float d = delta.magnitude();
-            if (d <= 0.f) continue;
-            const auto dir = delta.normalized();
-            const float candidates[2] = {
-                d - E_SWEETSPOT_IDEAL,
-                d + E_SWEETSPOT_IDEAL,
-            };
-            for (float dash : candidates) {
-                const float mag = std::fabs(dash);
-                if (mag < 1.f || mag > er) continue;
-                math::vector3 landing;
-                landing.x = player_pos.x + dir.x * dash;
-                landing.y = player_pos.y + dir.y * dash;
-                landing.z = player_pos.z + dir.z * dash;
-                int hits = 0;
-                for (const auto& q : preds) {
-                    const float ld = landing.distance(q.pos);
-                    if (ld >= spell_data::e_inner_radius && ld <= spell_data::e_outer_radius)
-                        ++hits;
-                }
-                if (hits > best_hits) {
-                    best_hits = hits;
-                    best_landing = landing;
+            const math::vector3 anchor_delta = anchor.pos - player_pos;
+            const float d_a = anchor_delta.magnitude();
+            if (d_a <= 0.f) continue;
+            const math::vector3 axis_dir = anchor_delta.normalized();
+
+            for (float deg : E_ANGLE_OFFSETS_DEG) {
+                const float rad = deg * 3.14159265358979323846f / 180.f;
+                const math::vector3 dir = rotate_xz(axis_dir, rad);
+
+                // Project anchor offset onto this direction so the two signed
+                // candidates still place THIS anchor near the ring on the
+                // rotated axis.
+                const float d_k = dir.x * anchor_delta.x
+                                + dir.y * anchor_delta.y
+                                + dir.z * anchor_delta.z;
+                const float candidates[2] = {
+                    d_k - E_SWEETSPOT_IDEAL,
+                    d_k + E_SWEETSPOT_IDEAL,
+                };
+
+                for (float dash : candidates) {
+                    const float mag = std::fabs(dash);
+                    if (mag < 1.f || mag > er) continue;
+
+                    math::vector3 landing;
+                    landing.x = player_pos.x + dir.x * dash;
+                    landing.y = player_pos.y + dir.y * dash;
+                    landing.z = player_pos.z + dir.z * dash;
+
+                    int   hits  = 0;
+                    float depth = 0.f;
+                    for (const auto& q : preds) {
+                        const float ld = landing.distance(q.pos);
+                        if (ld >= spell_data::e_inner_radius && ld <= spell_data::e_outer_radius) {
+                            ++hits;
+                            // Closer to IDEAL = deeper in the ring sweet zone.
+                            depth += (E_SWEETSPOT_MAX - std::fabs(ld - E_SWEETSPOT_IDEAL));
+                        }
+                    }
+
+                    if (hits > best_hits
+                        || (hits == best_hits && depth > best_depth)) {
+                        best_hits = hits;
+                        best_depth = depth;
+                        best_landing = landing;
+                    }
                 }
             }
         }

@@ -2921,7 +2921,7 @@ namespace viktor
         e_menu->add_slider_int("hitchance", "Hitchance", 0, 100, 1, menu::e_hitchance,
             [](int v) { menu::e_hitchance = v; });
         e_menu->add_checkbox("draw_range", "Draw Range", menu::draw_e_range, [](bool v) { menu::draw_e_range = v; });
-        e_menu->add_checkbox("log_casts", "Log E Casts (debug)", menu::log_e_casts, [](bool v) { menu::log_e_casts = v; });
+        //e_menu->add_checkbox("log_casts", "Log E Casts (debug)", menu::log_e_casts, [](bool v) { menu::log_e_casts = v; });
         e_menu->add_checkbox("draw_rgb", "RGB Range", menu::draw_e_rgb, [](bool v) { menu::draw_e_rgb = v; });
 
         auto r_menu = cat->add_sub_category("r_chaos_storm", "R - Chaos Storm");
