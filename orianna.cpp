@@ -54,6 +54,8 @@ namespace orianna
 
     // --- Per-ally shield enable map (true = shield this ally) ---
     static std::unordered_map<std::string, bool> g_ally_shield_enabled;
+    static menu_category* g_ally_shield_menu = nullptr;
+    static float          g_ally_menu_last_refresh = 0.f;
 
     static bool is_ally_shieldable(game_object* h)
     {
@@ -61,6 +63,28 @@ namespace orianna
         const std::string name = h->get_char_name();
         auto it = g_ally_shield_enabled.find(name);
         return it != g_ally_shield_enabled.end() ? it->second : true;
+    }
+
+    // Append a checkbox for each ally we haven't seen yet. Cheap, throttled
+    // to ~2s in on_update. Catches allies that hadn't loaded when init() ran.
+    static void refresh_ally_shield_menu()
+    {
+        if (!g_ally_shield_menu) return;
+        auto p = g_sdk->object_manager->get_local_player();
+        if (!p) return;
+
+        for (auto* h : g_sdk->object_manager->get_heroes()) {
+            if (!h || !h->is_valid() || h == p) continue;
+            if (h->get_team_id() != p->get_team_id()) continue;
+
+            const std::string name = h->get_char_name();
+            if (name.empty()) continue;
+            if (g_ally_shield_enabled.find(name) != g_ally_shield_enabled.end()) continue;
+
+            g_ally_shield_enabled[name] = true;
+            g_ally_shield_menu->add_checkbox("ally_" + name, name, true,
+                [name](bool v) { g_ally_shield_enabled[name] = v; });
+        }
     }
 
     // ============================================================================
@@ -1276,6 +1300,15 @@ namespace orianna
     {
         update_ball_state();
 
+        // Lazy per-ally menu refresh — throttled, cheap when nothing to do.
+        if (g_ally_shield_menu) {
+            const float now = g_sdk->clock_facade->get_game_time();
+            if (now - g_ally_menu_last_refresh >= 2.0f) {
+                g_ally_menu_last_refresh = now;
+                refresh_ally_shield_menu();
+            }
+        }
+
         // Semi-manual R runs independent of orbwalker mode.
         if (try_semi_r()) return;
         if (try_auto_r()) return;
@@ -1331,6 +1364,24 @@ namespace orianna
         if (menu::draw_q_range) {
             const uint32_t c = get_draw_color(SLOT_Q, menu::color_q);
             if (c) draw_circle(ppos, spell_data::q_range, c);
+        }
+        if (menu::draw_q_landing && sdk::prediction && sdk::target_selector) {
+            // Show where Q would actually detonate against the current TS pick.
+            // Use a permissive hitchance so the indicator stays visible even
+            // when the predictor only has "low" confidence — purely informational.
+            auto* target = pick_hero_target(spell_data::q_range);
+            if (target) {
+                const auto pred = predict_q(target, pred_sdk::hitchance::low);
+                if (pred.is_valid) {
+                    const uint32_t base = get_draw_color(SLOT_Q, menu::color_q);
+                    if (base) {
+                        // Translucent fill so it doesn't drown out the range ring.
+                        const uint32_t fill = (base & 0x00FFFFFFu) | 0x70000000u;
+                        draw_circle(pred.cast_position,
+                                    spell_data::q_effect_radius, fill);
+                    }
+                }
+            }
         }
         if (menu::draw_e_range) {
             const uint32_t c = get_draw_color(SLOT_E, menu::color_e);
@@ -1612,6 +1663,8 @@ namespace orianna
         q_menu->add_separator();
         q_menu->add_checkbox("draw_range", "Draw Range", menu::draw_q_range,
             [](bool v) { menu::draw_q_range = v; });
+        q_menu->add_checkbox("draw_landing", "Draw Q Landing", menu::draw_q_landing,
+            [](bool v) { menu::draw_q_landing = v; });
 
         // W — Command: Dissonance
         auto w_menu = s_menu->add_sub_category("w_command_dissonance", "W - Command: Dissonance");
@@ -1670,23 +1723,10 @@ namespace orianna
         e_menu->add_checkbox("draw_range", "Draw Range", menu::draw_e_range,
             [](bool v) { menu::draw_e_range = v; });
 
-        // Per-ally shield priority (0 = never, 5 = highest)
-        auto p = g_sdk->object_manager->get_local_player();
-        if (p) {
-            auto* allies_menu = e_menu->add_sub_category("shield_allies_list", "Shield Per Ally");
-            for (auto* h : g_sdk->object_manager->get_heroes()) {
-                if (!h || !h->is_valid() || h == p) continue;
-                if (h->get_team_id() != p->get_team_id()) continue;
-
-                const std::string name = h->get_char_name();
-                if (name.empty()) continue;
-                if (g_ally_shield_enabled.find(name) != g_ally_shield_enabled.end()) continue;
-
-                g_ally_shield_enabled[name] = true;
-                allies_menu->add_checkbox("ally_" + name, name, true,
-                    [name](bool v) { g_ally_shield_enabled[name] = v; });
-            }
-        }
+        // Per-ally shield toggles — built lazily on_update so late-joining
+        // allies still get menu entries. The submenu handle is kept so we
+        // can append checkboxes after init.
+        g_ally_shield_menu = e_menu->add_sub_category("shield_allies_list", "Shield Per Ally");
 
         // R — Command: Shockwave
         auto r_menu = s_menu->add_sub_category("r_command_shockwave", "R - Command: Shockwave");
@@ -1844,7 +1884,10 @@ namespace orianna
         g_infotab_auto_q = g_infotab_auto_r = g_infotab_semi_r = g_infotab_e_mode = 0;
 
         s_menu = nullptr;
-        g_ally_shield_enabled.clear();
+        // Keep g_ally_shield_enabled across re-inits within the session so
+        // user-configured per-ally toggles aren't lost between games.
+        g_ally_shield_menu = nullptr;
+        g_ally_menu_last_refresh = 0.f;
         g_ball_state = ball_state::on_self;
         g_ball_missile = nullptr;
         g_ball_ally = nullptr;
