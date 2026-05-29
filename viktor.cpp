@@ -1584,6 +1584,15 @@ namespace viktor
 
         if (best_score < 1.f) return;
 
+        // Decay stale hysteresis. If the previous move's justification has
+        // weakened (target died / left / lost CC), re-score last_r_move_pos
+        // against the current enemy set and pull last_r_move_score down to
+        // match. Without this, the storm gets stuck near a dead high-weight
+        // target because no nearby live target can clear the score gate.
+        const float current_score_at_last = score_pos(last_r_move_pos);
+        if (current_score_at_last < last_r_move_score)
+            last_r_move_score = current_score_at_last;
+
         move_r_to_pos(best_pos, best_score, /*force=*/false);
     }
 

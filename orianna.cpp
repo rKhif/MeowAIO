@@ -1323,11 +1323,14 @@ namespace orianna
         }
 
         if (!sdk::orbwalker) return;
+        // Check lasthit BEFORE clear/fast_clear — VEN's clear() returns true
+        // whenever any farming mode is active (including lasthit), so it would
+        // otherwise swallow the lasthit case and lasthit_mode() never runs.
         if      (sdk::orbwalker->combo())      combo();
         else if (sdk::orbwalker->harass())     harass();
+        else if (sdk::orbwalker->lasthit())    lasthit_mode();
         else if (sdk::orbwalker->fast_clear()) fast_clear();
         else if (sdk::orbwalker->clear())      clear();
-        else if (sdk::orbwalker->lasthit())    lasthit_mode();
         else if (sdk::orbwalker->flee())       flee();
     }
 
