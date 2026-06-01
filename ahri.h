@@ -20,12 +20,15 @@ namespace ahri
     namespace spell_data
     {
         // Q — Orb of Deception
-        constexpr float q_range          = 900.f;
+        constexpr float q_range          = 905.f;
         constexpr float q_radius         = 100.f;     // pred half-radius (200 width)
-        constexpr float q_speed          = 1550.f;
+        constexpr float q_speed          = 2500.f;    // outbound initial speed (decelerates to ~400)
+        constexpr float q_speed_min      = 400.f;
+        constexpr float q_return_speed   = 2600.f;
+        constexpr float q_return_min     = 60.f;
         constexpr float q_delay          = 0.25f;
 
-        // W — Fox-Fire (self-cast, auto-targeted flames)
+        // W — Fox-Fire (self-cast, auto-targeted flames)   
         constexpr float w_range          = 575.f;     // standard W reach
         constexpr float w_range_charm    = 725.f;     // priority range vs charmed targets
         constexpr float w_subseq_dmg_pct = 0.40f;     // 2nd/3rd flame damage multiplier
@@ -54,6 +57,7 @@ namespace ahri
     {
         // --- Combo ---
         inline bool combo_use_q          = true;
+        inline bool combo_q_magnet       = false;
         inline bool combo_use_w          = true;
         inline bool combo_use_e          = true;
         inline bool combo_use_r          = false;     // R only on hotkey/gap-close by default
@@ -63,6 +67,7 @@ namespace ahri
 
         // --- Harass ---
         inline bool harass_use_q         = true;
+        inline bool harass_use_w         = true;
         inline bool harass_use_e         = false;
         inline int  harass_mana_pct      = 50;
 
@@ -86,18 +91,17 @@ namespace ahri
         inline bool        semi_e_active   = false;
         inline std::string semi_e_key_str;
         inline uint32_t    infotab_semi_e  = 0;
-        inline int         semi_e_hitchance = pred_sdk::hitchance::medium;
+        inline uint32_t    infotab_e_first = 0;
 
         // --- Drawings ---
         inline bool draw_q_range         = true;
         inline bool draw_e_range         = true;
+        inline bool draw_e_rgb           = false;
         inline bool draw_w_range         = true;
         inline bool draw_r_range         = false;
-        inline bool draw_damage_bar      = true;
         inline bool draw_r_dmg_bar       = true;
-        inline bool draw_killable_text   = true;
-        inline bool draw_combo_mode      = true;
         inline bool draw_only_ready      = false;
+        inline bool draw_e_first_indicator = true;
 
         // --- Colors (ARGB) ---
         inline uint32_t color_q          = 0xFF00FF80u; // green
@@ -118,6 +122,9 @@ namespace ahri
     // ============================================================================
     void __fastcall on_update();
     void __fastcall on_draw();
+    void __fastcall on_present();
+    void __fastcall on_execute_cast(game_object* obj, spell_cast* cast);
+    void __fastcall on_basic_attack(game_object* obj, game_object* target, spell_cast* cast);
     void __fastcall on_new_path(game_object* obj, bool is_dash, float dash_speed);
     void __fastcall on_buff_gain(game_object* obj, buff_instance* buff);
     void __fastcall on_buff_loss(game_object* obj, buff_instance* buff);

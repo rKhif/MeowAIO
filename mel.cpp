@@ -428,19 +428,47 @@ namespace mel
         return std::sqrt(ex * ex + ez * ez);
     }
 
-    // Does this cast's geometry actually hit us? Targeted on us → yes;
-    // skillshot whose line passes within margin of us → yes.
+    static const spell_db::entry* get_spell_db_entry(spell_cast* cast)
+    {
+        if (!cast) return nullptr;
+        auto* sd = cast->get_spell_data();
+        if (!sd) return nullptr;
+        auto* st = sd->get_static_data();
+        if (!st) return nullptr;
+        const char* raw_name = st->get_name();
+        if (!raw_name || !*raw_name) return nullptr;
+        return spell_db::lookup(spell_db::normalize_spell_name(raw_name));
+    }
+
+    // Does this cast's geometry actually hit us? Targeted on us -> yes.
+    // For known skillshots, use Data.cpp's shape/radius; unknown spells fall
+    // back to the previous line-path heuristic.
     static bool cast_hits_player(game_object* caster, spell_cast* cast, game_object* p)
     {
         if (auto* tgt = cast->get_target()) {
             if (tgt->get_network_id() == p->get_network_id()) return true;
         }
-        // Skillshot path test — same heuristic as before.
-        constexpr float path_width = 150.f;
-        const auto start  = caster->get_position();
-        const auto end    = cast->get_end_pos();
-        const float margin = p->get_bounding_radius() + path_width;
-        const float d = distance_point_to_segment_2d(p->get_position(), start, end);
+
+        constexpr float fallback_width = 150.f;
+        constexpr float safety_margin  = 25.f;
+
+        const auto* meta = get_spell_db_entry(cast);
+        const float radius = meta && meta->radius > 0.f ? meta->radius : fallback_width;
+        const float margin = p->get_bounding_radius() + radius + safety_margin;
+
+        const auto end = cast->get_end_pos();
+        const auto pp  = p->get_position();
+
+        if (meta && (meta->shape == spell_db::shape_kind::circle
+                  || meta->shape == spell_db::shape_kind::ring
+                  || meta->shape == spell_db::shape_kind::polygon)) {
+            return pp.distance(end) <= margin;
+        }
+
+        auto start = cast->get_start_pos();
+        if (start.distance(end) <= 1.f) start = caster->get_position();
+
+        const float d = distance_point_to_segment_2d(pp, start, end);
         return d <= margin;
     }
 

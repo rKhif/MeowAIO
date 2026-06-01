@@ -473,7 +473,6 @@ namespace syndra
     bool cast_w_throw(game_object* target, int hitchance)
     {
         if (!target || !w_holding) return false;
-        if (!is_spell_ready(SLOT_W)) return false;
         if (!target->is_hero()) return false;
 
         const float now = g_sdk->clock_facade->get_game_time();
@@ -903,8 +902,7 @@ namespace syndra
         // W AOE throw onto minion stack (only when held and safe)
         if (menu::clear_use_w && w_holding
             && !is_enemy_hero_near(spell_data::w_throw_range + 300.f)
-            && (now - w_grab_time) >= spell_data::w_min_hold_time
-            && is_spell_ready(SLOT_W)) {
+            && (now - w_grab_time) >= spell_data::w_min_hold_time) {
 
             const auto player_pos = p->get_position();
             int best_hits = 0;
@@ -1362,6 +1360,23 @@ namespace syndra
             }
         }
 
+        // R killable text — Viktor-style (world_to_screen, centered above hero)
+        if (menu::draw_killable_txt && g_sdk->renderer) {
+            auto r_sp = p->get_spell(SLOT_R);
+            if (r_sp && r_sp->get_level() > 0 && r_sp->get_cooldown() <= 0.f) {
+                const int cur_total = count_r_spheres();
+                for (auto* h : g_sdk->object_manager->get_heroes()) {
+                    if (!is_valid_target(h)) continue;
+                    const float dmg = get_r_damage(h, cur_total);
+                    if (h->get_hp() > 0.f && h->get_hp() <= dmg) {
+                        auto screen = g_sdk->renderer->world_to_screen(h->get_position());
+                        g_sdk->renderer->add_text("R KILLABLE", 18.f,
+                            { screen.x - 35.f, screen.y - 60.f }, 0, 0xFFFF4500u);
+                    }
+                }
+            }
+        }
+
     }
 
     // HP-bar overlays must run on event::present, not draw_world,
@@ -1374,13 +1389,12 @@ namespace syndra
         auto p = g_sdk->object_manager->get_local_player();
         if (!p || p->is_dead()) return;
 
-        if (!menu::draw_r_dmg_bar && !menu::draw_killable_txt) return;
+        if (!menu::draw_r_dmg_bar) return;
 
         // Hide overlays while R is unavailable — drains/text are misleading otherwise.
         if (!is_spell_ready(SLOT_R) || !has_enough_mana(SLOT_R)) return;
 
         const int  cur_total  = count_r_spheres();
-        const int  cur_ground = count_ground_spheres();
 
         for (auto* h : g_sdk->object_manager->get_heroes()) {
             if (!is_valid_target(h)) continue;
@@ -1428,29 +1442,6 @@ namespace syndra
                 }
             }
 
-            if (!menu::draw_killable_txt) continue;
-
-            const bool kills_now = can_r_kill(h, cur_total);
-            bool kills_with_q = false;
-            int  total_with_q = cur_total;
-            if (!kills_now && is_spell_ready(SLOT_Q) && cur_ground < spell_data::r_max_grab_spheres) {
-                total_with_q = std::min(cur_ground + 1, spell_data::r_max_grab_spheres)
-                             + spell_data::r_base_spheres;
-                kills_with_q = can_r_kill(h, total_with_q);
-            }
-            if (!kills_now && !kills_with_q) continue;
-
-            const math::vector2 text_pos{ hbar.x, hbar.y - 20.f };
-            if (kills_now) {
-                g_sdk->renderer->add_text(
-                    has_r_execute() ? "EXECUTE with R" : "KILLABLE with R",
-                    13.f, text_pos, 1, 0xFF00E600u);
-            } else {
-                char buf[64];
-                std::snprintf(buf, sizeof(buf), "Killable with %d Spheres (%d/%d)",
-                    total_with_q, cur_total, total_with_q);
-                g_sdk->renderer->add_text(buf, 12.f, text_pos, 1, 0xFFFF8800u);
-            }
         }
     }
 
@@ -1825,7 +1816,7 @@ namespace syndra
         auto draw_menu = s_menu->add_sub_category("drawings", "Drawings");
         draw_menu->add_checkbox("only_ready", "Only Ready Spells", menu::draw_only_ready,
             [](bool v) { menu::draw_only_ready = v; });
-        draw_menu->add_checkbox("spheres", "Sphere Drawing", menu::draw_spheres,
+        draw_menu->add_checkbox("spheres", "Sphere Timer", menu::draw_spheres,
             [](bool v) { menu::draw_spheres = v; });
         draw_menu->add_checkbox("r_dmg_bar", "R Damage Indicator", menu::draw_r_dmg_bar,
             [](bool v) { menu::draw_r_dmg_bar = v; });

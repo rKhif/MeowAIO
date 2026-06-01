@@ -27,7 +27,7 @@ namespace syndra
 
         // Q — Dark Sphere (circular ground placement)
         constexpr float q_range            = 800.f;
-        constexpr float q_radius           = 105.f;
+        constexpr float q_radius           = 210.f;
         constexpr float q_proc_delay       = 0.6f;
         constexpr float q_effective_range  = 920.f; // range + radius slack for edge hits
         constexpr float q_sphere_duration  = 6.f;

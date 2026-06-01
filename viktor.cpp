@@ -111,6 +111,22 @@ namespace viktor
                o->has_buff_of_type(buff_type::asleep);
     }
 
+    static bool is_in_stasis(game_object* o)
+    {
+        if (!o) return false;
+        if (!sdk::common || !sdk::common->buffs) return false;
+        auto* stasis = sdk::common->buffs->get_stasis_buff(o);
+        return stasis && stasis->is_active();
+    }
+
+    static bool is_damage_immune(game_object* o)
+    {
+        if (!o) return false;
+        if (o->has_buff_of_type(buff_type::invulnerability)) return true;
+        if (o->has_buff_of_type(buff_type::spell_immunity)) return true;
+        return false;
+    }
+
     static void mark_spell_cast(float now) { m_last_spell_cast_time = now; }
 
     static float effective_hp(game_object* o)
@@ -322,17 +338,24 @@ namespace viktor
         if (slot != SLOT_R) return;
         // Skip recast/move commands — those reuse the R slot but should leave
         // the original cast position untouched.
-        if (!r_storm_active)
-        {
-            r_storm_active = true;
-            r_storm_start_t = g_sdk->clock_facade->get_game_time();
+        const float now = g_sdk->clock_facade->get_game_time();
+        r_storm_active = true;
+        r_storm_start_t = now;
 
-            const auto cp = cast->get_end_pos();
-            if (cp.x != 0.f || cp.y != 0.f || cp.z != 0.f)
-            {
-                r_cast_pos       = cp;
-                r_cast_pos_valid = true;
-            }
+        // Fresh storm cast should not inherit hysteresis from a previous storm.
+        last_r_move_time = 0.f;
+        last_r_move_pos = {};
+        last_r_move_score = 0.f;
+
+        const auto cp = cast->get_end_pos();
+        if (cp.x != 0.f || cp.y != 0.f || cp.z != 0.f)
+        {
+            r_cast_pos       = cp;
+            r_cast_pos_valid = true;
+        }
+        else
+        {
+            r_cast_pos_valid = false;
         }
     }
 
@@ -582,7 +605,7 @@ namespace viktor
         if (sdk::orbwalker->combo())        { combo(); }
         else if (sdk::orbwalker->harass())  { harass(); }
         else if (sdk::orbwalker->lasthit()) { lasthit(); }
-        else if (sdk::orbwalker->clear())   { clear(); }
+        else if (sdk::orbwalker->fast_clear() || sdk::orbwalker->clear()) { clear(); }
         else if (sdk::orbwalker->flee())
         {
             if (menu::use_w_flee)
@@ -1094,12 +1117,17 @@ namespace viktor
 
         if (is_casting()) return;
 
-        if (!sdk::orbwalker->is_spell_farm_enabled()) return;
+        const bool fast_clear_mode = sdk::orbwalker->fast_clear();
 
-        const float max_par = player->get_max_par();
-        if (max_par <= 0.f) return;
-        const float mana_pct = (player->get_par() / max_par) * 100.f;
-        if (mana_pct < static_cast<float>(menu::farm_mana_percent)) return;
+        if (!fast_clear_mode && !sdk::orbwalker->is_spell_farm_enabled()) return;
+
+        if (!fast_clear_mode)
+        {
+            const float max_par = player->get_max_par();
+            if (max_par <= 0.f) return;
+            const float mana_pct = (player->get_par() / max_par) * 100.f;
+            if (mana_pct < static_cast<float>(menu::farm_mana_percent)) return;
+        }
 
         if (menu::use_q_clear)
         {
@@ -1502,7 +1530,37 @@ namespace viktor
                 enemies.push_back(hero);
         }
 
-        if (enemies.empty()) return;
+        if (enemies.empty())
+        {
+            // Fallback retarget: if the current focus died or left storm search
+            // radius, move toward the nearest valid enemy so R does not stall.
+            game_object* nearest_enemy = nullptr;
+            float nearest_dist = FLT_MAX;
+
+            for (auto hero : g_sdk->object_manager->get_heroes())
+            {
+                if (!is_valid_target(hero)) continue;
+                if (hero->has_buff_of_type(buff_type::invulnerability)) continue;
+                if (hero->has_buff_of_type(buff_type::spell_immunity))  continue;
+                if (sdk::common && sdk::common->buffs)
+                {
+                    auto stasis = sdk::common->buffs->get_stasis_buff(hero);
+                    if (stasis && stasis->is_active()) continue;
+                }
+
+                const float d = storm_pos.distance(hero->get_position());
+                if (d < nearest_dist)
+                {
+                    nearest_dist = d;
+                    nearest_enemy = hero;
+                }
+            }
+
+            if (nearest_enemy)
+                move_r_to_target(nearest_enemy);
+
+            return;
+        }
 
         // Lead by base lag + storm travel to current cluster centroid.
         math::vector3 raw_centroid{};
@@ -2192,6 +2250,8 @@ namespace viktor
         for (auto hero : g_sdk->object_manager->get_heroes())
         {
             if (!is_valid_target(hero, e_reach)) continue;
+            if (is_in_stasis(hero)) continue;
+            if (is_damage_immune(hero)) continue;
 
             const auto  hpos = hero->get_position();
             const auto  hvel = hero->get_velocity();
@@ -2348,6 +2408,8 @@ namespace viktor
 
         if (!target->is_valid() || target->is_dead() || !target->is_targetable()) return false;
         if (target->is_monster() && !target->is_visible()) return false;
+        if (is_in_stasis(target)) return false;
+        if (is_damage_immune(target)) return false;
 
         if (!g_sdk->clock_facade) return false;
         const float now_e = g_sdk->clock_facade->get_game_time();
@@ -2532,17 +2594,27 @@ namespace viktor
 
         // Reposition FP along beam_dir so the predicted target sits inside the
         // beam segment. SDK sometimes returns FP near the player, making the
-        // beam fall short when target is past first_click. Center the target
-        // within the beam, clamped to [0, first_click].
+        // beam fall short when target is past first_click. Use a dynamic bias
+        // that nudges the beam toward its endpoint for far / fleeing targets.
         const auto& pp_pred = pred.predicted_position;
         const float tgt_t = (pp_pred.x - ppos.x) * beam_dir.x
                           + (pp_pred.z - ppos.z) * beam_dir.z;
-        const float ideal_fp_dist = tgt_t - beam_len * 0.5f;
+        const float range_frac = std::clamp(tgt_d / e_reach, 0.f, 1.f);
+        float bias = 0.5f + (range_frac - 0.5f) * 0.5f; // 0.25 → 0.75
+        const float longitudinal_vel = vel.x * beam_dir.x + vel.z * beam_dir.z;
+        if (longitudinal_vel > 0.f)
+            bias += std::min(longitudinal_vel / 600.f, 0.35f);
+        bias = std::clamp(bias, 0.2f, 0.9f);
+
+        const float ideal_fp_dist = tgt_t - beam_len * bias;
         const float fp_dist = std::clamp(ideal_fp_dist, 0.f, first_click);
         fp = ppos + beam_dir * fp_dist;
 
-        // Re-extend CP from FP so the beam length is exact.
-        cp = fp + beam_dir * beam_len;
+        // Re-extend CP from FP so the beam length is exact (clamped to total reach).
+        const float cp_total_dist = fp_dist + beam_len;
+        cp = (cp_total_dist > e_reach)
+            ? ppos + beam_dir * e_reach
+            : fp + beam_dir * beam_len;
 
         // Reject FP behind the player relative to the target.
         const auto to_tgt = (tpos - ppos).to_direction();
@@ -2858,9 +2930,9 @@ namespace viktor
         if (!cat) return;
 
         auto q_menu = cat->add_sub_category("q_siphon_power", "Q - Siphon Power");
-        q_menu->add_checkbox("flee", "Use Q in Flee", menu::use_q_flee, [](bool v) { menu::use_q_flee = v; });
         q_menu->add_checkbox("combo", "Use in Combo", menu::use_q_combo, [](bool v) { menu::use_q_combo = v; });
         q_menu->add_checkbox("harass", "Use in Harass", menu::use_q_harass, [](bool v) { menu::use_q_harass = v; });
+        q_menu->add_checkbox("flee", "Use in Flee", menu::use_q_flee, [](bool v) { menu::use_q_flee = v; });
         q_menu->add_checkbox("lasthit", "Lasthit", menu::lasthit_q, [](bool v) { menu::lasthit_q = v; });
         q_menu->add_checkbox("clear", "Use in Clear", menu::use_q_clear, [](bool v) { menu::use_q_clear = v; });
         q_menu->add_checkbox("killsteal", "Killsteal", menu::ks_q, [](bool v) { menu::ks_q = v; });

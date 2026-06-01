@@ -1368,24 +1368,6 @@ namespace orianna
             const uint32_t c = get_draw_color(SLOT_Q, menu::color_q);
             if (c) draw_circle(ppos, spell_data::q_range, c);
         }
-        if (menu::draw_q_landing && sdk::prediction && sdk::target_selector) {
-            // Show where Q would actually detonate against the current TS pick.
-            // Use a permissive hitchance so the indicator stays visible even
-            // when the predictor only has "low" confidence — purely informational.
-            auto* target = pick_hero_target(spell_data::q_range);
-            if (target) {
-                const auto pred = predict_q(target, pred_sdk::hitchance::low);
-                if (pred.is_valid) {
-                    const uint32_t base = get_draw_color(SLOT_Q, menu::color_q);
-                    if (base) {
-                        // Translucent fill so it doesn't drown out the range ring.
-                        const uint32_t fill = (base & 0x00FFFFFFu) | 0x70000000u;
-                        draw_circle(pred.cast_position,
-                                    spell_data::q_effect_radius, fill);
-                    }
-                }
-            }
-        }
         if (menu::draw_e_range) {
             const uint32_t c = get_draw_color(SLOT_E, menu::color_e);
             if (c) draw_circle(ppos, spell_data::e_range, c);
@@ -1666,8 +1648,6 @@ namespace orianna
         q_menu->add_separator();
         q_menu->add_checkbox("draw_range", "Draw Range", menu::draw_q_range,
             [](bool v) { menu::draw_q_range = v; });
-        q_menu->add_checkbox("draw_landing", "Draw Q Landing", menu::draw_q_landing,
-            [](bool v) { menu::draw_q_landing = v; });
 
         // W — Command: Dissonance
         auto w_menu = s_menu->add_sub_category("w_command_dissonance", "W - Command: Dissonance");

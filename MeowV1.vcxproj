@@ -71,6 +71,9 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <OutDir>..\..\..\..\AppData\Local\VEN\League\Modules\</OutDir>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
@@ -150,9 +153,13 @@
     <ClInclude Include="..\ts_sdk.hpp" />
     <ClInclude Include="mel.h" />
     <ClInclude Include="mel_spell_db.hpp" />
+    <ClInclude Include="ahri.h" />
+    <ClInclude Include="hwei.h" />
+    <ClInclude Include="jax.h" />
     <ClInclude Include="orianna.h" />
     <ClInclude Include="shyvana.h" />
     <ClInclude Include="syndra.h" />
+    <ClInclude Include="vex.h" />
     <ClInclude Include="veigar.h" />
     <ClInclude Include="viktor.h" />
     <ClInclude Include="zaahen.h" />
@@ -160,9 +167,13 @@
   <ItemGroup>
     <ClCompile Include="..\main.cpp" />
     <ClCompile Include="mel.cpp" />
+    <ClCompile Include="ahri.cpp" />
+    <ClCompile Include="hwei.cpp" />
+    <ClCompile Include="jax.cpp" />
     <ClCompile Include="orianna.cpp" />
     <ClCompile Include="shyvana.cpp" />
     <ClCompile Include="syndra.cpp" />
+    <ClCompile Include="vex.cpp" />
     <ClCompile Include="veigar.cpp" />
     <ClCompile Include="viktor.cpp" />
     <ClCompile Include="zaahen.cpp" />

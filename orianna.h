@@ -125,7 +125,6 @@ namespace orianna
 
         // --- Drawings ---
         inline bool draw_q_range      = true;
-        inline bool draw_q_landing    = false;    // show predicted Q detonation circle
         inline bool draw_w_range      = true;     // W range at ball
         inline bool draw_e_range      = false;    // E range from player
         inline bool draw_r_range      = true;     // R range at ball

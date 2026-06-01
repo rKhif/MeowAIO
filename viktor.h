@@ -21,15 +21,13 @@ namespace viktor
         constexpr float q_range = 715.f;
         constexpr float q_cast_time = 0.25f;
 
-        // W: Gravity Field — circular AoE, instant placement.
+        // W: Gravity Fiel.
         constexpr float w_range = 800.f;
         constexpr float w_radius = 340.f;
         constexpr float w_activation_delay = 0.75f;
         constexpr float w_stun_duration    = 1.5f;
 
-        // E: Death Ray — vector spell, FP → CP beam sweep.
-        //   e_range = total reach (= cast_range + beam_length, 550 + 700)
-        //   e_delay = anti-spam window between consecutive E casts
+        // E: Death Ray 
         constexpr float e_range  = 1250.f;
         constexpr float e_radius = 45.f;
         constexpr float e_speed  = 1050.f;

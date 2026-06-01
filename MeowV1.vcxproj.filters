@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <Filter Include="Source Files">
@@ -93,6 +93,18 @@
     <ClInclude Include="mel_spell_db.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="ahri.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="hwei.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="vex.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="jax.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\main.cpp">
@@ -117,6 +129,18 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="mel.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ahri.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="hwei.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="vex.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="jax.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

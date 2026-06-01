@@ -6,15 +6,27 @@
 
 #include "utility/defensive_buffs.hpp"
 #include "utility/helpers.hpp"
+#include "evade_sdk.hpp"
 
 namespace ahri
 {
     static menu_category* s_menu = nullptr;
 
     static constexpr float MIN_SPELL_DELAY = 0.05f;
+    static constexpr float Q_MAGNET_WINDOW = 2.5f;
+    static constexpr float Q_MAGNET_REISSUE_DELAY = 0.05f;
+    static constexpr float HARASS_W_WINDOW = 0.6f;
     static float           last_spell_cast_time = 0.f;
     static float           last_q_cast_time     = 0.f;
     static float           last_e_cast_time     = 0.f;
+    static float           last_auto_time       = 0.f;
+    static uint32_t        last_auto_target_id  = 0;
+
+    static bool            q_magnet_active      = false;
+    static float           q_magnet_expire_time = 0.f;
+    static math::vector3   q_magnet_end_pos     {};
+    static game_object*    q_magnet_target      = nullptr;
+    static float           q_magnet_last_order  = 0.f;
 
     // ============================================================================
     // SPELL VALIDATION
@@ -127,6 +139,22 @@ namespace ahri
         if (!t) return false;
         auto* b = t->get_buff_by_hash(spell_data::buff_hash_e_charm);
         return b && b->is_active();
+    }
+
+    static bool target_in_stasis(game_object* t)
+    {
+        if (!t) return false;
+        if (!sdk::common || !sdk::common->buffs) return false;
+        auto* stasis = sdk::common->buffs->get_stasis_buff(t);
+        return stasis && stasis->is_active();
+    }
+
+    static bool target_is_damage_immune(game_object* t)
+    {
+        if (!t) return false;
+        if (t->has_buff_of_type(buff_type::invulnerability)) return true;
+        if (t->has_buff_of_type(buff_type::spell_immunity)) return true;
+        return false;
     }
 
     // Returns the longest remaining duration (s) of any immobilizing CC on `obj`.
@@ -243,6 +271,11 @@ namespace ahri
     {
         if (!target || !sdk::common || !sdk::prediction) return false;
         if (!is_spell_ready(SLOT_Q) || !has_enough_mana(SLOT_Q)) return false;
+        if (target_is_damage_immune(target) || target_in_stasis(target)) return false;
+
+        const float dist = distance_to(target);
+        const float reach = spell_data::q_range + target->get_bounding_radius();
+        if (dist > reach) return false;
 
         auto pred = predict_q(target, hitchance);
         if (!pred.is_valid || pred.hitchance < hitchance) return false;
@@ -272,11 +305,24 @@ namespace ahri
         return ok;
     }
 
+    static bool can_harass_cast_w(game_object* target)
+    {
+        if (!menu::harass_use_w) return false;
+        if (!target) return false;
+        if (target_is_charmed(target)) return true;
+        if (!g_sdk || !g_sdk->clock_facade) return false;
+        if (last_auto_time <= 0.f) return false;
+        if (last_auto_target_id != target->get_network_id()) return false;
+        const float elapsed = g_sdk->clock_facade->get_game_time() - last_auto_time;
+        return elapsed <= HARASS_W_WINDOW;
+    }
+
     static bool try_e(game_object* target, int hitchance)
     {
         if (!target || !sdk::common || !sdk::prediction) return false;
         if (!is_spell_ready(SLOT_E) || !has_enough_mana(SLOT_E)) return false;
         if (!is_e_cc_chain_safe(target)) return false;
+        if (target_is_damage_immune(target) || target_in_stasis(target)) return false;
 
         auto pred = predict_e(target, hitchance);
         if (!pred.is_valid || pred.hitchance < hitchance) return false;
@@ -334,6 +380,76 @@ namespace ahri
         }
     }
 
+    static void handle_q_magnet()
+    {
+        if (!q_magnet_active) return;
+        if (!menu::combo_q_magnet) {
+            q_magnet_active = false;
+            q_magnet_target = nullptr;
+            return;
+        }
+
+        if (!g_sdk || !g_sdk->object_manager || !g_sdk->clock_facade) return;
+        auto player = g_sdk->object_manager->get_local_player();
+        if (!player || player->is_dead()) {
+            q_magnet_active = false;
+            q_magnet_target = nullptr;
+            return;
+        }
+
+        const float now = g_sdk->clock_facade->get_game_time();
+        if (now >= q_magnet_expire_time) {
+            q_magnet_active = false;
+            q_magnet_target = nullptr;
+            return;
+        }
+
+        if (!q_magnet_target || !q_magnet_target->is_valid() || q_magnet_target->is_dead()
+            || q_magnet_target->get_team_id() == player->get_team_id() || !q_magnet_target->is_visible()) {
+            q_magnet_active = false;
+            q_magnet_target = nullptr;
+            return;
+        }
+
+        if (!sdk::orbwalker || !sdk::common) return;
+        if (sdk::evade && sdk::evade->is_evading()) return;
+        if (!sdk::orbwalker->combo()) return;
+
+        const auto player_pos = player->get_position();
+        const auto ball_pos = q_magnet_end_pos;
+        const auto target_pos = q_magnet_target->get_position();
+
+        float dx = target_pos.x - ball_pos.x;
+        float dz = target_pos.z - ball_pos.z;
+        float len = std::sqrt(dx * dx + dz * dz);
+        if (len <= 1.f) {
+            q_magnet_active = false;
+            return;
+        }
+
+        dx /= len;
+        dz /= len;
+
+        float proj = (player_pos.x - ball_pos.x) * dx + (player_pos.z - ball_pos.z) * dz;
+        math::vector3 anchor{
+            ball_pos.x + dx * proj,
+            player_pos.y,
+            ball_pos.z + dz * proj
+        };
+
+        constexpr float threshold = 40.f;
+        const float dist = player_pos.distance(anchor);
+        if (dist <= threshold) return;
+
+        if (g_sdk->nav_mesh && !g_sdk->nav_mesh->is_pathable(anchor))
+            anchor = g_sdk->nav_mesh->get_nearest_passable_position(anchor);
+
+        if (now - q_magnet_last_order < Q_MAGNET_REISSUE_DELAY) return;
+
+        sdk::common->issue_order(game_object_order::move_to, anchor, false);
+        q_magnet_last_order = now;
+    }
+
     // ============================================================================
     // AUTO Q/E ON CC
     // ============================================================================
@@ -362,6 +478,58 @@ namespace ahri
                 && dist <= spell_data::q_range) {
                 if (try_q(h, pred_sdk::hitchance::low)) return;
             }
+        }
+    }
+
+    void __fastcall on_present()
+    {
+        if (!menu::draw_r_dmg_bar) return;
+        if (!g_sdk || !g_sdk->object_manager || !g_sdk->renderer) return;
+
+        auto p = g_sdk->object_manager->get_local_player();
+        if (!p || !p->is_valid() || p->is_dead()) return;
+
+        auto r_sp = p->get_spell(SLOT_R);
+        if (!r_sp || r_sp->get_level() == 0) return;
+
+        constexpr float HERO_OX = -45.6f;
+        constexpr float HERO_OY = 15.5f;
+        constexpr float HERO_BW = 106.4f;
+        constexpr float HERO_BH = 11.5f;
+
+        const float scale = static_cast<float>(g_sdk->renderer->get_window_height()) / 1080.f;
+        const float ox = HERO_OX * scale;
+        const float oy = HERO_OY * scale;
+        const float bw = HERO_BW * scale;
+        const float bh = HERO_BH * scale;
+
+        for (auto* hero : g_sdk->object_manager->get_heroes())
+        {
+            if (!hero || !hero->is_valid() || hero->is_dead()) continue;
+            if (hero->get_team_id() == p->get_team_id()) continue;
+            if (!hero->is_visible()) continue;
+
+            const float r_dmg = sdk::damage ? sdk::damage->get_spell_damage(p, hero, SLOT_R) : 0.f;
+            if (r_dmg <= 0.f) continue;
+
+            const float hp = hero->get_hp();
+            const float mhp = hero->get_max_hp();
+            if (mhp <= 0.f || hp <= 0.f) continue;
+
+            const auto hbar = hero->get_health_bar_position();
+            if (hbar.x < 1.f && hbar.y < 1.f) continue;
+
+            const float r0 = hp / mhp;
+            const float r1 = std::max(0.f, hp - r_dmg) / mhp;
+            if (r0 <= r1) continue;
+
+            math::rect rc{};
+            rc.left   = hbar.x + ox + r1 * bw;
+            rc.top    = hbar.y + oy;
+            rc.right  = hbar.x + ox + r0 * bw;
+            rc.bottom = hbar.y + oy + bh;
+
+            g_sdk->renderer->add_rectangle_filled(rc, menu::color_r_dmg);
         }
     }
 
@@ -419,6 +587,7 @@ namespace ahri
         if (!target) return;
 
         if (menu::harass_use_e && try_e(target, menu::combo_e_hitchance)) return;
+        if (can_harass_cast_w(target) && try_w(target)) return;
         if (menu::harass_use_q && try_q(target, menu::combo_q_hitchance)) return;
     }
 
@@ -539,7 +708,7 @@ namespace ahri
         auto* target = pick_hero_target(spell_data::e_range);
         if (!target) return;
 
-        try_e(target, menu::semi_e_hitchance);
+        try_e(target, menu::combo_e_hitchance);
     }
 
     // ============================================================================
@@ -554,6 +723,7 @@ namespace ahri
         if (menu::semi_e_active) { semi_e(); return; }
 
         handle_auto_cc();
+        handle_q_magnet();
         killsteal_q();
 
         if (!sdk::orbwalker) return;
@@ -617,44 +787,33 @@ namespace ahri
         }
         if (menu::draw_e_range) {
             const uint32_t c = get_draw_color(SLOT_E, menu::color_e);
-            if (c) draw_circle(pos, spell_data::e_range, c);
+            if (c) {
+                if (menu::draw_e_rgb && sdk::shaders)
+                    sdk::shaders->draw_world_circle(pos, spell_data::e_range, 2.f, c,
+                        shaders_sdk::world_circle_style::rgb);
+                else
+                    draw_circle(pos, spell_data::e_range, c);
+            }
         }
         if (menu::draw_r_range) {
             const uint32_t c = get_draw_color(SLOT_R, menu::color_r);
             if (c) draw_circle(pos, spell_data::r_dash_range, c);
         }
 
-        // Combo mode label above player
-        if (menu::draw_combo_mode && g_sdk->renderer) {
+        if (menu::draw_e_first_indicator && menu::combo_e_first && g_sdk->renderer) {
             const auto screen = g_sdk->renderer->world_to_screen(pos);
-            const char* label = menu::combo_e_first ? "E FIRST" : "NORMAL";
-            const uint32_t color = menu::combo_e_first ? 0xFFFF40C0u : 0xFF80FFC0u;
-            g_sdk->renderer->add_text(label, 14.f, { screen.x, screen.y - 80.f }, 1, color);
+            g_sdk->renderer->add_text("E FIRST: ON", 16.f,
+                { screen.x, screen.y + 42.f }, 1, 0xFF20FFB0u);
         }
 
-        if ((menu::draw_damage_bar || menu::draw_killable_text || menu::draw_r_dmg_bar)
-            && sdk::damage && g_sdk->renderer) {
+        if (menu::draw_r_dmg_bar && sdk::damage && g_sdk->renderer) {
             const bool r_learned = is_spell_learned(SLOT_R);
             const float scale = (float)g_sdk->renderer->get_window_height() / 1080.f;
             const float ox = -45.6f * scale, oy = 15.5f * scale;
             const float bw = 106.4f * scale, bh = 11.5f * scale;
             for (auto* h : g_sdk->object_manager->get_heroes()) {
                 if (!is_valid_target(h)) continue;
-                const float dmg = get_combo_damage(h);
-
-                if (menu::draw_damage_bar && dmg > 0.f)
-                    g_sdk->renderer->add_damage_indicator(h, dmg);
-
-                if (menu::draw_killable_text && dmg > 0.f
-                    && dmg >= h->get_hp() + h->get_all_shield()) {
-                    const auto hbar = h->get_health_bar_position();
-                    if (!(hbar.x < 1.f && hbar.y < 1.f)) {
-                        g_sdk->renderer->add_text("KILL", 14.f,
-                            { hbar.x, hbar.y - 20.f }, 1, 0xFF00E600u);
-                    }
-                }
-
-                if (menu::draw_r_dmg_bar && r_learned) {
+                if (r_learned) {
                     const float r_dmg = sdk::damage->get_spell_damage(p, h, SLOT_R);
                     const float hp = h->get_hp(), mhp = h->get_max_hp();
                     if (r_dmg > 0.f && mhp > 0.f && hp > 0.f) {
@@ -691,6 +850,52 @@ namespace ahri
         try_e(obj, pred_sdk::hitchance::low);
     }
 
+    void __fastcall on_execute_cast(game_object* obj, spell_cast* cast)
+    {
+        if (!obj || !cast || !g_sdk || !g_sdk->object_manager || !g_sdk->clock_facade) return;
+        auto player = g_sdk->object_manager->get_local_player();
+        if (!player || obj->get_network_id() != player->get_network_id()) return;
+
+        if (!menu::combo_q_magnet || cast->get_spell_slot() != SLOT_Q) return;
+
+        math::vector3 start = cast->get_start_pos();
+        math::vector3 end   = cast->get_end_pos();
+        float dx = end.x - start.x;
+        float dz = end.z - start.z;
+        float len = std::sqrt(dx * dx + dz * dz);
+        if (len <= 1.f) return;
+
+        dx /= len;
+        dz /= len;
+
+        q_magnet_active = true;
+        q_magnet_expire_time = g_sdk->clock_facade->get_game_time() + Q_MAGNET_WINDOW;
+        q_magnet_target = cast->get_target();
+        q_magnet_last_order = 0.f;
+
+        q_magnet_end_pos.x = start.x + dx * spell_data::q_range;
+        q_magnet_end_pos.y = start.y;
+        q_magnet_end_pos.z = start.z + dz * spell_data::q_range;
+    }
+
+    void __fastcall on_basic_attack(game_object* obj, game_object* target, spell_cast* /*cast*/)
+    {
+        if (!g_sdk || !g_sdk->object_manager || !g_sdk->clock_facade) return;
+        if (!obj) return;
+
+        auto player = g_sdk->object_manager->get_local_player();
+        if (!player || obj->get_network_id() != player->get_network_id()) return;
+
+        last_auto_time = g_sdk->clock_facade->get_game_time();
+
+        if (target && target->is_valid() && !target->is_dead()
+            && target->is_hero() && target->get_team_id() != player->get_team_id()) {
+            last_auto_target_id = target->get_network_id();
+        } else {
+            last_auto_target_id = 0;
+        }
+    }
+
     void __fastcall on_buff_gain(game_object* /*obj*/, buff_instance* /*buff*/) {}
     void __fastcall on_buff_loss(game_object* /*obj*/, buff_instance* /*buff*/) {}
 
@@ -711,73 +916,63 @@ namespace ahri
         auto q_menu = s_menu->add_sub_category("q_orb_of_deception", "Q - Orb of Deception");
         q_menu->add_checkbox("combo",  "Use in Combo",  menu::combo_use_q,  [](bool v) { menu::combo_use_q = v; });
         q_menu->add_checkbox("harass", "Use in Harass", menu::harass_use_q, [](bool v) { menu::harass_use_q = v; });
+        q_menu->add_checkbox("combo_magnet", "Q Magnet", menu::combo_q_magnet,
+            [](bool v) { menu::combo_q_magnet = v; });
+        q_menu->add_checkbox("auto_cc", "Auto Q on CC", menu::auto_q_cc,
+            [](bool v) { menu::auto_q_cc = v; });
+        q_menu->add_checkbox("ks", "Killsteal", menu::ks_use_q,
+            [](bool v) { menu::ks_use_q = v; });
         q_menu->add_checkbox("clear",  "Use in Clear",  menu::clear_use_q,  [](bool v) { menu::clear_use_q = v; });
         q_menu->add_slider_int("c_min", "  Clear Min Hits", 1, 6, 1, menu::clear_q_min,
             [](int v) { menu::clear_q_min = v; });
-        q_menu->add_checkbox("ks", "Killsteal", menu::ks_use_q,
-            [](bool v) { menu::ks_use_q = v; });
-        q_menu->add_separator();
         q_menu->add_slider_int("hitchance", "Hitchance", 0, 100, 1, menu::combo_q_hitchance,
             [](int v) { menu::combo_q_hitchance = v; });
-        q_menu->add_checkbox("auto_cc", "Auto Q on CC", menu::auto_q_cc,
-            [](bool v) { menu::auto_q_cc = v; });
-        q_menu->add_separator();
         q_menu->add_checkbox("draw_range", "Draw Range", menu::draw_q_range,
             [](bool v) { menu::draw_q_range = v; });
-
-        // W — Fox-Fire
-        auto w_menu = s_menu->add_sub_category("w_fox_fire", "W - Fox-Fire");
-        w_menu->add_checkbox("combo", "Use in Combo", menu::combo_use_w,
-            [](bool v) { menu::combo_use_w = v; });
-        w_menu->add_separator();
-        w_menu->add_checkbox("draw_range", "Draw Range", menu::draw_w_range,
-            [](bool v) { menu::draw_w_range = v; });
 
         // E — Charm
         auto e_menu = s_menu->add_sub_category("e_charm", "E - Charm");
         e_menu->add_checkbox("combo",  "Use in Combo",  menu::combo_use_e,  [](bool v) { menu::combo_use_e = v; });
         e_menu->add_checkbox("harass", "Use in Harass", menu::harass_use_e, [](bool v) { menu::harass_use_e = v; });
         e_menu->add_separator();
+        e_menu->add_checkbox("auto_cc", "Auto E on CC", menu::auto_e_cc,
+            [](bool v) { menu::auto_e_cc = v; });
+        e_menu->add_checkbox("antigap", "Anti Gap", menu::antigap_e,
+            [](bool v) { menu::antigap_e = v; });
         e_menu->add_slider_int("hitchance", "Hitchance", 0, 100, 1, menu::combo_e_hitchance,
             [](int v) { menu::combo_e_hitchance = v; });
-        e_menu->add_checkbox("auto_cc", "Auto E on CC (chain-safe)", menu::auto_e_cc,
-            [](bool v) { menu::auto_e_cc = v; });
-        e_menu->add_checkbox("antigap", "Anti-Gap-Closer E", menu::antigap_e,
-            [](bool v) { menu::antigap_e = v; });
-        e_menu->add_separator();
-        e_menu->add_slider_int("semi_hc", "Semi-E Hitchance", 0, 100, 1, menu::semi_e_hitchance,
-            [](int v) { menu::semi_e_hitchance = v; });
-        e_menu->add_hotkey("semi_e", "Semi-Manual E (best target)", 'G', false, false,
+        e_menu->add_hotkey("combo_mode_toggle", "E First Combo", 'Y', false, true,
+            [](std::string* /*hk*/, bool active) { menu::combo_e_first = active; });
+
+        e_menu->add_hotkey("semi_e", "Semi-Manual E", 'G', false, false,
             [](std::string* hk, bool pressed) {
                 menu::semi_e_active = pressed;
                 if (hk) menu::semi_e_key_str = *hk;
             });
-        e_menu->add_separator();
         e_menu->add_checkbox("draw_range", "Draw Range", menu::draw_e_range,
             [](bool v) { menu::draw_e_range = v; });
+        e_menu->add_checkbox("draw_rgb", "Draw Rainbow", menu::draw_e_rgb,
+            [](bool v) { menu::draw_e_rgb = v; });
+
+        // W — Fox-Fire
+        auto w_menu = s_menu->add_sub_category("w_fox_fire", "W - Fox-Fire");
+        w_menu->add_checkbox("combo", "Use in Combo", menu::combo_use_w,
+            [](bool v) { menu::combo_use_w = v; });
+        w_menu->add_checkbox("harass", "Use in Harass", menu::harass_use_w,
+            [](bool v) { menu::harass_use_w = v; });
+        w_menu->add_checkbox("draw_range", "Draw Range", menu::draw_w_range,
+            [](bool v) { menu::draw_w_range = v; });
 
         // R — Spirit Rush
         auto r_menu = s_menu->add_sub_category("r_spirit_rush", "R - Spirit Rush");
-        r_menu->add_checkbox("combo", "Use R to Gap-Close in Combo", menu::combo_use_r,
+        r_menu->add_checkbox("combo", "Use R to gap close", menu::combo_use_r,
             [](bool v) { menu::combo_use_r = v; });
-        r_menu->add_separator();
-        r_menu->add_checkbox("draw_range", "Draw Dash Range", menu::draw_r_range,
+        r_menu->add_checkbox("draw_range", "Draw Range", menu::draw_r_range,
             [](bool v) { menu::draw_r_range = v; });
-        r_menu->add_hotkey("semi_r", "Semi-Manual R (cursor)", 'T', false, false,
+        r_menu->add_hotkey("semi_r", "Semi-Manual R", 'T', false, false,
             [](std::string* hk, bool pressed) {
                 menu::semi_r_active = pressed;
                 if (hk) menu::semi_r_key_str = *hk;
-            });
-
-        // Combo mode toggle
-        auto combo_menu = s_menu->add_sub_category("combo_mode", "Combo Mode");
-        combo_menu->add_checkbox("e_first", "E First Mode", menu::combo_e_first,
-            [](bool v) { menu::combo_e_first = v; });
-        combo_menu->add_hotkey("e_first_toggle", "Toggle E First", 'Y', false, true,
-            [](std::string* /*hk*/, bool active) {
-                menu::combo_e_first = active;
-                if (g_sdk) g_sdk->log_console("[Ahri] Combo mode: %s",
-                    active ? "E FIRST" : "NORMAL");
             });
 
         // Mana
@@ -791,14 +986,10 @@ namespace ahri
         auto draw_menu = s_menu->add_sub_category("drawings", "Drawings");
         draw_menu->add_checkbox("only_ready", "Only Ready Spells", menu::draw_only_ready,
             [](bool v) { menu::draw_only_ready = v; });
-        draw_menu->add_checkbox("dmg",     "Combo Damage Indicator", menu::draw_damage_bar,
-            [](bool v) { menu::draw_damage_bar = v; });
-        draw_menu->add_checkbox("r_dmg_bar", "R Damage Indicator (HP-bar overlay)", menu::draw_r_dmg_bar,
+        draw_menu->add_checkbox("r_dmg_bar", "R Damage Indicator", menu::draw_r_dmg_bar,
             [](bool v) { menu::draw_r_dmg_bar = v; });
-        draw_menu->add_checkbox("kill",    "KILL Text on Killable", menu::draw_killable_text,
-            [](bool v) { menu::draw_killable_text = v; });
-        draw_menu->add_checkbox("mode",    "Combo Mode Indicator", menu::draw_combo_mode,
-            [](bool v) { menu::draw_combo_mode = v; });
+        draw_menu->add_checkbox("e_first_indicator", "E-First Indicator", menu::draw_e_first_indicator,
+            [](bool v) { menu::draw_e_first_indicator = v; });
         draw_menu->add_separator();
         draw_menu->add_colorpicker("col_q", "Q Color", menu::color_q,
             [](uint32_t c) { menu::color_q = c; });
@@ -815,6 +1006,12 @@ namespace ahri
             reinterpret_cast<void*>(on_update));
         g_sdk->event_manager->register_callback(event_manager::event::draw_world,
             reinterpret_cast<void*>(on_draw));
+        g_sdk->event_manager->register_callback(event_manager::event::present,
+            reinterpret_cast<void*>(on_present));
+        g_sdk->event_manager->register_callback(event_manager::event::execute_cast,
+            reinterpret_cast<void*>(on_execute_cast));
+        g_sdk->event_manager->register_callback(event_manager::event::basic_attack,
+            reinterpret_cast<void*>(on_basic_attack));
         g_sdk->event_manager->register_callback(event_manager::event::new_path,
             reinterpret_cast<void*>(on_new_path));
         g_sdk->event_manager->register_callback(event_manager::event::buff_gain,
@@ -838,9 +1035,15 @@ namespace ahri
                     const uint32_t clr = menu::semi_e_active ? 0xFF00FF00u : 0xFFFF0000u;
                     return { menu::semi_e_active ? "ON" : "OFF", clr };
                 });
-        }
 
-        g_sdk->log_console("[MeowAIO] Ahri module loaded");
+            infotab_sdk::text_entry title_e_first{ "E First", 0xFFFFFFFFu };
+            menu::infotab_e_first = sdk::infotab->add_text(title_e_first,
+                []() -> infotab_sdk::text_entry {
+                    const bool enabled = menu::combo_e_first;
+                    const uint32_t clr = enabled ? 0xFF20FFB0u : 0xFFFF8080u;
+                    return { enabled ? "ON" : "OFF", clr };
+                });
+        }
     }
 
     void unload()
@@ -850,6 +1053,12 @@ namespace ahri
                 reinterpret_cast<void*>(on_update));
             g_sdk->event_manager->unregister_callback(event_manager::event::draw_world,
                 reinterpret_cast<void*>(on_draw));
+            g_sdk->event_manager->unregister_callback(event_manager::event::present,
+                reinterpret_cast<void*>(on_present));
+            g_sdk->event_manager->unregister_callback(event_manager::event::execute_cast,
+                reinterpret_cast<void*>(on_execute_cast));
+            g_sdk->event_manager->unregister_callback(event_manager::event::basic_attack,
+                reinterpret_cast<void*>(on_basic_attack));
             g_sdk->event_manager->unregister_callback(event_manager::event::new_path,
                 reinterpret_cast<void*>(on_new_path));
             g_sdk->event_manager->unregister_callback(event_manager::event::buff_gain,
@@ -867,6 +1076,10 @@ namespace ahri
                 sdk::infotab->remove_text(menu::infotab_semi_e);
                 menu::infotab_semi_e = 0;
             }
+            if (menu::infotab_e_first != 0) {
+                sdk::infotab->remove_text(menu::infotab_e_first);
+                menu::infotab_e_first = 0;
+            }
         }
 
         s_menu = nullptr;
@@ -875,7 +1088,5 @@ namespace ahri
         last_e_cast_time = 0.f;
         menu::semi_r_active = false;
         menu::semi_e_active = false;
-
-        if (g_sdk) g_sdk->log_console("[-] Ahri module unloaded");
     }
 }
