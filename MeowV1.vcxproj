@@ -157,6 +157,7 @@
     <ClInclude Include="hwei.h" />
     <ClInclude Include="jax.h" />
     <ClInclude Include="orianna.h" />
+    <ClInclude Include="ryze.h" />
     <ClInclude Include="shyvana.h" />
     <ClInclude Include="syndra.h" />
     <ClInclude Include="vex.h" />
@@ -171,6 +172,7 @@
     <ClCompile Include="hwei.cpp" />
     <ClCompile Include="jax.cpp" />
     <ClCompile Include="orianna.cpp" />
+    <ClCompile Include="ryze.cpp" />
     <ClCompile Include="shyvana.cpp" />
     <ClCompile Include="syndra.cpp" />
     <ClCompile Include="vex.cpp" />

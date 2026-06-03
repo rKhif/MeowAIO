@@ -764,9 +764,6 @@ namespace mel
         auto p = g_sdk->object_manager->get_local_player();
         if (!p || p->is_dead()) return;
 
-        build_reflect_menu_if_needed();
-        build_skip_menu_if_needed();
-
         // Expire brilliance stacks if past the duration
         const float now = g_sdk->clock_facade->get_game_time();
         if (brilliance_expire > 0.f && now > brilliance_expire) {
@@ -997,9 +994,21 @@ namespace mel
 
         // Per-enemy override list — force W on for specific slots regardless of Smart Modes.
         s_w_reflect_menu = w_menu->add_sub_category("reflect", "Force Reflect (per enemy)");
+        if (s_w_reflect_menu) {
+            s_w_reflect_menu->add_label("Spells");
+            build_reflect_menu_if_needed();
+            if (s_w_reflect_map.empty())
+                s_w_reflect_menu->add_label("No enemies detected - join a game and reload.");
+        }
 
         // Per-enemy whitelist — make Smart Modes ignore specific slots/AA per enemy.
         s_w_skip_menu = w_menu->add_sub_category("whitelist", "Whitelist (ignore per enemy)");
+        if (s_w_skip_menu) {
+            s_w_skip_menu->add_label("Spells");
+            build_skip_menu_if_needed();
+            if (s_w_skip_map.empty())
+                s_w_skip_menu->add_label("No enemies detected - join a game and reload.");
+        }
 
         // E — Solar Snare
         auto e_menu = s_menu->add_sub_category("e_solar_snare", "E - Solar Snare");

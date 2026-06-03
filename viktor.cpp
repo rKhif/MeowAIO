@@ -138,6 +138,24 @@ namespace viktor
              + o->get_magical_shield();
     }
 
+    static float distance_2d(const math::vector3& a, const math::vector3& b)
+    {
+        const float dx = b.x - a.x;
+        const float dz = b.z - a.z;
+        return std::sqrt(dx * dx + dz * dz);
+    }
+
+    static math::vector3 direction_2d(const math::vector3& from, const math::vector3& to)
+    {
+        const float dx = to.x - from.x;
+        const float dz = to.z - from.z;
+        const float len = std::sqrt(dx * dx + dz * dz);
+        if (len <= 0.001f)
+            return {};
+
+        return { dx / len, 0.f, dz / len };
+    }
+
     // Hashes mirror meow_shared/utility/defensive_buffs.hpp. 0u placeholders
     static bool has_anti_burst_buff(game_object* o)
     {
@@ -1174,9 +1192,6 @@ namespace viktor
         if (!is_spell_ready(SLOT_E)) return;
         if (!has_enough_mana(SLOT_E)) return;
 
-        auto e = player->get_spell(SLOT_E);
-        if (!e) return;
-
         if (!sdk::prediction) return;
         if (sdk::orbwalker->would_cancel_attack()) return;
 
@@ -1237,8 +1252,8 @@ namespace viktor
 
         const float now_farm_pred = g_sdk->clock_facade ? g_sdk->clock_facade->get_game_time() : 0.f;
         const float e_delay_time = spell_data::e_delay;
-        const float first_click_f = e->get_cast_range();
-        const float beam_len_f = spell_data::e_range - first_click_f;
+        const float first_click_f = spell_data::e_first_click;
+        const float beam_len_f = spell_data::e_beam_len;
 
         auto& target_e_dmg = scratch::farm_e_dmg();
         target_e_dmg.reserve(targets.size());
@@ -1299,10 +1314,10 @@ namespace viktor
             catch (...) { continue; }
             if (!pred.is_valid) continue;
 
-            const float pred_dist = ppos.distance(pred.cast_position);
+            const float pred_dist = distance_2d(ppos, pred.cast_position);
             const float fp_buf    = 30.f + pred_dist * 0.08f;
             const float fp_dist   = std::clamp(pred_dist - fp_buf, 0.f, first_click_f);
-            const auto  dir_pred  = (pred.cast_position - ppos).to_direction();
+            const auto  dir_pred  = direction_2d(ppos, pred.cast_position);
             const auto  fp        = ppos + dir_pred * fp_dist;
             const auto  cp        = fp + dir_pred * beam_len_f;
 
@@ -1327,8 +1342,8 @@ namespace viktor
             centroid.y *= inv_n;
             centroid.z *= inv_n;
 
-            const auto  to_c     = (centroid - ppos).to_direction();
-            const float c_dist   = ppos.distance(centroid);
+            const auto  to_c     = direction_2d(ppos, centroid);
+            const float c_dist   = distance_2d(ppos, centroid);
             const float c_fp_buf = 30.f + c_dist * 0.08f;
             const float c_fp_dist = std::clamp(c_dist - c_fp_buf, 0.f, first_click_f);
 
@@ -1898,9 +1913,6 @@ namespace viktor
         if (!is_spell_ready(SLOT_E)) return;
         if (!has_enough_mana(SLOT_E)) return;
 
-        auto e_spell = player->get_spell(SLOT_E);
-        if (!e_spell) return;
-
         const float now = g_sdk->clock_facade->get_game_time();
         if (now - last_cast_e < spell_data::e_delay) return;
         if (now - m_last_spell_cast_time < MIN_SPELL_DELAY) return;
@@ -1908,9 +1920,8 @@ namespace viktor
 
         const auto  ppos = player->get_position();
         const float e_reach = spell_data::e_range;
-        const float first_click = e_spell->get_cast_range();
-        if (first_click <= 0.f) return;
-        const float beam_len = spell_data::e_range - first_click;
+        const float first_click = spell_data::e_first_click;
+        const float beam_len = spell_data::e_beam_len;
 
         for (auto hero : g_sdk->object_manager->get_heroes())
         {
@@ -1918,7 +1929,7 @@ namespace viktor
             if (hero->get_team_id() == player->get_team_id()) continue;
 
             const auto  hpos = hero->get_position();
-            const float dist = ppos.distance(hpos);
+            const float dist = distance_2d(ppos, hpos);
             if (dist > e_reach) continue;
 
             auto stasis = sdk::common->buffs->get_stasis_buff(hero);
@@ -1934,7 +1945,7 @@ namespace viktor
 
             if (remaining >= (total_time - 0.05f) && remaining <= (total_time + 0.15f))
             {
-                const auto dir = (hpos - ppos).to_direction();
+                const auto dir = direction_2d(ppos, hpos);
                 const auto fp = ppos + dir * fp_d;
                 const auto cp = fp + dir * beam_len;
 
@@ -2237,10 +2248,8 @@ namespace viktor
         const auto  ppos = player->get_position();
         const float e_reach = spell_data::e_range;
 
-        auto e_spell = player->get_spell(SLOT_E);
-        if (!e_spell) return primary;
-        const float first_click = e_spell->get_cast_range();
-        const float beam_len = e_reach - first_click;
+        const float first_click = spell_data::e_first_click;
+        const float beam_len = spell_data::e_beam_len;
 
         auto& in_range = scratch::e_in_range();
         in_range.reserve(5);
@@ -2261,8 +2270,8 @@ namespace viktor
                 hpos.z + hvel.z * PRED_HORIZON
             };
 
-            if (ppos.distance(pred) > e_reach)
-                pred = ppos + (pred - ppos).to_direction() * e_reach;
+            if (distance_2d(ppos, pred) > e_reach)
+                pred = ppos + direction_2d(ppos, pred) * e_reach;
 
             in_range.push_back({ hero, pred });
         }
@@ -2284,10 +2293,10 @@ namespace viktor
 
         auto count_beam_hits = [&](const math::vector3& aim_target) -> int
             {
-                const float aim_d = ppos.distance(aim_target);
+                const float aim_d = distance_2d(ppos, aim_target);
                 if (aim_d < 10.f) return 0;
 
-                const auto  d = (aim_target - ppos).to_direction();
+                const auto  d = direction_2d(ppos, aim_target);
                 const float ideal_fp = aim_d - beam_len * 0.5f;
                 const float fpd = std::clamp(ideal_fp, 0.f, first_click);
                 const auto  fp = ppos + d * fpd;
@@ -2350,8 +2359,8 @@ namespace viktor
                 if (mid_hits > midpoint_best_hits)
                 {
                     midpoint_best_hits = mid_hits;
-                    const float da = ppos.distance(a.pred_pos);
-                    const float db = ppos.distance(b.pred_pos);
+                    const float da = distance_2d(ppos, a.pred_pos);
+                    const float db = distance_2d(ppos, b.pred_pos);
                     midpoint_seed = (da <= db) ? a.hero : b.hero;
                 }
 
@@ -2423,13 +2432,10 @@ namespace viktor
 
         const auto  ppos = player->get_position();
         const float e_reach = spell_data::e_range;
-        if (ppos.distance(target->get_position()) > e_reach) return false;
+        if (distance_2d(ppos, target->get_position()) > e_reach) return false;
 
-        auto e_spell = player->get_spell(SLOT_E);
-        if (!e_spell) return false;
-
-        const float first_click = e_spell->get_cast_range();
-        const float beam_len    = spell_data::e_range - first_click;
+        const float first_click = spell_data::e_first_click;
+        const float beam_len    = spell_data::e_beam_len;
 
         const auto  tpos  = target->get_position();
         const float tgt_d = ppos.distance(tpos);
@@ -2452,7 +2458,7 @@ namespace viktor
                 return false;
             }
 
-            const float aim_dist = ppos.distance(aim_pos);
+            const float aim_dist = distance_2d(ppos, aim_pos);
             if (aim_dist < 10.f)
             {
                 log_e("[E] reject: aim too close %.1f (branch=%s)", aim_dist, branch_name);
@@ -2498,7 +2504,7 @@ namespace viktor
             const float speed = std::sqrt(spd_sq);
             const float perp_x = -vel.z / speed;
             const float perp_z =  vel.x / speed;
-            const auto  to_tgt = (tpos - ppos).to_direction();
+            const auto  to_tgt = direction_2d(ppos, tpos);
             const float sign   = (to_tgt.x * perp_x + to_tgt.z * perp_z > 0.f) ? 1.f : -1.f;
 
             const float offset = spell_data::e_radius + target->get_bounding_radius() + 50.f;
@@ -2507,10 +2513,10 @@ namespace viktor
                 tpos.y,
                 tpos.z + perp_z * sign * offset
             };
-            if (ppos.distance(aim_pos) > e_reach)
-                aim_pos = ppos + (aim_pos - ppos).to_direction() * e_reach;
+            if (distance_2d(ppos, aim_pos) > e_reach)
+                aim_pos = ppos + direction_2d(ppos, aim_pos) * e_reach;
 
-            const auto dir = (aim_pos - ppos).to_direction();
+            const auto dir = direction_2d(ppos, aim_pos);
             return fire(aim_pos, dir, 0.5f, "close-perp");
         }
 
@@ -2521,16 +2527,16 @@ namespace viktor
             if (!path.empty())
             {
                 math::vector3 dash_end = path.back();
-                if (ppos.distance(dash_end) > e_reach)
-                    dash_end = ppos + (dash_end - ppos).to_direction() * e_reach;
-                const auto dir = (dash_end - ppos).to_direction();
+                if (distance_2d(ppos, dash_end) > e_reach)
+                    dash_end = ppos + direction_2d(ppos, dash_end) * e_reach;
+                const auto dir = direction_2d(ppos, dash_end);
                 return fire(dash_end, dir, 0.5f, "dash-end");
             }
         }
 
         if (immobile || nearly_still)
         {
-            const auto dir = (tpos - ppos).to_direction();
+            const auto dir = direction_2d(ppos, tpos);
             return fire(tpos, dir, 0.5f, immobile ? "cc'd" : "still");
         }
 
@@ -2540,9 +2546,9 @@ namespace viktor
         {
             const float lead_t = spell_data::e_delay + std::max(0.f, tgt_d - first_click) / spell_data::e_speed;
             math::vector3 aim_pos = { tpos.x + vel.x * lead_t, tpos.y, tpos.z + vel.z * lead_t };
-            if (ppos.distance(aim_pos) > e_reach)
-                aim_pos = ppos + (aim_pos - ppos).to_direction() * e_reach;
-            const auto dir = (aim_pos - ppos).to_direction();
+            if (distance_2d(ppos, aim_pos) > e_reach)
+                aim_pos = ppos + direction_2d(ppos, aim_pos) * e_reach;
+            const auto dir = direction_2d(ppos, aim_pos);
             return fire(aim_pos, dir, 0.5f, "no-pred-fb");
         }
 
@@ -2578,12 +2584,12 @@ namespace viktor
         math::vector3 fp = pred.first_cast_position;
         math::vector3 cp = pred.cast_position;
 
-        auto beam_dir = (cp - fp).to_direction();
+        auto beam_dir = direction_2d(fp, cp);
         float beam_dir_sq = beam_dir.x * beam_dir.x + beam_dir.z * beam_dir.z;
         if (beam_dir_sq < 0.01f)
         {
             // Fall back to ppos -> predicted target direction.
-            beam_dir = (pred.predicted_position - ppos).to_direction();
+            beam_dir = direction_2d(ppos, pred.predicted_position);
             beam_dir_sq = beam_dir.x * beam_dir.x + beam_dir.z * beam_dir.z;
             if (beam_dir_sq < 0.01f)
             {
@@ -2617,8 +2623,8 @@ namespace viktor
             : fp + beam_dir * beam_len;
 
         // Reject FP behind the player relative to the target.
-        const auto to_tgt = (tpos - ppos).to_direction();
-        const auto fp_dir = (fp - ppos).to_direction();
+        const auto to_tgt = direction_2d(ppos, tpos);
+        const auto fp_dir = direction_2d(ppos, fp);
         const float facing_dot = to_tgt.x * fp_dir.x + to_tgt.z * fp_dir.z;
         if (facing_dot < 0.2f)
         {

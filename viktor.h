@@ -29,6 +29,8 @@ namespace viktor
 
         // E: Death Ray 
         constexpr float e_range  = 1250.f;
+        constexpr float e_first_click = 550.f;
+        constexpr float e_beam_len = e_range - e_first_click;
         constexpr float e_radius = 45.f;
         constexpr float e_speed  = 1050.f;
         constexpr float e_delay  = 0.25f;
