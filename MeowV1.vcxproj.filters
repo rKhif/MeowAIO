@@ -96,6 +96,12 @@
     <ClInclude Include="mel_spell_db.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="annie.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="taliyah.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="ahri.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -135,6 +141,12 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="mel.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="annie.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="taliyah.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="ahri.cpp">

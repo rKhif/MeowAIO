@@ -20,7 +20,7 @@ namespace ryze
         inline bool combo_use_w = true;
         inline bool combo_use_e = true;
         inline bool combo_flux_q_collision = true;
-        inline int  combo_q_hitchance = pred_sdk::hitchance::high;
+        inline int  combo_q_hitchance = pred_sdk::hitchance::very_high;
         inline int  combo_mode = 0;
 
         inline bool harass_use_q = true;
@@ -163,6 +163,7 @@ namespace ryze
             auto* p = player();
             if (!p || !unit) return false;
             if (!unit->is_valid() || unit->is_dead() || !unit->is_targetable() || !unit->is_visible()) return false;
+            if (unit->is_plant()) return false;
             if (unit->get_team_id() == p->get_team_id()) return false;
             if (range != FLT_MAX && p->get_position().distance(unit->get_position()) > range) return false;
             return true;
@@ -185,6 +186,40 @@ namespace ryze
             }
 
             return nullptr;
+        }
+
+        static int effective_q_hitchance(game_object* target, int hitchance)
+        {
+            auto* p = player();
+            if (!p || !target || !target->is_hero())
+                return hitchance;
+
+            const float dist = p->get_position().distance(target->get_position());
+            int effective = hitchance;
+
+            if (dist > 850.f)
+                effective = (std::max)(effective, static_cast<int>(pred_sdk::hitchance::very_high));
+            else if (dist > 650.f)
+                effective = (std::max)(effective, static_cast<int>(pred_sdk::hitchance::high));
+
+            if (dist > 550.f && target->get_move_speed() > 420.f)
+                effective = (std::max)(effective, static_cast<int>(pred_sdk::hitchance::very_high));
+
+            return effective;
+        }
+
+        static bool is_unstable_q_prediction(game_object* target, const pred_sdk::pred_data& pred)
+        {
+            auto* p = player();
+            if (!p || !target || !target->is_hero())
+                return false;
+
+            const float dist = p->get_position().distance(target->get_position());
+            if (dist <= 600.f)
+                return false;
+
+            return pred.state == pred_sdk::prediction_state::juking
+                || pred.state == pred_sdk::prediction_state::awaiting_netvar_update;
         }
 
         static pred_sdk::pred_data predict_q(game_object* target, int hitchance)
@@ -214,32 +249,58 @@ namespace ryze
             if (!sdk::common || !sdk::prediction || !target) return false;
             if (!is_spell_ready(SLOT_Q) || !has_enough_mana(SLOT_Q)) return false;
 
-            const auto pred = predict_q(target, hitchance);
-            if (!pred.is_valid || pred.hitchance < hitchance) return false;
+            const int effective_hc = effective_q_hitchance(target, hitchance);
+            const auto pred = predict_q(target, effective_hc);
+            if (!pred.is_valid || pred.hitchance < effective_hc) return false;
+            if (is_unstable_q_prediction(target, pred)) return false;
 
             const bool ok = sdk::common->cast_spell(SLOT_Q, pred.cast_position);
             if (ok) s_last_spell_cast_time = game_time();
             return ok;
         }
 
-        static bool cast_w(game_object* target)
+        static bool cast_w(game_object* target, bool bypass_anti_buffering = false)
         {
-            if (!sdk::common || !target) return false;
+            auto* p = player();
+            if (!p || !target) return false;
+            if (!sdk::common && !bypass_anti_buffering) return false;
             if (!is_spell_ready(SLOT_W) || !has_enough_mana(SLOT_W)) return false;
             if (!is_valid_target(target, sc::W_RANGE)) return false;
 
-            const bool ok = sdk::common->cast_spell(SLOT_W, target);
+            bool ok = false;
+            if (bypass_anti_buffering)
+            {
+                p->cast_spell(SLOT_W, target);
+                ok = true;
+            }
+            else
+            {
+                ok = sdk::common->cast_spell(SLOT_W, target);
+            }
+
             if (ok) s_last_spell_cast_time = game_time();
             return ok;
         }
 
-        static bool cast_e(game_object* target)
+        static bool cast_e(game_object* target, bool bypass_anti_buffering = false)
         {
-            if (!sdk::common || !target) return false;
+            auto* p = player();
+            if (!p || !target) return false;
+            if (!sdk::common && !bypass_anti_buffering) return false;
             if (!is_spell_ready(SLOT_E) || !has_enough_mana(SLOT_E)) return false;
             if (!is_valid_target(target, sc::E_RANGE)) return false;
 
-            const bool ok = sdk::common->cast_spell(SLOT_E, target);
+            bool ok = false;
+            if (bypass_anti_buffering)
+            {
+                p->cast_spell(SLOT_E, target);
+                ok = true;
+            }
+            else
+            {
+                ok = sdk::common->cast_spell(SLOT_E, target);
+            }
+
             if (ok) s_last_spell_cast_time = game_time();
             return ok;
         }
@@ -299,7 +360,7 @@ namespace ryze
 
         static void cycle_combo_mode()
         {
-            menu::combo_mode = (menu::combo_mode + 1) % 3;
+            menu::combo_mode = (menu::combo_mode + 1) % 4;
         }
 
         static bool is_flux_buff(buff_instance* buff)
@@ -591,7 +652,7 @@ namespace ryze
                 const float alignment = dot / (len_t * len_m);
                 if (alignment < 0.85f) continue;
 
-                return cast_q(minion, pred_sdk::hitchance::low);
+                return cast_q(minion, pred_sdk::hitchance::medium);
             }
 
             return false;
@@ -607,10 +668,12 @@ namespace ryze
             const auto player_pos = p->get_position();
             const auto target_pos = target->get_position();
             const float target_dist = player_pos.distance(target_pos);
-            const auto direct_pred = predict_q(target, menu::combo_q_hitchance);
+            const int direct_hc = effective_q_hitchance(target, menu::combo_q_hitchance);
+            const auto direct_pred = predict_q(target, direct_hc);
 
             // Keep the normal direct pattern when Q already has a clean line.
-            if (direct_pred.is_valid && direct_pred.hitchance >= menu::combo_q_hitchance)
+            if (direct_pred.is_valid && direct_pred.hitchance >= direct_hc
+                && !is_unstable_q_prediction(target, direct_pred))
                 return false;
 
             game_object* best_minion = nullptr;
@@ -655,8 +718,10 @@ namespace ryze
 
             if (menu::combo_flux_q_collision)
             {
-                const auto direct_pred = predict_q(target, menu::combo_q_hitchance);
-                if (!direct_pred.is_valid || direct_pred.hitchance < menu::combo_q_hitchance)
+                const int direct_hc = effective_q_hitchance(target, menu::combo_q_hitchance);
+                const auto direct_pred = predict_q(target, direct_hc);
+                if (!direct_pred.is_valid || direct_pred.hitchance < direct_hc
+                    || is_unstable_q_prediction(target, direct_pred))
                 {
                     if (try_q_on_fluxed_collision(target)) return true;
                 }
@@ -893,7 +958,7 @@ namespace ryze
 
             if (s_semi_root_target && w_ready && is_valid_target(s_semi_root_target, sc::W_RANGE))
             {
-                if (cast_w(s_semi_root_target))
+                if (cast_w(s_semi_root_target, true))
                 {
                     s_semi_root_target = nullptr;
                     s_semi_root_expire_time = 0.f;
@@ -911,13 +976,13 @@ namespace ryze
 
             if (has_flux(target) && w_ready)
             {
-                cast_w(target);
+                cast_w(target, true);
                 return;
             }
 
             if (e_ready)
             {
-                if (cast_e(target))
+                if (cast_e(target, true))
                 {
                     s_semi_root_target = target;
                     s_semi_root_expire_time = game_time() + SEMI_ROOT_BUFFER_WINDOW;

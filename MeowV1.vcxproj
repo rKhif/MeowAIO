@@ -107,7 +107,7 @@
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <AdditionalIncludeDirectories>$(ProjectDir)..\;$(ProjectDir)..\VENPlus-main\venp_shared\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
@@ -153,6 +153,8 @@
     <ClInclude Include="..\ts_sdk.hpp" />
     <ClInclude Include="mel.h" />
     <ClInclude Include="mel_spell_db.hpp" />
+    <ClInclude Include="annie.h" />
+    <ClInclude Include="taliyah.h" />
     <ClInclude Include="ahri.h" />
     <ClInclude Include="hwei.h" />
     <ClInclude Include="jax.h" />
@@ -168,6 +170,8 @@
   <ItemGroup>
     <ClCompile Include="..\main.cpp" />
     <ClCompile Include="mel.cpp" />
+    <ClCompile Include="annie.cpp" />
+    <ClCompile Include="taliyah.cpp" />
     <ClCompile Include="ahri.cpp" />
     <ClCompile Include="hwei.cpp" />
     <ClCompile Include="jax.cpp" />
