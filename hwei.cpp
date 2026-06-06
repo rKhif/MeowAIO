@@ -59,6 +59,10 @@ namespace hwei
             bool repredict = false;
             pred_sdk::spell_data repredict_spell{};
             int repredict_hitchance = 0;
+            // When set, the engine keeps re-validating the (minion) target right
+            // up to the moment the shot fires and aborts if it has died or is no
+            // longer last-hittable. Prevents wasting QQ on an already-dead minion.
+            bool lasthit_guard = false;
         };
 
         constexpr ability_info ABILITY_QQ{ subject::disaster, SLOT_Q, ability_cast::position };
@@ -121,6 +125,7 @@ namespace hwei
         static bool s_subject_cache_authoritative = false;
 
         bool execute_cast_engine();
+        float get_qq_damage(game_object* target);
 
         inline float now()
         {
@@ -998,6 +1003,37 @@ namespace hwei
 
             if (t - s_last_cast_time < MIN_CAST_INTERVAL)
                 return false;
+
+            // Last-hit safety: keep re-checking the minion up to the moment we
+            // fire. The subject-select + cast delay is long enough for the minion
+            // to die (our auto, allied minions) or to no longer be killable, in
+            // which case firing QQ just wastes the cast.
+            if (s_intent.lasthit_guard && !s_intent.followup_sent)
+            {
+                auto* tgt = s_intent.target;
+                bool abort = (!tgt || !tgt->is_valid() || tgt->is_dead() || !tgt->is_targetable());
+                if (!abort)
+                {
+                    const float dist = player->get_position().distance(tgt->get_position());
+                    const float hit_time = spell_data::qq_delay + dist / spell_data::qq_speed;
+                    float hp = tgt->get_hp();
+                    if (sdk::health_prediction)
+                    {
+                        const float pred_hp = sdk::health_prediction->get_predicted_health(tgt, now() + hit_time);
+                        if (pred_hp >= 0.f)
+                            hp = pred_hp;
+                    }
+                    const float dmg = get_qq_damage(tgt);
+                    // Already dying to other damage, or no longer lethal -> skip.
+                    if (hp <= 0.f || hp > dmg)
+                        abort = true;
+                }
+                if (abort)
+                {
+                    reset_cast_engine(false, "lasthit-target-gone");
+                    return false;
+                }
+            }
 
             if (s_intent.info.mood == subject::none)
             {
@@ -2097,6 +2133,7 @@ namespace hwei
 
             if (queue_cast_intent(ABILITY_QQ, best_cast_pos, best_target, range))
             {
+                s_intent.lasthit_guard = true;
                 execute_cast_engine();
                 return true;
             }

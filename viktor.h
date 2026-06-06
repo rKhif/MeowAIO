@@ -25,15 +25,15 @@ namespace viktor
         constexpr float w_range = 800.f;
         constexpr float w_radius = 340.f;
         constexpr float w_activation_delay = 0.75f;
-        constexpr float w_stun_duration    = 1.5f;
+        constexpr float w_stun_duration = 1.5f;
 
         // E: Death Ray 
-        constexpr float e_range  = 1250.f;
+        constexpr float e_range = 1250.f;
         constexpr float e_first_click = 550.f;
         constexpr float e_beam_len = e_range - e_first_click;
         constexpr float e_radius = 45.f;
-        constexpr float e_speed  = 1050.f;
-        constexpr float e_delay  = 0.25f;
+        constexpr float e_speed = 1050.f;
+        constexpr float e_delay = 0.25f;
         constexpr float e_aftershock_delay = 1.0f;
 
         // R: Chaos Storm — circular AoE, instant placement.
@@ -41,7 +41,7 @@ namespace viktor
         constexpr float r_cast_time = 0.25f;
         constexpr float r_radius = 325.f;
         constexpr float r_move_rate = 0.15f;
-        constexpr float r_duration  = 6.5f;
+        constexpr float r_duration = 6.5f;
         constexpr int   r_max_ticks = 6;
     }
 
@@ -53,8 +53,8 @@ namespace viktor
 
     namespace buffs
     {
-        constexpr const char* DISCHARGE       = "viktorpowertransferreturn";
-        constexpr const char* CHAOS_STORM     = "ViktorChaosStormTimer";
+        constexpr const char* DISCHARGE = "viktorpowertransferreturn";
+        constexpr const char* CHAOS_STORM = "ViktorChaosStormTimer";
     }
 
     // Targets we should not commit a finisher into. Mirrors entries in
@@ -62,7 +62,7 @@ namespace viktor
     namespace anti_burst
     {
         constexpr uint32_t KINDRED_R = 0xE9EDCF9Eu;
-        constexpr uint32_t ZILEAN_R  = 0x9A270666u;
+        constexpr uint32_t ZILEAN_R = 0x9A270666u;
     }
 
     namespace menu

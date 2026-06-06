@@ -4,6 +4,7 @@
 #include <cmath>
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace orianna
@@ -54,6 +55,11 @@ namespace orianna
 
     // --- Per-ally shield enable map (true = shield this ally) ---
     static std::unordered_map<std::string, bool> g_ally_shield_enabled;
+    // Names already added to the *current* menu instance. Kept separate from
+    // g_ally_shield_enabled (which persists across re-inits) so that after a
+    // reload — where the submenu is rebuilt empty — checkboxes are re-added
+    // even though the value map still holds the names.
+    static std::unordered_set<std::string>       g_ally_menu_added;
     static menu_category* g_ally_shield_menu = nullptr;
     static float          g_ally_menu_last_refresh = 0.f;
 
@@ -79,10 +85,14 @@ namespace orianna
 
             const std::string name = h->get_char_name();
             if (name.empty()) continue;
-            if (g_ally_shield_enabled.find(name) != g_ally_shield_enabled.end()) continue;
+            if (g_ally_menu_added.count(name)) continue;
 
-            g_ally_shield_enabled[name] = true;
-            g_ally_shield_menu->add_checkbox("ally_" + name, name, true,
+            // Preserve any previously-configured value across reloads; default on.
+            auto it = g_ally_shield_enabled.find(name);
+            const bool initial = (it != g_ally_shield_enabled.end()) ? it->second : true;
+            g_ally_shield_enabled[name] = initial;
+            g_ally_menu_added.insert(name);
+            g_ally_shield_menu->add_checkbox("ally_" + name, name, initial,
                 [name](bool v) { g_ally_shield_enabled[name] = v; });
         }
     }
@@ -1266,7 +1276,8 @@ namespace orianna
     void flee()
     {
         auto p = g_sdk->object_manager->get_local_player();
-        if (!p) return;
+        if (!p || p->is_dead()) return;
+        if (is_casting()) return;
 
         // E first — recall the ball to self so W's MS field lands on us, not
         // wherever the ball was sitting (otherwise W's haste is wasted).
@@ -1868,7 +1879,10 @@ namespace orianna
 
         s_menu = nullptr;
         // Keep g_ally_shield_enabled across re-inits within the session so
-        // user-configured per-ally toggles aren't lost between games.
+        // user-configured per-ally toggles aren't lost between games. The
+        // menu instance, however, is rebuilt on the next load, so clear the
+        // "added to menu" tracking to force checkboxes to be re-created.
+        g_ally_menu_added.clear();
         g_ally_shield_menu = nullptr;
         g_ally_menu_last_refresh = 0.f;
         g_ball_state = ball_state::on_self;

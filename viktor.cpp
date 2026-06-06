@@ -46,9 +46,11 @@ namespace viktor
     }
 
     // Q scheduled by on_before_attack, consumed in on_update.
-    static bool         m_q_scheduled        = false;
-    static float        m_q_scheduled_time   = 0.f;
-    static game_object* m_q_scheduled_target = nullptr;
+    static bool         m_q_scheduled         = false;
+    static float        m_q_scheduled_time    = 0.f;
+    // Stored by network id, not a raw pointer — the object can be freed between
+    // on_before_attack and the on_update that consumes it.
+    static uint32_t     m_q_scheduled_tgt_id  = 0;
     static constexpr float Q_AA_CAST_DELAY   = 0.05f;
 
     static constexpr float R_SEARCH_RADIUS    = 700.f;
@@ -64,6 +66,9 @@ namespace viktor
     static constexpr float R_HYSTERESIS       = 1.5f;
     static constexpr float R_HIT_RADIUS_FRAC  = 0.92f;
     static constexpr float R_PRED_BASE_DELAY  = 0.30f;
+    // Storm redirect reach is larger than the initial cast range, so the
+    // auto-mover can steer the storm well past where it was first placed.
+    static constexpr float R_REDIRECT_RANGE   = 1500.f;
 
     static math::vector3 last_r_move_pos{};
     static float         last_r_move_score = 0.f;
@@ -129,13 +134,28 @@ namespace viktor
 
     static void mark_spell_cast(float now) { m_last_spell_cast_time = now; }
 
+    // Viktor deals only magic damage, so physical shields are irrelevant to
+    // his effective HP / killable math — counting them would under-commit.
+    static float magic_shield_bonus(game_object* o)
+    {
+        if (!o) return 0.f;
+        return o->get_all_shield() + o->get_magical_shield();
+    }
+
     static float effective_hp(game_object* o)
     {
         if (!o) return 0.f;
-        return o->get_hp()
-             + o->get_all_shield()
-             + o->get_physical_shield()
-             + o->get_magical_shield();
+        return o->get_hp() + magic_shield_bonus(o);
+    }
+
+    // Wraps health prediction so every call site shares the same null/throw
+    // handling. Returns 0 when unavailable, which all callers treat as "no
+    // prediction" via their `> 0.f` guards.
+    static float predict_health(game_object* o, float time)
+    {
+        if (!o || !sdk::health_prediction) return 0.f;
+        try { return sdk::health_prediction->get_predicted_health(o, time); }
+        catch (...) { return 0.f; }
     }
 
     static float distance_2d(const math::vector3& a, const math::vector3& b)
@@ -211,21 +231,17 @@ namespace viktor
         const float q_dmg = get_q_damage(m);
         if (q_dmg <= 0.f) return false;
 
-        if (sdk::health_prediction && g_sdk->clock_facade)
+        if (g_sdk->clock_facade)
         {
-            try
+            const float prediction_time = now + spell_data::q_cast_time;
+            float predicted_hp = predict_health(m, prediction_time);
+            if (predicted_hp > 0.f
+                && predicted_hp <= m->get_max_hp()
+                && predicted_hp <= hp
+                && (hp - predicted_hp) > prediction_constants::min_hp_difference)
             {
-                const float prediction_time = now + spell_data::q_cast_time;
-                float predicted_hp = sdk::health_prediction->get_predicted_health(m, prediction_time);
-                if (predicted_hp > 0.f
-                    && predicted_hp <= m->get_max_hp()
-                    && predicted_hp <= hp
-                    && (hp - predicted_hp) > prediction_constants::min_hp_difference)
-                {
-                    hp = predicted_hp;
-                }
+                hp = predicted_hp;
             }
-            catch (...) {}
         }
 
         // 15% / 15-HP safety margin (Viktor's existing tuning, looser than
@@ -424,7 +440,7 @@ namespace viktor
         const float now = g_sdk->clock_facade->get_game_time();
         m_q_scheduled        = true;
         m_q_scheduled_time   = now + Q_AA_CAST_DELAY;
-        m_q_scheduled_target = target;
+        m_q_scheduled_tgt_id = target->get_network_id();
 
         return true; // never block the AA
     }
@@ -451,7 +467,7 @@ namespace viktor
             const float now_q = g_sdk->clock_facade->get_game_time();
             if (now_q >= m_q_scheduled_time)
             {
-                auto* tgt = m_q_scheduled_target;
+                auto* tgt = g_sdk->object_manager->get_object_by_network_id(m_q_scheduled_tgt_id);
                 if (tgt && tgt->is_valid() && !tgt->is_dead() && tgt->is_targetable()
                     && is_spell_learned(SLOT_Q) && is_spell_ready(SLOT_Q) && has_enough_mana(SLOT_Q)
                     && !is_discharge_ready(player))
@@ -460,7 +476,7 @@ namespace viktor
                         last_q_combo_time = now_q;
                 }
                 m_q_scheduled        = false;
-                m_q_scheduled_target = nullptr;
+                m_q_scheduled_tgt_id = 0;
             }
         }
 
@@ -573,9 +589,9 @@ namespace viktor
                     if (dist > aa_range) continue;
 
                     float hp = minion->get_hp();
-                    if (sdk::health_prediction && g_sdk->clock_facade)
+                    if (g_sdk->clock_facade)
                     {
-                        float predicted_hp = sdk::health_prediction->get_predicted_health(minion, aa_time);
+                        float predicted_hp = predict_health(minion, aa_time);
                         if (predicted_hp > 0.f && predicted_hp <= minion->get_max_hp() && predicted_hp <= hp)
                             hp = predicted_hp;
                     }
@@ -762,7 +778,10 @@ namespace viktor
                 {
                     if (!is_valid_target(hero)) continue;
                     const float r_dmg = get_r_damage(hero);
-                    if (hero->get_hp() > 0.f && hero->get_hp() <= r_dmg)
+                    // Match the killsteal math (magic-relevant shields) so the
+                    // overlay doesn't claim a kill that shields would survive.
+                    const float ehp = effective_hp(hero);
+                    if (ehp > 0.f && ehp <= r_dmg)
                     {
                         auto screen = g_sdk->renderer->world_to_screen(hero->get_position());
                         g_sdk->renderer->add_text("R KILLABLE", 18.f,
@@ -1034,9 +1053,9 @@ namespace viktor
 
                     const float q_dmg = get_q_damage(minion);
                     float hp = minion->get_hp();
-                    if (sdk::health_prediction && g_sdk->clock_facade)
+                    if (g_sdk->clock_facade)
                     {
-                        float predicted_hp = sdk::health_prediction->get_predicted_health(minion, now_harass + spell_data::q_cast_time);
+                        float predicted_hp = predict_health(minion, now_harass + spell_data::q_cast_time);
                         if (predicted_hp > 0.f && predicted_hp <= minion->get_max_hp() && predicted_hp <= hp)
                             hp = predicted_hp;
                     }
@@ -1280,10 +1299,10 @@ namespace viktor
                     {
                         ++out_hit;
                         float hp = other->get_hp();
-                        if (sdk::health_prediction && g_sdk->clock_facade)
+                        if (g_sdk->clock_facade)
                         {
                             const float prediction_time = now_farm_pred + e_delay_time;
-                            float predicted_hp = sdk::health_prediction->get_predicted_health(other, prediction_time);
+                            float predicted_hp = predict_health(other, prediction_time);
                             if (predicted_hp > 0.f && predicted_hp <= other->get_max_hp() && predicted_hp <= hp
                                 && (hp - predicted_hp) > prediction_constants::min_hp_difference)
                                 hp = predicted_hp;
@@ -1410,20 +1429,19 @@ namespace viktor
 
             if (has_anti_burst_buff(hero)) continue;
 
-            // Include shields so KS doesn't overcommit into Riven W / Karma E etc.
+            // Include magic-relevant shields so KS doesn't overcommit into
+            // Karma E / Janna shield etc. Physical-only shields are ignored.
             const float base_hp = effective_hp(hero);
 
             if (menu::ks_q)
             {
                 float hp = base_hp;
-                if (sdk::health_prediction && g_sdk->clock_facade)
+                if (g_sdk->clock_facade)
                 {
                     const float prediction_time = now + spell_data::q_cast_time + 0.1f;
-                    float predicted_hp = sdk::health_prediction->get_predicted_health(hero, prediction_time);
+                    float predicted_hp = predict_health(hero, prediction_time);
                     if (predicted_hp > 0.f && predicted_hp <= hero->get_max_hp())
-                        hp = predicted_hp + hero->get_all_shield()
-                                          + hero->get_physical_shield()
-                                          + hero->get_magical_shield();
+                        hp = predicted_hp + magic_shield_bonus(hero);
                 }
                 if (hp > 0.f && hp <= get_q_damage(hero))
                     if (cast_q(hero)) return;
@@ -1432,13 +1450,10 @@ namespace viktor
             if (menu::ks_e)
             {
                 float hp = base_hp;
-                if (sdk::health_prediction)
                 {
-                    const float p = sdk::health_prediction->get_predicted_health(hero, now + spell_data::e_delay);
+                    const float p = predict_health(hero, now + spell_data::e_delay);
                     if (p > 0.f && p <= hero->get_max_hp())
-                        hp = p + hero->get_all_shield()
-                              + hero->get_physical_shield()
-                              + hero->get_magical_shield();
+                        hp = p + magic_shield_bonus(hero);
                 }
                 if (hp > 0.f && hp <= get_e_damage(hero))
                 {
@@ -1449,13 +1464,10 @@ namespace viktor
             if (menu::ks_r)
             {
                 float hp = base_hp;
-                if (sdk::health_prediction)
                 {
-                    const float p = sdk::health_prediction->get_predicted_health(hero, now + spell_data::r_cast_time);
+                    const float p = predict_health(hero, now + spell_data::r_cast_time);
                     if (p > 0.f && p <= hero->get_max_hp())
-                        hp = p + hero->get_all_shield()
-                              + hero->get_physical_shield()
-                              + hero->get_magical_shield();
+                        hp = p + magic_shield_bonus(hero);
                 }
                 if (hp > 0.f && hp <= get_r_damage(hero))
                     if (cast_r(hero)) return;
@@ -1590,10 +1602,10 @@ namespace viktor
         const float lead_time    = R_PRED_BASE_DELAY + std::min(storm_travel, 1.5f);
 
         struct enemy_pred {
-            game_object*   obj;
-            math::vector3  pos;
-            bool           ccd;
-            float          weight;
+            game_object*   obj    = nullptr;
+            math::vector3  pos{};
+            bool           ccd    = false;
+            float          weight = 0.f;
         };
         std::array<enemy_pred, 16> preds{};
         size_t pred_n = 0;
@@ -2598,13 +2610,10 @@ namespace viktor
             }
         }
 
-        // Reposition FP along beam_dir so the predicted target sits inside the
-        // beam segment. SDK sometimes returns FP near the player, making the
-        // beam fall short when target is past first_click. Use a dynamic bias
-        // that nudges the beam toward its endpoint for far / fleeing targets.
+        // Where along the 700-unit beam the predicted target should sit
+        // (0 = near end, 1 = far end). Nudge toward the far end for far /
+        // fleeing targets so the beam doesn't fall short.
         const auto& pp_pred = pred.predicted_position;
-        const float tgt_t = (pp_pred.x - ppos.x) * beam_dir.x
-                          + (pp_pred.z - ppos.z) * beam_dir.z;
         const float range_frac = std::clamp(tgt_d / e_reach, 0.f, 1.f);
         float bias = 0.5f + (range_frac - 0.5f) * 0.5f; // 0.25 → 0.75
         const float longitudinal_vel = vel.x * beam_dir.x + vel.z * beam_dir.z;
@@ -2612,23 +2621,33 @@ namespace viktor
             bias += std::min(longitudinal_vel / 600.f, 0.35f);
         bias = std::clamp(bias, 0.2f, 0.9f);
 
-        const float ideal_fp_dist = tgt_t - beam_len * bias;
-        const float fp_dist = std::clamp(ideal_fp_dist, 0.f, first_click);
-        fp = ppos + beam_dir * fp_dist;
+        // Anchor the beam ON the predicted position, then walk the near point
+        // backward along the beam direction. This preserves the perpendicular
+        // lead — a target strafing sideways gets hit where it WILL be, instead
+        // of on the player-radial line (which only kept the forward component
+        // and dropped the sideways one, landing the beam on the live position).
+        fp = { pp_pred.x - beam_dir.x * (beam_len * bias), pp_pred.y,
+               pp_pred.z - beam_dir.z * (beam_len * bias) };
 
-        // Re-extend CP from FP so the beam length is exact (clamped to total reach).
-        const float cp_total_dist = fp_dist + beam_len;
-        cp = (cp_total_dist > e_reach)
-            ? ppos + beam_dir * e_reach
-            : fp + beam_dir * beam_len;
+        // Near point must be reachable: clamp it to first_click from Viktor.
+        if (distance_2d(ppos, fp) > first_click)
+            fp = ppos + direction_2d(ppos, fp) * first_click;
 
-        // Reject FP behind the player relative to the target.
-        const auto to_tgt = direction_2d(ppos, tpos);
-        const auto fp_dir = direction_2d(ppos, fp);
-        const float facing_dot = to_tgt.x * fp_dir.x + to_tgt.z * fp_dir.z;
-        if (facing_dot < 0.2f)
+        // Beam extends beam_len from the near point; clamp the far end to reach.
+        cp = { fp.x + beam_dir.x * beam_len, fp.y, fp.z + beam_dir.z * beam_len };
+        if (distance_2d(ppos, cp) > e_reach)
+            cp = ppos + direction_2d(ppos, cp) * e_reach;
+
+        // Sanity: the predicted position must be roughly in front of Viktor
+        // (guards against a degenerate prediction pointing backward). This is
+        // based on the predicted spot, not FP, so legitimate sideways beams
+        // are not falsely rejected.
+        const auto to_tgt   = direction_2d(ppos, tpos);
+        const auto pred_dir = direction_2d(ppos, pp_pred);
+        const float facing_dot = to_tgt.x * pred_dir.x + to_tgt.z * pred_dir.z;
+        if (facing_dot < -0.2f)
         {
-            log_e("[E] reject: FP behind player (dot=%.2f) tgt=%s",
+            log_e("[E] reject: predicted behind player (dot=%.2f) tgt=%s",
                   facing_dot, target->get_char_name().c_str());
             return false;
         }
@@ -2692,15 +2711,14 @@ namespace viktor
 
         if (!manual && menu::r_only_killable)
         {
-            // Gate against FULL combo damage, not R alone — R-only would
-            // reject marginal kills that Q+E+R+AA actually finish.
+            // Gate against the damage actually available right now (only spells
+            // that are ready and in range) — R-only would reject marginal kills
+            // that Q+E+R+AA actually finish, but assuming every spell lands
+            // regardless of cooldown/range would over-commit R on non-kills.
             const float now_hp = g_sdk->clock_facade->get_game_time();
-            float pred_hp = sdk::health_prediction
-                ? sdk::health_prediction->get_predicted_health(target, now_hp + spell_data::r_cast_time)
-                : target->get_hp();
-            pred_hp += target->get_all_shield()
-                     + target->get_physical_shield()
-                     + target->get_magical_shield();
+            const float predicted = predict_health(target, now_hp + spell_data::r_cast_time);
+            float pred_hp = predicted > 0.f ? predicted : target->get_hp();
+            pred_hp += magic_shield_bonus(target);
             if (pred_hp > get_combo_damage(target)) return false;
         }
 
@@ -2757,10 +2775,12 @@ namespace viktor
         const auto  ppos = player->get_position();
         const auto  spos = r_obj->get_position();
 
-        // Engine range-clamps against the caster, not the storm.
+        // Engine range-clamps the redirect against the caster, not the storm.
+        // Redirect reach is larger than the initial cast range, so the storm
+        // can be steered well past where it was first placed.
         const float pdist = ppos.distance(pos);
-        if (pdist > spell_data::r_range)
-            pos = ppos + (pos - ppos).to_direction() * spell_data::r_range;
+        if (pdist > R_REDIRECT_RANGE)
+            pos = ppos + (pos - ppos).to_direction() * R_REDIRECT_RANGE;
 
         // Dead-zone + hysteresis — bypassed when force=true (KS / forced TS).
         if (!force)
@@ -2891,11 +2911,23 @@ namespace viktor
         auto player = g_sdk->object_manager->get_local_player();
         if (!player || !target || !sdk::damage) return 0.f;
 
+        const float dist = player->get_position().distance(target->get_position());
+        // Mirror cast_q's effective reach: raw Q range + both bounding radii.
+        const float q_reach = spell_data::q_range
+                            + player->get_bounding_radius()
+                            + target->get_bounding_radius();
+
         float total = 0.f;
 
-        total += get_q_damage(target);
-        total += get_e_damage(target);
-        total += get_r_damage(target);
+        // Only count a spell when it could actually land this combo — ready,
+        // affordable, and in range. Otherwise the "only if killable" gate would
+        // assume damage from spells on cooldown or out of reach.
+        if (is_spell_ready(SLOT_Q) && has_enough_mana(SLOT_Q) && dist <= q_reach)
+            total += get_q_damage(target);
+        if (is_spell_ready(SLOT_E) && has_enough_mana(SLOT_E) && dist <= spell_data::e_range)
+            total += get_e_damage(target);
+        if (is_spell_ready(SLOT_R) && has_enough_mana(SLOT_R) && dist <= spell_data::r_range)
+            total += get_r_damage(target);
 
         // Flat AA estimate — pessimistic about Discharge empower so we don't
         // overcommit R on marginal kills.
@@ -3001,14 +3033,14 @@ namespace viktor
         auto e_menu = cat->add_sub_category("e_death_ray", "E - Death Ray");
         e_menu->add_checkbox("combo", "Use in Combo", menu::use_e_combo, [](bool v) { menu::use_e_combo = v; });
         e_menu->add_checkbox("harass", "Use in Harass", menu::use_e_harass, [](bool v) { menu::use_e_harass = v; });
-        e_menu->add_checkbox("farm", "Farm", menu::use_e_farm, [](bool v) { menu::use_e_farm = v; });
-        e_menu->add_slider_int("farm_min", "Farm Min Minions", 1, 10, 1, menu::e_farm_min_minions, [](int v) { menu::e_farm_min_minions = v; });
+        e_menu->add_checkbox("farm", "Use in Clear", menu::use_e_farm, [](bool v) { menu::use_e_farm = v; });
+        e_menu->add_slider_int("farm_min", "Min Minions", 1, 10, 1, menu::e_farm_min_minions, [](int v) { menu::e_farm_min_minions = v; });
         e_menu->add_checkbox("farm_monsters", "Jungle Clear", menu::use_farm_monsters, [](bool v) { menu::use_farm_monsters = v; });
         e_menu->add_checkbox("killsteal", "Killsteal", menu::ks_e, [](bool v) { menu::ks_e = v; });
         e_menu->add_slider_int("hitchance", "Hitchance", 0, 100, 1, menu::e_hitchance,
             [](int v) { menu::e_hitchance = v; });
         e_menu->add_checkbox("draw_range", "Draw Range", menu::draw_e_range, [](bool v) { menu::draw_e_range = v; });
-        //e_menu->add_checkbox("log_casts", "Log E Casts (debug)", menu::log_e_casts, [](bool v) { menu::log_e_casts = v; });
+        //e_menu->add_checkbox("log_casts", "Debug E Casts (debug)", menu::log_e_casts, [](bool v) { menu::log_e_casts = v; });
         e_menu->add_checkbox("draw_rgb", "RGB Range", menu::draw_e_rgb, [](bool v) { menu::draw_e_rgb = v; });
 
         auto r_menu = cat->add_sub_category("r_chaos_storm", "R - Chaos Storm");
@@ -3103,7 +3135,7 @@ namespace viktor
         m_last_spell_cast_time = 0.f;
         m_q_scheduled = false;
         m_q_scheduled_time = 0.f;
-        m_q_scheduled_target = nullptr;
+        m_q_scheduled_tgt_id = 0;
         m_e_log = {};
 
         g_sdk->log_console("[MeowAIO] Viktor unloaded successfully :3");
