@@ -9,6 +9,7 @@
 
 namespace hwei
 {
+
     namespace
     {
 
@@ -52,21 +53,40 @@ namespace hwei
             float timeout_at = 0.f;
             bool selector_sent = false;
             float selector_sent_at = 0.f;
+            bool followup_sent = false;
+            float followup_sent_at = 0.f;
+            const char* expected_followup_name = nullptr;
+            bool repredict = false;
+            pred_sdk::spell_data repredict_spell{};
+            int repredict_hitchance = 0;
         };
 
         constexpr ability_info ABILITY_QQ{ subject::disaster, SLOT_Q, ability_cast::position };
         constexpr ability_info ABILITY_QW{ subject::disaster, SLOT_W, ability_cast::position };
         constexpr ability_info ABILITY_QE{ subject::disaster, SLOT_E, ability_cast::position };
         constexpr ability_info ABILITY_WQ{ subject::serenity, SLOT_Q, ability_cast::position };
+        constexpr ability_info ABILITY_WW{ subject::serenity, SLOT_W, ability_cast::self };
         constexpr ability_info ABILITY_WE{ subject::serenity, SLOT_E, ability_cast::self };
         constexpr ability_info ABILITY_EQ{ subject::torment,  SLOT_Q, ability_cast::position };
+        constexpr ability_info ABILITY_EW{ subject::torment,  SLOT_W, ability_cast::position };
         constexpr ability_info ABILITY_EE{ subject::torment,  SLOT_E, ability_cast::position };
         constexpr ability_info ABILITY_R { subject::none,      SLOT_R, ability_cast::position };
 
         constexpr float MIN_CAST_INTERVAL = 0.08f;
-        constexpr float SUBJECT_MEMORY = 0.8f;
-        constexpr float SUBJECT_CONFIRM_DELAY = 0.26f;
+        constexpr float REQUEST_TIMEOUT = 1.25f;
+        constexpr float SUBJECT_CONFIRM_DELAY = 0.30f;
+        constexpr float SUBJECT_RETRY_LOCKOUT = 0.55f;
         constexpr float EE_QQ_FOLLOWUP_WINDOW = 1.25f;
+        constexpr float EW_ROOT_FOLLOWUP_DELAY = 0.75f;
+        // Max time the teamfight combo stalls QE/QW while waiting for R to land.
+        constexpr float TEAMFIGHT_R_WAIT = 2.0f;
+        // Floor lockout applied to a sub-spell after we observe it cast. Hwei's
+        // three sub-spells per subject each have their own cooldown, but the
+        // owning slot (Q/W/E) keeps reading "ready" while the other two are up.
+        // This guards against immediately re-queuing the sub-spell we just cast
+        // (which desyncs the subject selector into a bare HweiQ/W/E cast).
+        constexpr float SUBSPELL_MIN_LOCKOUT = 0.40f;
+        static bool HWEI_DEBUG_LOGS = false;
 
         static menu_category* s_menu = nullptr;
         static pred_sdk::spell_data s_pred_qq{};
@@ -74,15 +94,33 @@ namespace hwei
         static pred_sdk::spell_data s_pred_wq{};
         static pred_sdk::spell_data s_pred_qe{};
         static pred_sdk::spell_data s_pred_eq{};
+        static pred_sdk::spell_data s_pred_ew{};
         static pred_sdk::spell_data s_pred_ee{};
         static pred_sdk::spell_data s_pred_r{};
 
         static float s_last_cast_time = 0.f;
         static float s_ee_qq_followup_until = 0.f;
+        static float s_ew_qw_followup_ready_at = 0.f;
+        static float s_ew_qw_followup_until = 0.f;
         static cast_engine_state s_cast_state = cast_engine_state::idle;
         static cast_intent s_intent{};
+        static float s_subject_lockout_until[3] = {};
+        // [subject_index 0..2][followup slot 0..2(SLOT_Q/W/E)] -> game time the
+        // specific sub-spell becomes castable again.
+        static float s_subspell_ready_at[3][3] = {};
         static uint32_t s_infotab_combo_mode = 0;
+        static uint32_t s_infotab_bind_qw   = 0;
+        static uint32_t s_infotab_bind_we   = 0;
+        static uint32_t s_infotab_bind_ee   = 0;
+        static uint32_t s_infotab_bind_eq   = 0;
+        static uint32_t s_infotab_bind_r    = 0;
         static bool s_combo_mode_was_pressed = false;
+        static std::string s_last_observed_cast_name;
+        static float s_r_wait_started_at = 0.f;
+        static subject s_cached_subject = subject::none;
+        static bool s_subject_cache_authoritative = false;
+
+        bool execute_cast_engine();
 
         inline float now()
         {
@@ -185,6 +223,118 @@ namespace hwei
             return nullptr;
         }
 
+        bool has_hard_cc(game_object* target)
+        {
+            if (!target)
+                return false;
+
+            for (auto* buff : target->get_buffs())
+            {
+                if (!buff || !buff->is_active())
+                    continue;
+
+                switch (buff->get_type())
+                {
+                case buff_type::knockup:
+                case buff_type::knockback:
+                case buff_type::drowsy:
+                case buff_type::taunt:
+                case buff_type::snare:
+                case buff_type::stun:
+                case buff_type::suppression:
+                case buff_type::flee:
+                case buff_type::fear:
+                case buff_type::charm:
+                    return true;
+                default:
+                    break;
+                }
+            }
+
+            return false;
+        }
+
+        bool is_isolated_for_qw(game_object* target)
+        {
+            if (!target || !g_sdk || !g_sdk->object_manager)
+                return false;
+
+            // Severing Bolt's missing-health bonus only applies when the bolt hits a single
+            // enemy CHAMPION (or an immobilized one) -- not "no nearby allied units". So the
+            // bonus is lost whenever another enemy champion is close enough to also be caught
+            // in the ~225-radius AoE. Two points inside one such circle are at most ~450 apart,
+            // so treat any other enemy champion within that distance as breaking isolation.
+            // (Minions are irrelevant to the champion bonus and must not be counted.)
+            const auto target_pos = target->get_position();
+            const float shared_aoe = s_pred_qw.radius * 2.f;
+
+            for (auto* hero : g_sdk->object_manager->get_heroes())
+            {
+                if (!hero || hero == target || !hero->is_valid() || hero->is_dead())
+                    continue;
+                if (hero->get_team_id() != target->get_team_id())
+                    continue;
+                if (!hero->is_visible())
+                    continue;
+                if (hero->get_position().distance(target_pos) <= shared_aoe)
+                    return false;
+            }
+
+            return true;
+        }
+
+        bool line_blocked_by_enemy_minion(const math::vector3& cast_pos, float radius, game_object* skip = nullptr)
+        {
+            auto* player = get_player();
+            if (!player || !g_sdk || !g_sdk->object_manager)
+                return false;
+
+            const auto src = player->get_position();
+            const float dx = cast_pos.x - src.x;
+            const float dz = cast_pos.z - src.z;
+            const float len_sq = dx * dx + dz * dz;
+            if (len_sq <= 1.f)
+                return false;
+
+            for (auto* minion : g_sdk->object_manager->get_minions())
+            {
+                if (!minion || minion == skip || !minion->is_valid() || minion->is_dead())
+                    continue;
+                if (!minion->is_visible() || !minion->is_targetable())
+                    continue;
+                if (minion->get_team_id() == player->get_team_id())
+                    continue;
+                if (!minion->is_lane_minion())
+                    continue;
+
+                const auto minion_pos = minion->get_position();
+                const float rel_x = minion_pos.x - src.x;
+                const float rel_z = minion_pos.z - src.z;
+                const float t = (rel_x * dx + rel_z * dz) / len_sq;
+                if (t <= 0.f || t >= 1.f)
+                    continue;
+
+                const float closest_x = src.x + dx * t;
+                const float closest_z = src.z + dz * t;
+                const float off_x = minion_pos.x - closest_x;
+                const float off_z = minion_pos.z - closest_z;
+                const float hit_radius = radius + minion->get_bounding_radius();
+                if ((off_x * off_x + off_z * off_z) <= hit_radius * hit_radius)
+                {
+                    if (HWEI_DEBUG_LOGS && g_sdk)
+                    {
+                        g_sdk->log_console("[MeowAIO] collision block spell=HweiQQ minion=%s dist=%.0f radius=%.0f",
+                            minion->get_name().c_str(),
+                            std::sqrt(off_x * off_x + off_z * off_z),
+                            hit_radius);
+                    }
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         void setup_prediction_templates()
         {
             s_pred_qq = {};
@@ -250,6 +400,15 @@ namespace hwei
                 pred_sdk::collision_type::braum_wall
             };
 
+            s_pred_ew = {};
+            s_pred_ew.spell_slot = SLOT_W;
+            s_pred_ew.spell_type = pred_sdk::spell_type::linear;
+            s_pred_ew.targetting_type = pred_sdk::targetting_type::center;
+            s_pred_ew.range = spell_data::ew_range;
+            s_pred_ew.radius = spell_data::ew_radius;
+            s_pred_ew.delay = spell_data::ew_delay;
+            s_pred_ew.projectile_speed = spell_data::ew_speed;
+
             s_pred_ee = {};
             s_pred_ee.spell_slot = SLOT_E;
             s_pred_ee.spell_type = pred_sdk::spell_type::circular;
@@ -274,7 +433,7 @@ namespace hwei
             };
         }
 
-        subject get_game_subject()
+        subject read_live_game_subject()
         {
             auto* player = get_player();
             if (!player) return subject::none;
@@ -286,12 +445,37 @@ namespace hwei
             if (!static_data) return subject::none;
             const char* name = static_data->get_name();
             if (!name) return subject::none;
-            if (std::strcmp(name, "HweiQ") == 0 || strstr(name, "HweiQQ") || strstr(name, "HweiQW") || strstr(name, "HweiQE"))
+            if (strstr(name, "HweiQQ") || strstr(name, "HweiQW") || strstr(name, "HweiQE"))
                 return subject::disaster;
-            if (std::strcmp(name, "HweiW") == 0 || strstr(name, "HweiWQ") || strstr(name, "HweiWW") || strstr(name, "HweiWE"))
+            if (strstr(name, "HweiWQ") || strstr(name, "HweiWW") || strstr(name, "HweiWE"))
                 return subject::serenity;
-            if (std::strcmp(name, "HweiE") == 0 || strstr(name, "HweiEQ") || strstr(name, "HweiEW") || strstr(name, "HweiEE"))
+            if (strstr(name, "HweiEQ") || strstr(name, "HweiEW") || strstr(name, "HweiEE"))
                 return subject::torment;
+            return subject::none;
+        }
+
+        void cache_selected_subject(subject mood, const char* reason)
+        {
+            s_cached_subject = mood;
+            s_subject_cache_authoritative = true;
+
+            if (HWEI_DEBUG_LOGS && g_sdk)
+            {
+                g_sdk->log_console("[MeowAIO] subject cache=%d reason=%s",
+                    static_cast<int>(mood),
+                    reason ? reason : "unknown");
+            }
+        }
+
+        subject get_game_subject()
+        {
+            if (s_subject_cache_authoritative)
+                return s_cached_subject;
+
+            const subject live_subject = read_live_game_subject();
+            if (live_subject != subject::none)
+                return live_subject;
+
             return subject::none;
         }
 
@@ -334,10 +518,374 @@ namespace hwei
                 || std::strcmp(name, "HweiEE") == 0;
         }
 
-        void reset_cast_engine()
+        int subject_index(subject mood)
         {
+            switch (mood)
+            {
+            case subject::disaster:
+                return 0;
+            case subject::serenity:
+                return 1;
+            case subject::torment:
+                return 2;
+            case subject::none:
+            default:
+                return -1;
+            }
+        }
+
+        const char* expected_followup_name(const ability_info& info)
+        {
+            if (info.mood == subject::disaster)
+            {
+                if (info.slot == SLOT_Q) return "HweiQQ";
+                if (info.slot == SLOT_W) return "HweiQW";
+                if (info.slot == SLOT_E) return "HweiQE";
+            }
+            if (info.mood == subject::serenity)
+            {
+                if (info.slot == SLOT_Q) return "HweiWQ";
+                if (info.slot == SLOT_W) return "HweiWW";
+                if (info.slot == SLOT_E) return "HweiWE";
+            }
+            if (info.mood == subject::torment)
+            {
+                if (info.slot == SLOT_Q) return "HweiEQ";
+                if (info.slot == SLOT_W) return "HweiEW";
+                if (info.slot == SLOT_E) return "HweiEE";
+            }
+            return nullptr;
+        }
+
+        bool is_expected_followup_name(const char* name)
+        {
+            if (!name || !s_intent.active || !s_intent.expected_followup_name)
+                return false;
+            return std::strcmp(name, s_intent.expected_followup_name) == 0;
+        }
+
+        // Maps a follow-up spell name (e.g. "HweiQE") back to its subject index
+        // (0/1/2) and the slot it is bound to (SLOT_Q/W/E == 0/1/2).
+        bool followup_indices(const char* name, int& subj_idx, int& slot)
+        {
+            if (!name)
+                return false;
+            struct entry { const char* name; int subj; int slot; };
+            static const entry maps[] = {
+                { "HweiQQ", 0, SLOT_Q }, { "HweiQW", 0, SLOT_W }, { "HweiQE", 0, SLOT_E },
+                { "HweiWQ", 1, SLOT_Q }, { "HweiWW", 1, SLOT_W }, { "HweiWE", 1, SLOT_E },
+                { "HweiEQ", 2, SLOT_Q }, { "HweiEW", 2, SLOT_W }, { "HweiEE", 2, SLOT_E },
+            };
+            for (const auto& m : maps)
+            {
+                if (std::strcmp(name, m.name) == 0)
+                {
+                    subj_idx = m.subj;
+                    slot = m.slot;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Best-effort live cooldown of a specific sub-spell, derived from the
+        // child-spell static cooldown table adjusted by ability haste. Returns
+        // 0 when unavailable so callers can fall back to the floor lockout.
+        float compute_followup_cooldown(const char* followup_name, int subject_owner_slot)
+        {
+            auto* player = get_player();
+            if (!player || !followup_name)
+                return 0.f;
+
+            auto* entry = player->get_spell(subject_owner_slot);
+            if (!entry)
+                return 0.f;
+
+            int rank = entry->get_level();
+            if (rank < 1) rank = 1;
+            if (rank > 5) rank = 5;
+
+            auto children = player->get_child_spells(subject_owner_slot);
+            for (auto* child : children)
+            {
+                if (!child)
+                    continue;
+                const char* cn = child->get_name();
+                if (!cn || std::strcmp(cn, followup_name) != 0)
+                    continue;
+
+                float* cds = child->get_cooldown();
+                if (!cds)
+                    return 0.f;
+
+                float base = cds[rank - 1];
+                if (base <= 0.f)
+                    return 0.f;
+
+                const float ah = player->get_ability_haste_mod();
+                if (ah > 0.f)
+                    base /= (1.f + ah * 0.01f);
+                return base;
+            }
+            return 0.f;
+        }
+
+        // Called when we observe a sub-spell actually cast (combo or manual) so
+        // the cast engine respects its individual cooldown instead of the
+        // owning slot's shared "ready" state.
+        void register_subspell_cooldown(const char* followup_name)
+        {
+            int subj_idx = -1, slot = -1;
+            if (!followup_indices(followup_name, subj_idx, slot))
+                return;
+            if (subj_idx < 0 || subj_idx > 2 || slot < 0 || slot > 2)
+                return;
+
+            const int owner_slot = (subj_idx == 0) ? SLOT_Q : (subj_idx == 1) ? SLOT_W : SLOT_E;
+            const float cd = compute_followup_cooldown(followup_name, owner_slot);
+            const float lock = std::max(cd, SUBSPELL_MIN_LOCKOUT);
+            s_subspell_ready_at[subj_idx][slot] = now() + lock;
+
+            if (HWEI_DEBUG_LOGS && g_sdk)
+            {
+                g_sdk->log_console("[MeowAIO] subspell cd name=%s cd=%.2f lock=%.2f",
+                    followup_name, cd, lock);
+            }
+        }
+
+        bool is_subspell_on_local_cd(const ability_info& info)
+        {
+            const int subj_idx = subject_index(info.mood);
+            if (subj_idx < 0 || subj_idx > 2)
+                return false;
+            if (info.slot < 0 || info.slot > 2)
+                return false;
+            return now() < s_subspell_ready_at[subj_idx][info.slot];
+        }
+
+        const char* cast_type_name(ability_cast type)
+        {
+            switch (type)
+            {
+            case ability_cast::position:
+                return "position";
+            case ability_cast::target:
+                return "target";
+            case ability_cast::self:
+                return "self";
+            default:
+                return "unknown";
+            }
+        }
+
+        const char* prediction_state_name(pred_sdk::prediction_state state)
+        {
+            switch (state)
+            {
+            case pred_sdk::prediction_state::standard:
+                return "standard";
+            case pred_sdk::prediction_state::no_recent_input:
+                return "no_recent_input";
+            case pred_sdk::prediction_state::coming_into_range:
+                return "coming_into_range";
+            case pred_sdk::prediction_state::juking:
+                return "juking";
+            case pred_sdk::prediction_state::dashing_or_casting:
+                return "dashing_or_casting";
+            case pred_sdk::prediction_state::undodgeable:
+                return "undodgeable";
+            case pred_sdk::prediction_state::stasis_or_revive:
+                return "stasis_or_revive";
+            case pred_sdk::prediction_state::awaiting_netvar_update:
+                return "awaiting_netvar_update";
+            case pred_sdk::prediction_state::wall_collision:
+                return "wall_collision";
+            default:
+                return "unknown";
+            }
+        }
+
+        void log_prediction_result(const char* spell_name, game_object* target, const pred_sdk::pred_data& prediction,
+            int required_hitchance, float cast_distance, float range, const char* result)
+        {
+            if (!HWEI_DEBUG_LOGS || !g_sdk)
+                return;
+
+            g_sdk->log_console(
+                "[MeowAIO] pred spell=%s target=%s result=%s valid=%d hc=%d need=%d state=%s dist=%.0f/%.0f hit_time=%.2f pred=(%.0f,%.0f) cast=(%.0f,%.0f) collisions=%zu",
+                spell_name ? spell_name : "unknown",
+                target ? target->get_name().c_str() : "none",
+                result ? result : "unknown",
+                prediction.is_valid,
+                prediction.hitchance,
+                required_hitchance,
+                prediction_state_name(prediction.state),
+                cast_distance,
+                range,
+                prediction.intersection_time,
+                prediction.predicted_position.x,
+                prediction.predicted_position.z,
+                prediction.cast_position.x,
+                prediction.cast_position.z,
+                prediction.collided_units.size());
+        }
+
+        const char* cast_state_name(cast_engine_state state)
+        {
+            switch (state)
+            {
+            case cast_engine_state::idle:
+                return "idle";
+            case cast_engine_state::selecting_subject:
+                return "selecting_subject";
+            case cast_engine_state::await_followup_window:
+                return "await_followup_window";
+            case cast_engine_state::casting_followup:
+                return "casting_followup";
+            default:
+                return "unknown";
+            }
+        }
+
+        std::string intent_target_name()
+        {
+            if (!s_intent.active || !s_intent.target)
+                return "none";
+            return s_intent.target->get_name();
+        }
+
+        void apply_subject_lockout(subject mood)
+        {
+            const int idx = subject_index(mood);
+            if (idx >= 0)
+                s_subject_lockout_until[idx] = now() + SUBJECT_RETRY_LOCKOUT;
+        }
+
+        bool is_subject_lockout_active()
+        {
+            const float t = now();
+            return t < s_subject_lockout_until[0]
+                || t < s_subject_lockout_until[1]
+                || t < s_subject_lockout_until[2];
+        }
+
+        bool has_combo_followup_window()
+        {
+            const float t = now();
+            return (s_ee_qq_followup_until > 0.f && t <= s_ee_qq_followup_until)
+                || (s_ew_qw_followup_until > 0.f && t <= s_ew_qw_followup_until);
+        }
+
+        bool consume_cast_engine_busy()
+        {
+            if (is_casting())
+                return true;
+            if (s_intent.active)
+            {
+                execute_cast_engine();
+                return true;
+            }
+            return is_subject_lockout_active();
+        }
+
+        bool cast_or_busy(bool attempted)
+        {
+            return attempted || s_intent.active;
+        }
+
+        bool cast_hwei_spell(game_object* player, const cast_intent& request)
+        {
+            if (!player || !request.active)
+                return false;
+
+            const int subject_spell_slot = subject_slot(request.info.mood);
+            const int followup_slot = request.info.slot;
+
+            if (HWEI_DEBUG_LOGS && g_sdk)
+            {
+                g_sdk->log_console("[MeowAIO] followup send expected=%s subject_slot=%d followup_slot=%d type=%s backend=exposed-sdk",
+                    request.expected_followup_name ? request.expected_followup_name : "unknown",
+                    subject_spell_slot,
+                    followup_slot,
+                    cast_type_name(request.info.cast_type));
+            }
+
+            switch (request.info.cast_type)
+            {
+            case ability_cast::position:
+                if (request.max_cast_range < FLT_MAX
+                    && player->get_position().distance(request.cast_pos) > request.max_cast_range)
+                    return false;
+                if (sdk::common && sdk::common->cast_spell(followup_slot, request.cast_pos))
+                    return true;
+                player->cast_spell(followup_slot, request.cast_pos);
+                return true;
+            case ability_cast::target:
+                if (!request.target)
+                    return false;
+                if (sdk::common && sdk::common->cast_spell(followup_slot, request.target))
+                    return true;
+                player->cast_spell(followup_slot, request.target);
+                return true;
+            case ability_cast::self:
+                if (sdk::common && sdk::common->cast_spell(followup_slot))
+                    return true;
+                player->cast_spell(followup_slot);
+                return true;
+            }
+
+            return false;
+        }
+
+        bool send_hwei_selector(game_object* player, subject mood)
+        {
+            if (!player)
+                return false;
+
+            const int slot = subject_slot(mood);
+            const bool sent = player->cast_hwei_mood(static_cast<int>(mood));
+            if (sent)
+            {
+                cache_selected_subject(mood, "selector-sent");
+                return true;
+            }
+
+            // cast_hwei_mood unavailable (game palette not yet initialized) — fall back to
+            // raw cast_spell to open the palette, then let the followup fire normally.
+            if (HWEI_DEBUG_LOGS && g_sdk)
+            {
+                g_sdk->log_console("[MeowAIO] selector mood-api failed, raw fallback subject=%d slot=%d",
+                    static_cast<int>(mood), slot);
+            }
+            player->cast_spell(slot);
+            cache_selected_subject(mood, "selector-raw-fallback");
+            return true;
+        }
+
+        void reset_cast_engine(bool apply_lockout = false, const char* reason = nullptr)
+        {
+            if (apply_lockout && s_intent.active)
+            {
+                if (HWEI_DEBUG_LOGS && g_sdk)
+                {
+                    const std::string target_name = intent_target_name();
+                    g_sdk->log_console("[MeowAIO] reset reason=%s state=%s expected=%s observed=%s subject=%d followup=%d target=%s lockout=%.2fs",
+                        reason ? reason : "timeout",
+                        cast_state_name(s_cast_state),
+                        s_intent.expected_followup_name ? s_intent.expected_followup_name : "unknown",
+                        s_last_observed_cast_name.empty() ? "none" : s_last_observed_cast_name.c_str(),
+                        static_cast<int>(s_intent.info.mood),
+                        s_intent.info.slot,
+                        target_name.c_str(),
+                        SUBJECT_RETRY_LOCKOUT);
+                }
+                apply_subject_lockout(s_intent.info.mood);
+            }
+            if (s_intent.active && (apply_lockout || (reason && std::strcmp(reason, "confirmed-followup") == 0)))
+                cache_selected_subject(subject::none, reason ? reason : "reset");
             s_cast_state = cast_engine_state::idle;
             s_intent = {};
+            s_last_observed_cast_name.clear();
         }
 
         void forget_subject_if_needed()
@@ -346,7 +894,7 @@ namespace hwei
                 return;
             if (now() <= s_intent.timeout_at)
                 return;
-            reset_cast_engine();
+            reset_cast_engine(true, "timeout");
         }
 
         bool can_queue_subject_cast(const ability_info& info)
@@ -359,10 +907,24 @@ namespace hwei
                 return false;
             if (!has_mana_for(ready_slot))
                 return false;
+
+            if (info.mood == subject::none)
+                return is_spell_ready(ready_slot);
+
+            const int idx = subject_index(info.mood);
+            if (idx >= 0 && now() < s_subject_lockout_until[idx])
+                return false;
+
+            if (is_subspell_on_local_cd(info))
+                return false;
+
+            if (!is_spell_ready(ready_slot))
+                return false;
+
             return true;
         }
 
-        bool queue_cast_intent(const ability_info& info, const math::vector3& cast_pos, game_object* target, float max_cast_range = FLT_MAX, float timeout = SUBJECT_MEMORY)
+        bool queue_cast_intent(const ability_info& info, const math::vector3& cast_pos, game_object* target, float max_cast_range = FLT_MAX, float timeout = REQUEST_TIMEOUT)
         {
             auto* player = get_player();
             if (!player) return false;
@@ -380,9 +942,12 @@ namespace hwei
             {
                 if (s_intent.info.mood != info.mood || s_intent.info.slot != info.slot)
                     return false;
-                s_intent.cast_pos = cast_pos;
-                s_intent.target = target;
-                s_intent.max_cast_range = max_cast_range;
+                if (!s_intent.followup_sent)
+                {
+                    s_intent.cast_pos = cast_pos;
+                    s_intent.target = target;
+                    s_intent.max_cast_range = max_cast_range;
+                }
                 return true;
             }
 
@@ -394,7 +959,21 @@ namespace hwei
             s_intent.timeout_at = now() + timeout;
             s_intent.selector_sent = false;
             s_intent.selector_sent_at = 0.f;
+            s_intent.followup_sent = false;
+            s_intent.followup_sent_at = 0.f;
+            s_intent.expected_followup_name = expected_followup_name(info);
+            s_last_observed_cast_name.clear();
             s_cast_state = cast_engine_state::selecting_subject;
+
+            if (HWEI_DEBUG_LOGS && g_sdk)
+            {
+                g_sdk->log_console("[MeowAIO] queue expected=%s subject=%d subject_slot=%d followup=%d type=%s",
+                    s_intent.expected_followup_name ? s_intent.expected_followup_name : "unknown",
+                    static_cast<int>(info.mood),
+                    subject_slot(info.mood),
+                    info.slot,
+                    cast_type_name(info.cast_type));
+            }
             return true;
         }
 
@@ -404,16 +983,16 @@ namespace hwei
                 return false;
 
             auto* player = get_player();
-            if (!player || !sdk::common)
+            if (!player)
             {
-                reset_cast_engine();
+                reset_cast_engine(true, "invalid-player");
                 return false;
             }
 
             const float t = now();
             if (t > s_intent.timeout_at)
             {
-                reset_cast_engine();
+                reset_cast_engine(true, "timeout");
                 return false;
             }
 
@@ -429,20 +1008,40 @@ namespace hwei
                     if (s_intent.max_cast_range < FLT_MAX
                         && player->get_position().distance(s_intent.cast_pos) > s_intent.max_cast_range)
                         return false;
-                    casted = sdk::common->cast_spell(s_intent.info.slot, s_intent.cast_pos);
+                    if (sdk::common)
+                        casted = sdk::common->cast_spell(s_intent.info.slot, s_intent.cast_pos);
+                    else
+                    {
+                        player->cast_spell(s_intent.info.slot, s_intent.cast_pos);
+                        casted = true;
+                    }
                     break;
                 case ability_cast::target:
                     if (s_intent.target)
-                        casted = sdk::common->cast_spell(s_intent.info.slot, s_intent.target);
+                    {
+                        if (sdk::common)
+                            casted = sdk::common->cast_spell(s_intent.info.slot, s_intent.target);
+                        else
+                        {
+                            player->cast_spell(s_intent.info.slot, s_intent.target);
+                            casted = true;
+                        }
+                    }
                     break;
                 case ability_cast::self:
-                    casted = sdk::common->cast_spell(s_intent.info.slot);
+                    if (sdk::common)
+                        casted = sdk::common->cast_spell(s_intent.info.slot);
+                    else
+                    {
+                        player->cast_spell(s_intent.info.slot);
+                        casted = true;
+                    }
                     break;
                 }
                 if (casted)
                 {
                     s_last_cast_time = t;
-                    reset_cast_engine();
+                    reset_cast_engine(false, "subjectless-cast-sent");
                     return true;
                 }
                 return false;
@@ -460,11 +1059,21 @@ namespace hwei
                 }
                 else if (!s_intent.selector_sent)
                 {
-                    if (!player->cast_hwei_mood(static_cast<int>(s_intent.info.mood)))
+                    if (!send_hwei_selector(player, s_intent.info.mood))
+                    {
+                        reset_cast_engine(true, "selector-send-failed");
                         return false;
+                    }
                     s_intent.selector_sent = true;
                     s_intent.selector_sent_at = t;
                     s_cast_state = cast_engine_state::await_followup_window;
+                    if (HWEI_DEBUG_LOGS && g_sdk)
+                    {
+                        g_sdk->log_console("[MeowAIO] selector sent expected=%s subject=%d subject_slot=%d",
+                            s_intent.expected_followup_name ? s_intent.expected_followup_name : "unknown",
+                            static_cast<int>(s_intent.info.mood),
+                            subject_slot(s_intent.info.mood));
+                    }
                     return false;
                 }
                 else
@@ -478,31 +1087,50 @@ namespace hwei
                 if (t - s_intent.selector_sent_at < SUBJECT_CONFIRM_DELAY)
                     return false;
 
-                bool casted = false;
-                switch (s_intent.info.cast_type)
+                if (s_intent.followup_sent)
                 {
-                case ability_cast::position:
-                    if (s_intent.max_cast_range < FLT_MAX)
-                    {
-                        if (player->get_position().distance(s_intent.cast_pos) > s_intent.max_cast_range)
-                            return false;
-                    }
-                    casted = sdk::common->cast_spell(s_intent.info.slot, s_intent.cast_pos);
-                    break;
-                case ability_cast::target:
-                    if (s_intent.target)
-                        casted = sdk::common->cast_spell(s_intent.info.slot, s_intent.target);
-                    break;
-                case ability_cast::self:
-                    casted = sdk::common->cast_spell(s_intent.info.slot);
-                    break;
+                    s_cast_state = cast_engine_state::casting_followup;
+                    return false;
                 }
+
+                // Re-predict the aim point at the moment the followup actually fires.
+                // The subject-select step plus the spell's own cast delay let the target
+                // drift far from the position computed at queue time, which both misses
+                // moving targets and can push the frozen point out of range (spinning until
+                // timeout). Refreshing here keeps the cast accurate and in range.
+                if (s_intent.repredict
+                    && s_intent.target
+                    && s_intent.info.cast_type == ability_cast::position
+                    && sdk::prediction
+                    && is_valid_target(s_intent.target, FLT_MAX))
+                {
+                    s_intent.repredict_spell.source = player;
+                    s_intent.repredict_spell.source_position = player->get_position();
+                    s_intent.repredict_spell.expected_hitchance = s_intent.repredict_hitchance;
+
+                    auto fresh = sdk::prediction->predict(s_intent.target, s_intent.repredict_spell);
+                    if (fresh.is_valid && fresh.hitchance >= s_intent.repredict_hitchance)
+                    {
+                        const float fresh_dist = player->get_position().distance(fresh.cast_position);
+                        const bool in_range = s_intent.max_cast_range >= FLT_MAX
+                            || fresh_dist <= s_intent.max_cast_range;
+                        const bool blocked = s_intent.info.mood == subject::disaster
+                            && s_intent.info.slot == SLOT_Q
+                            && line_blocked_by_enemy_minion(fresh.cast_position, s_intent.repredict_spell.radius, s_intent.target);
+                        if (in_range && !blocked)
+                            s_intent.cast_pos = fresh.cast_position;
+                    }
+                }
+
+                const bool casted = cast_hwei_spell(player, s_intent);
 
                 if (casted)
                 {
                     s_last_cast_time = t;
+                    s_intent.followup_sent = true;
+                    s_intent.followup_sent_at = t;
                     s_cast_state = cast_engine_state::casting_followup;
-                    return true;
+                    return false;
                 }
             }
 
@@ -525,16 +1153,39 @@ namespace hwei
             base_spell.expected_hitchance = hitchance;
 
             auto prediction = sdk::prediction->predict(target, base_spell);
+            const float cast_dist = player->get_position().distance(prediction.cast_position);
+            const char* pred_result = "accepted";
+            if (!prediction.is_valid)
+                pred_result = "invalid";
+            else if (prediction.hitchance < hitchance)
+                pred_result = "low-hitchance";
+            else if (cast_dist > base_spell.range)
+                pred_result = "out-of-range";
+            else if (info.mood == subject::disaster
+                && info.slot == SLOT_Q
+                && line_blocked_by_enemy_minion(prediction.cast_position, base_spell.radius, target))
+                pred_result = "collision";
+
+            log_prediction_result(expected_followup_name(info), target, prediction, hitchance, cast_dist, base_spell.range, pred_result);
+
             if (!prediction.is_valid || prediction.hitchance < hitchance)
                 return false;
 
             // Prevent forced walk-in: never cast if predicted point is out of range.
-            const float cast_dist = player->get_position().distance(prediction.cast_position);
             if (cast_dist > base_spell.range)
+                return false;
+
+            if (std::strcmp(pred_result, "collision") == 0)
                 return false;
 
             if (!queue_cast_intent(info, prediction.cast_position, target, base_spell.range))
                 return false;
+            if (!s_intent.followup_sent)
+            {
+                s_intent.repredict = true;
+                s_intent.repredict_spell = base_spell;
+                s_intent.repredict_hitchance = hitchance;
+            }
             return execute_cast_engine();
         }
 
@@ -554,16 +1205,32 @@ namespace hwei
             base_spell.expected_hitchance = hitchance;
 
             auto prediction = sdk::prediction->predict(target, base_spell);
+            const float cast_dist = player->get_position().distance(prediction.cast_position);
+            const char* pred_result = "accepted";
+            if (!prediction.is_valid)
+                pred_result = "invalid";
+            else if (prediction.hitchance < hitchance)
+                pred_result = "low-hitchance";
+            else if (cast_dist > base_spell.range)
+                pred_result = "out-of-range";
+
+            log_prediction_result(expected_followup_name(info), target, prediction, hitchance, cast_dist, base_spell.range, pred_result);
+
             if (!prediction.is_valid || prediction.hitchance < hitchance)
                 return false;
 
             // Prevent forced walk-in: never cast if predicted point is out of range.
-            const float cast_dist = player->get_position().distance(prediction.cast_position);
             if (cast_dist > base_spell.range)
                 return false;
 
             if (!queue_cast_intent(info, prediction.cast_position, target, base_spell.range))
                 return false;
+            if (!s_intent.followup_sent)
+            {
+                s_intent.repredict = true;
+                s_intent.repredict_spell = base_spell;
+                s_intent.repredict_hitchance = hitchance;
+            }
             return execute_cast_engine();
         }
 
@@ -595,6 +1262,9 @@ namespace hwei
             if (cast_dist > s_pred_qq.range)
                 return false;
 
+            if (line_blocked_by_enemy_minion(cast_pos, s_pred_qq.radius, target))
+                return false;
+
             if (!queue_cast_intent(ABILITY_QQ, cast_pos, target, s_pred_qq.range))
                 return false;
             return execute_cast_engine();
@@ -603,6 +1273,44 @@ namespace hwei
         bool try_cast_qw(int hitchance)
         {
             return try_cast_circular(ABILITY_QW, s_pred_qw, hitchance);
+        }
+
+        bool try_cast_qw_on_target(game_object* target, int hitchance)
+        {
+            if (!sdk::prediction)
+                return false;
+
+            auto* player = get_player();
+            if (!player || !is_valid_target(target, s_pred_qw.range))
+                return false;
+
+            auto spell = s_pred_qw;
+            spell.source = player;
+            spell.source_position = player->get_position();
+            spell.expected_hitchance = hitchance;
+
+            auto prediction = sdk::prediction->predict(target, spell);
+            const float cast_dist = player->get_position().distance(prediction.cast_position);
+            const char* pred_result = "accepted";
+            if (!prediction.is_valid)
+                pred_result = "invalid";
+            else if (prediction.hitchance < hitchance)
+                pred_result = "low-hitchance";
+            else if (cast_dist > spell.range)
+                pred_result = "out-of-range";
+
+            log_prediction_result("HweiQW", target, prediction, hitchance, cast_dist, spell.range, pred_result);
+
+            if (!prediction.is_valid || prediction.hitchance < hitchance)
+                return false;
+
+            if (cast_dist > spell.range)
+                return false;
+
+            if (!queue_cast_intent(ABILITY_QW, prediction.cast_position, target, spell.range))
+                return false;
+
+            return execute_cast_engine();
         }
 
         bool try_cast_qe(int hitchance)
@@ -617,9 +1325,118 @@ namespace hwei
             return execute_cast_engine();
         }
 
+        // WW (Stirring Lights): self-centered heal that prioritises the most
+        // wounded nearby ally. Fires when our own HP% drops below the self
+        // threshold, or a visible allied champion within heal range drops below
+        // the ally threshold.
+        bool handle_ww()
+        {
+            if (!menu::use_ww)
+                return false;
+            if (!is_spell_learned(SLOT_W) || !is_spell_ready(SLOT_W) || !has_mana_for(SLOT_W))
+                return false;
+            if (consume_cast_engine_busy())
+                return false;
+
+            auto* player = get_player();
+            if (!player || !g_sdk || !g_sdk->object_manager)
+                return false;
+
+            bool should_heal = false;
+
+            const float self_max = player->get_max_hp();
+            if (self_max > 0.f
+                && (player->get_hp() / self_max) * 100.f <= static_cast<float>(menu::ww_self_hp_pct))
+            {
+                should_heal = true;
+            }
+
+            if (!should_heal)
+            {
+                const auto ppos = player->get_position();
+                for (auto* ally : g_sdk->object_manager->get_heroes())
+                {
+                    if (!ally || !ally->is_valid() || ally->is_dead() || !ally->is_visible())
+                        continue;
+                    if (ally->get_team_id() != player->get_team_id())
+                        continue;
+                    if (ally->get_network_id() == player->get_network_id())
+                        continue;
+                    if (ppos.distance(ally->get_position()) > spell_data::ww_range)
+                        continue;
+
+                    const float max_hp = ally->get_max_hp();
+                    if (max_hp <= 0.f)
+                        continue;
+                    if ((ally->get_hp() / max_hp) * 100.f <= static_cast<float>(menu::ww_ally_hp_pct))
+                    {
+                        should_heal = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!should_heal)
+                return false;
+
+            if (!queue_cast_intent(ABILITY_WW, {}, nullptr))
+                return false;
+            return execute_cast_engine();
+        }
+
         bool try_cast_eq(int hitchance)
         {
             return try_cast_linear(ABILITY_EQ, s_pred_eq, hitchance);
+        }
+
+        bool try_cast_ew_root_setup()
+        {
+            if (!sdk::prediction) return false;
+
+            auto* player = get_player();
+            if (!player) return false;
+
+            auto* target = pick_target(s_pred_ew.range);
+            if (!is_valid_target(target, s_pred_ew.range))
+                return false;
+
+            auto spell = s_pred_ew;
+            spell.source = player;
+            spell.source_position = player->get_position();
+            spell.expected_hitchance = pred_sdk::hitchance::medium;
+
+            auto prediction = sdk::prediction->predict(target, spell);
+            const float cast_dist = player->get_position().distance(prediction.cast_position);
+
+            const char* pred_result = "accepted";
+            if (!prediction.is_valid)
+                pred_result = "invalid";
+            else if (cast_dist > spell.range)
+                pred_result = "out-of-range";
+
+            log_prediction_result("HweiEW-root", target, prediction, pred_sdk::hitchance::medium,
+                cast_dist, spell.range, pred_result);
+
+            if (!prediction.is_valid || cast_dist > spell.range)
+                return false;
+
+            if (HWEI_DEBUG_LOGS && g_sdk)
+            {
+                g_sdk->log_console("[MeowAIO] EW root setup pred_pos=(%.0f,%.0f,%.0f) target=%s",
+                    prediction.cast_position.x, prediction.cast_position.y,
+                    prediction.cast_position.z, target->get_name().c_str());
+            }
+
+            if (!queue_cast_intent(ABILITY_EW, prediction.cast_position, target, s_pred_ew.range))
+                return false;
+            if (!s_intent.followup_sent)
+            {
+                s_intent.repredict = true;
+                s_intent.repredict_spell = spell;
+                s_intent.repredict_hitchance = 0; // root setup is lenient: refresh whenever prediction is valid
+            }
+
+            return execute_cast_engine();
         }
 
         bool try_cast_ee(int hitchance)
@@ -627,11 +1444,190 @@ namespace hwei
             return try_cast_circular(ABILITY_EE, s_pred_ee, hitchance);
         }
 
-        bool try_cast_r(int hitchance)
+        // Returns false when the prediction should not be trusted for R:
+        //  - cast position is within RANGE_MARGIN of max range (borderline shots miss on moving targets)
+        //  - cast position is behind / orthogonal to the target (happens at melee range when target
+        //    runs into or past the player, producing a backwards intersection point)
+        bool validate_r_prediction(game_object* target,
+            const pred_sdk::pred_data& prediction,
+            float cast_dist, float range)
         {
-            if (!menu::combo_use_r) return false;
+            constexpr float RANGE_MARGIN = 60.f;
+            if (cast_dist > range - RANGE_MARGIN)
+            {
+                if (HWEI_DEBUG_LOGS && g_sdk)
+                    g_sdk->log_console("[MeowAIO] R reject edge-of-range dist=%.0f margin=%.0f range=%.0f",
+                        cast_dist, RANGE_MARGIN, range);
+                return false;
+            }
+
+            auto* player = get_player();
+            if (player && target)
+            {
+                const auto ppos      = player->get_position();
+                const auto to_target = target->get_position() - ppos;
+                const auto to_cast   = prediction.cast_position - ppos;
+                const float dot      = to_target.x * to_cast.x + to_target.z * to_cast.z;
+                if (dot <= 0.f)
+                {
+                    if (HWEI_DEBUG_LOGS && g_sdk)
+                        g_sdk->log_console("[MeowAIO] R reject backwards cast_pos target=%s dot=%.1f",
+                            target->get_name().c_str(), dot);
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        bool try_cast_r_direct(int hitchance)
+        {
+            if (!sdk::prediction || !sdk::common) return false;
+            if (!is_spell_ready(SLOT_R) || !has_mana_for(SLOT_R))
+            {
+                if (HWEI_DEBUG_LOGS && g_sdk)
+                    g_sdk->log_console("[MeowAIO] R skip ready=%d mana=%d", is_spell_ready(SLOT_R), has_mana_for(SLOT_R));
+                return false;
+            }
+
+            auto* player = get_player();
+            if (!player) return false;
+
+            auto* target = pick_target(s_pred_r.range);
+            if (!is_valid_target(target, s_pred_r.range))
+            {
+                if (HWEI_DEBUG_LOGS && g_sdk)
+                    g_sdk->log_console("[MeowAIO] R skip no valid target range=%.0f", s_pred_r.range);
+                return false;
+            }
+
+            auto spell = s_pred_r;
+            spell.source = player;
+            spell.source_position = player->get_position();
+            spell.expected_hitchance = hitchance;
+
+            auto prediction = sdk::prediction->predict(target, spell);
+            const float cast_dist = player->get_position().distance(prediction.cast_position);
+            const char* pred_result = "accepted";
+            if (!prediction.is_valid)
+                pred_result = "invalid";
+            else if (prediction.hitchance < hitchance)
+                pred_result = "low-hitchance";
+            else if (cast_dist > spell.range)
+                pred_result = "out-of-range";
+
+            log_prediction_result("HweiR", target, prediction, hitchance, cast_dist, spell.range, pred_result);
+
+            if (!prediction.is_valid || prediction.hitchance < hitchance)
+            {
+                if (HWEI_DEBUG_LOGS && g_sdk)
+                    g_sdk->log_console("[MeowAIO] R skip prediction valid=%d hc=%d need=%d",
+                        prediction.is_valid, prediction.hitchance, hitchance);
+                return false;
+            }
+
+            if (cast_dist > spell.range)
+            {
+                if (HWEI_DEBUG_LOGS && g_sdk)
+                    g_sdk->log_console("[MeowAIO] R skip cast position out of range");
+                return false;
+            }
+
+            if (!validate_r_prediction(target, prediction, cast_dist, spell.range))
+                return false;
+
+            const bool r_fired = sdk::common->cast_spell(SLOT_R, prediction.cast_position);
+            if (r_fired)
+                s_r_wait_started_at = 0.f;
+            return r_fired;
+        }
+
+        bool try_cast_r_on_target(game_object* target, int hitchance)
+        {
+            if (!sdk::prediction || !sdk::common) return false;
             if (!is_spell_ready(SLOT_R) || !has_mana_for(SLOT_R)) return false;
-            return try_cast_linear(ABILITY_R, s_pred_r, hitchance);
+
+            auto* player = get_player();
+            if (!player || !is_valid_target(target, s_pred_r.range)) return false;
+
+            auto spell = s_pred_r;
+            spell.source = player;
+            spell.source_position = player->get_position();
+            spell.expected_hitchance = hitchance;
+
+            auto prediction = sdk::prediction->predict(target, spell);
+            const float cast_dist = player->get_position().distance(prediction.cast_position);
+
+            const char* pred_result = "accepted";
+            if (!prediction.is_valid)
+                pred_result = "invalid";
+            else if (prediction.hitchance < hitchance)
+                pred_result = "low-hitchance";
+            else if (cast_dist > spell.range)
+                pred_result = "out-of-range";
+
+            log_prediction_result("HweiR-KS", target, prediction, hitchance, cast_dist, spell.range, pred_result);
+
+            if (!prediction.is_valid || prediction.hitchance < hitchance || cast_dist > spell.range)
+                return false;
+
+            if (!validate_r_prediction(target, prediction, cast_dist, spell.range))
+                return false;
+
+            const bool fired = sdk::common->cast_spell(SLOT_R, prediction.cast_position);
+            if (fired)
+                s_r_wait_started_at = 0.f;
+            return fired;
+        }
+
+        bool try_cast_r_semi(int hitchance)
+        {
+            if (try_cast_r_direct(hitchance))
+                return true;
+
+            return try_cast_r_direct(pred_sdk::hitchance::medium);
+        }
+
+        bool should_wait_for_r()
+        {
+            if (!is_spell_ready(SLOT_R) || !has_mana_for(SLOT_R))
+            {
+                s_r_wait_started_at = 0.f;
+                return false;
+            }
+            // Only stall the rest of the combo (QE/QW) while there is actually a target
+            // within R range to wait for. Otherwise R can never land and we'd needlessly
+            // withhold damage for the full wait window.
+            if (!is_valid_target(pick_target(s_pred_r.range), s_pred_r.range))
+            {
+                s_r_wait_started_at = 0.f;
+                return false;
+            }
+            const float wait_max = TEAMFIGHT_R_WAIT;
+            if (wait_max <= 0.f)
+                return false;
+            const float t = now();
+            if (s_r_wait_started_at <= 0.f)
+                s_r_wait_started_at = t;
+            if (t - s_r_wait_started_at >= wait_max)
+            {
+                s_r_wait_started_at = 0.f;
+                return false;
+            }
+            return true;
+        }
+
+        void open_ew_qw_followup_window(float ready_delay, const char* reason)
+        {
+            const float current_time = now();
+            s_ew_qw_followup_ready_at = current_time + ready_delay;
+            s_ew_qw_followup_until = current_time + EE_QQ_FOLLOWUP_WINDOW;
+
+            if (HWEI_DEBUG_LOGS && g_sdk)
+            {
+                g_sdk->log_console("[MeowAIO] EW followup window opened reason=%s ready_delay=%.2fs",
+                    reason ? reason : "unknown", ready_delay);
+            }
         }
 
         bool handle_ee_qq_followup()
@@ -653,7 +1649,84 @@ namespace hwei
                 return true;
             }
 
-            // Keep follow-up window active, but don't block other combo actions.
+            return s_intent.active;
+        }
+
+        bool handle_ew_qw_followup(bool cast_r_first)
+        {
+            if (s_ew_qw_followup_until <= 0.f)
+                return false;
+
+            const float current_time = now();
+            if (current_time > s_ew_qw_followup_until)
+            {
+                s_ew_qw_followup_ready_at = 0.f;
+                s_ew_qw_followup_until = 0.f;
+                return false;
+            }
+
+            if (current_time < s_ew_qw_followup_ready_at)
+                return true;
+
+            if (cast_r_first && try_cast_r_semi(menu::combo_r_hitchance))
+                return true;
+
+            if (cast_or_busy(try_cast_qw(menu::combo_qw_hitchance)))
+                return true;
+
+            return false;
+        }
+
+        bool combo_basic()
+        {
+            if (handle_ee_qq_followup()) return true;
+            if (cast_or_busy(try_cast_we())) return true;
+            if (cast_or_busy(try_cast_ee(menu::combo_ee_hitchance))) return true;
+            if (cast_or_busy(try_cast_qq(menu::combo_qq_hitchance))) return true;
+            return false;
+        }
+
+        bool combo_qe_qw()
+        {
+            if (cast_or_busy(try_cast_we())) return true;
+            if (cast_or_busy(try_cast_qe(menu::combo_qe_hitchance))) return true;
+            if (cast_or_busy(try_cast_qw(menu::combo_qw_hitchance))) return true;
+            return false;
+        }
+
+        bool combo_ew_qw()
+        {
+            if (handle_ew_qw_followup(false)) return true;
+            if (cast_or_busy(try_cast_ew_root_setup())) return true;
+            return false;
+        }
+
+        bool combo_ew_r_qw()
+        {
+            if (handle_ew_qw_followup(true)) return true;
+            if (cast_or_busy(try_cast_ew_root_setup())) return true;
+            return false;
+        }
+
+        bool combo_all_in_burst()
+        {
+            if (handle_ee_qq_followup()) return true;
+            if (cast_or_busy(try_cast_we())) return true;
+            if (cast_or_busy(try_cast_ee(menu::combo_ee_hitchance))) return true;
+            if (try_cast_r_semi(menu::combo_r_hitchance)) return true;
+            if (cast_or_busy(try_cast_qq(menu::combo_qq_hitchance))) return true;
+            if (cast_or_busy(try_cast_qw(menu::combo_qw_hitchance))) return true;
+            return false;
+        }
+
+        bool combo_teamfight_all_in()
+        {
+            if (cast_or_busy(try_cast_we())) return true;
+            if (cast_or_busy(try_cast_ee(menu::combo_ee_hitchance))) return true;
+            if (try_cast_r_semi(menu::combo_r_hitchance)) return true;
+            if (should_wait_for_r()) return true;
+            if (cast_or_busy(try_cast_qe(menu::combo_qe_hitchance))) return true;
+            if (cast_or_busy(try_cast_qw(menu::combo_qw_hitchance))) return true;
             return false;
         }
 
@@ -694,8 +1767,9 @@ namespace hwei
             auto* r_spell = player->get_spell(SLOT_R);
             if (!r_spell || r_spell->get_level() <= 0) return 0.f;
 
-            const int level = std::clamp(r_spell->get_level(), 0, 3);
-            constexpr float BASE[] = { 0.f, 200.f, 360.f, 490.f };
+            const int level = std::clamp(r_spell->get_level(), 1, 3);
+            // Spiraling Despair (per Data.cpp HweiR): 230/360/490 + 0.95 AP
+            constexpr float BASE[] = { 0.f, 230.f, 360.f, 490.f };
             constexpr float AP_RATIO = 0.95f;
 
             const float ap = player->get_ability_power();
@@ -704,93 +1778,355 @@ namespace hwei
             return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw);
         }
 
+        float get_qw_damage(game_object* target)
+        {
+            auto* player = get_player();
+            if (!player || !target || !sdk::damage)
+                return 0.f;
+
+            // QW (Severing Bolt) is a Disaster sub-spell: it ranks with the Q slot
+            // (Data.cpp HweiQW -> SkillshotSlot 'Q'), not W.
+            auto* q_spell = player->get_spell(SLOT_Q);
+            if (!q_spell || q_spell->get_level() <= 0)
+                return 0.f;
+
+            const int level = std::clamp(q_spell->get_level(), 1, 5);
+            constexpr float BASE[] = { 0.f, 60.f, 85.f, 110.f, 135.f, 160.f };
+            constexpr float MAX_MISSING_HP_MULT[] = { 0.f, 2.00f, 2.375f, 2.75f, 3.125f, 3.50f };
+
+            float raw = BASE[level] + 0.25f * player->get_ability_power();
+
+            if (has_hard_cc(target) || is_isolated_for_qw(target))
+            {
+                const float max_hp = target->get_max_hp();
+                if (max_hp > 0.f)
+                {
+                    const float missing_pct = std::clamp((max_hp - target->get_hp()) / max_hp, 0.f, 1.f);
+                    const float mult = 1.f + (MAX_MISSING_HP_MULT[level] - 1.f) * missing_pct;
+                    raw *= mult;
+                }
+            }
+
+            return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw);
+        }
+
+        float get_qq_damage(game_object* target)
+        {
+            auto* player = get_player();
+            if (!player || !target || !sdk::damage) return 0.f;
+
+            auto* q_spell = player->get_spell(SLOT_Q);
+            if (!q_spell || q_spell->get_level() <= 0) return 0.f;
+
+            const int idx = std::clamp(q_spell->get_level(), 1, 5) - 1;
+            // Devastating Fire [Fireball] direct hit (per Data.cpp HweiQQ):
+            //   base 60/90/120/150/180 + (3/4/5/6/7)% target max HP + 0.75 AP
+            constexpr float BASE[]   = { 60.f, 90.f, 120.f, 150.f, 180.f };
+            constexpr float HP_PCT[] = { 3.f,  4.f,  5.f,   6.f,   7.f   };
+            constexpr float AP_RATIO = 0.75f;
+
+            const float raw = BASE[idx]
+                + HP_PCT[idx] * target->get_max_hp() / 100.f
+                + AP_RATIO * player->get_ability_power();
+            return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw);
+        }
+
+        float get_magic_effective_hp(game_object* target, float delay)
+        {
+            if (!target)
+                return FLT_MAX;
+
+            float hp = target->get_hp();
+            if (sdk::health_prediction)
+            {
+                const float predicted = sdk::health_prediction->get_predicted_health(target, now() + delay);
+                if (predicted > 0.f && predicted <= target->get_max_hp())
+                    hp = predicted;
+            }
+
+            return hp + target->get_all_shield() + target->get_magical_shield();
+        }
+
+        bool killsteal_qw()
+        {
+            if (!menu::killsteal_qw || !g_sdk || !g_sdk->object_manager)
+                return false;
+            if (consume_cast_engine_busy() || has_combo_followup_window())
+                return false;
+            if (!is_spell_ready(SLOT_Q) || !has_mana_for(SLOT_Q))
+                return false;
+
+            for (auto* hero : g_sdk->object_manager->get_heroes())
+            {
+                if (!is_valid_target(hero, s_pred_qw.range))
+                    continue;
+
+                const float hp = get_magic_effective_hp(hero, spell_data::qw_delay + 0.05f);
+                const float damage = get_qw_damage(hero);
+                if (hp <= 0.f || hp > damage)
+                    continue;
+
+                if (HWEI_DEBUG_LOGS && g_sdk)
+                {
+                    g_sdk->log_console("[MeowAIO] QW killsteal target=%s hp=%.0f dmg=%.0f",
+                        hero->get_name().c_str(), hp, damage);
+                }
+
+                if (cast_or_busy(try_cast_qw_on_target(hero, menu::combo_qw_hitchance)))
+                    return true;
+            }
+
+            return false;
+        }
+
+        bool killsteal_r()
+        {
+            if (!menu::killsteal_r || !g_sdk || !g_sdk->object_manager)
+                return false;
+            // R is a standalone ultimate (no subject selector), so it may fire during
+            // a combo follow-up window to secure a kill — only the active cast engine blocks it.
+            if (consume_cast_engine_busy())
+                return false;
+            if (!is_spell_ready(SLOT_R) || !has_mana_for(SLOT_R))
+                return false;
+
+            for (auto* hero : g_sdk->object_manager->get_heroes())
+            {
+                if (!is_valid_target(hero, s_pred_r.range))
+                    continue;
+
+                const float hp = get_magic_effective_hp(hero, spell_data::r_delay + 0.05f);
+                const float damage = get_r_damage(hero);
+                if (hp <= 0.f || hp > damage)
+                    continue;
+
+                if (HWEI_DEBUG_LOGS && g_sdk)
+                {
+                    g_sdk->log_console("[MeowAIO] R killsteal target=%s hp=%.0f dmg=%.0f",
+                        hero->get_name().c_str(), hp, damage);
+                }
+
+                if (try_cast_r_on_target(hero, menu::combo_r_hitchance))
+                    return true;
+            }
+
+            return false;
+        }
+
         bool handle_hotkeys()
         {
-            if (s_intent.active)
-                return execute_cast_engine();
+            if (consume_cast_engine_busy())
+                return true;
 
-            if (menu::bind_r_active && try_cast_r(menu::combo_r_hitchance))
+            if (menu::bind_r_active && try_cast_r_semi(menu::combo_r_hitchance))
                 return true;
-            if (menu::bind_we_active && try_cast_we())
+            if (menu::bind_we_active && cast_or_busy(try_cast_we()))
                 return true;
-            if (menu::bind_qw_active && try_cast_qw(menu::combo_qw_hitchance))
+            if (menu::bind_qw_active && cast_or_busy(try_cast_qw(menu::combo_qw_hitchance)))
                 return true;
-            if (menu::bind_ee_active && try_cast_ee(menu::combo_ee_hitchance))
+            if (menu::bind_ee_active && cast_or_busy(try_cast_ee(menu::combo_ee_hitchance)))
+                return true;
+            if (menu::bind_eq_active && cast_or_busy(try_cast_eq(menu::combo_eq_hitchance)))
                 return true;
             return false;
         }
 
+        int effective_combo_mode()
+        {
+            if (menu::bind_mode_basic_active)     return static_cast<int>(combo_mode::basic);
+            if (menu::bind_mode_qeqw_active)      return static_cast<int>(combo_mode::qe_qw);
+            if (menu::bind_mode_ewqw_active)      return static_cast<int>(combo_mode::ew_qw);
+            if (menu::bind_mode_ewrqw_active)     return static_cast<int>(combo_mode::ew_r_qw);
+            if (menu::bind_mode_burst_active)     return static_cast<int>(combo_mode::all_in_burst);
+            if (menu::bind_mode_teamfight_active) return static_cast<int>(combo_mode::teamfight_all_in);
+            return menu::combo_mode_sel;
+        }
+
+        bool any_mode_bind_active()
+        {
+            return menu::bind_mode_basic_active
+                || menu::bind_mode_qeqw_active
+                || menu::bind_mode_ewqw_active
+                || menu::bind_mode_ewrqw_active
+                || menu::bind_mode_burst_active
+                || menu::bind_mode_teamfight_active;
+        }
+
+        void clear_all_mode_binds()
+        {
+            menu::bind_mode_basic_active     = false;
+            menu::bind_mode_qeqw_active      = false;
+            menu::bind_mode_ewqw_active      = false;
+            menu::bind_mode_ewrqw_active     = false;
+            menu::bind_mode_burst_active     = false;
+            menu::bind_mode_teamfight_active = false;
+        }
+
+        void toggle_mode_bind(bool& target)
+        {
+            if (target)
+            {
+                target = false;
+            }
+            else
+            {
+                clear_all_mode_binds();
+                target = true;
+            }
+        }
+
         void combo()
         {
-            if (is_casting())
+            if (consume_cast_engine_busy())
                 return;
-            if (s_intent.active)
-            {
-                execute_cast_engine();
-                return;
-            }
 
-            switch (static_cast<combo_mode>(menu::combo_mode_sel))
+            switch (static_cast<combo_mode>(effective_combo_mode()))
             {
             case combo_mode::basic:
+                combo_basic();
+                break;
+            case combo_mode::qe_qw:
+                combo_qe_qw();
+                break;
+            case combo_mode::ew_qw:
+                combo_ew_qw();
+                break;
+            case combo_mode::ew_r_qw:
+                combo_ew_r_qw();
+                break;
+            case combo_mode::all_in_burst:
+                combo_all_in_burst();
+                break;
+            case combo_mode::teamfight_all_in:
+                combo_teamfight_all_in();
+                break;
             default:
-                if (handle_ee_qq_followup()) return;
-                if (try_cast_r(menu::combo_r_hitchance)) return;
-                if (try_cast_we()) return;
-                if (try_cast_ee(menu::combo_ee_hitchance)) return;
-                if (try_cast_qq(menu::combo_qq_hitchance)) return;
+                combo_basic();
                 break;
             }
         }
 
         void harass()
         {
-            if (is_casting())
+            if (consume_cast_engine_busy())
                 return;
-            if (s_intent.active)
-            {
-                execute_cast_engine();
-                return;
-            }
 
             if (mana_percent() < static_cast<float>(menu::harass_mana_pct))
                 return;
 
-            if (menu::harass_use_we && try_cast_we())
+            if (menu::harass_use_eq && cast_or_busy(try_cast_eq(menu::combo_eq_hitchance)))
                 return;
 
-            if (menu::harass_use_qe && try_cast_linear(ABILITY_QE, s_pred_qe, menu::combo_qe_hitchance))
+            if (menu::harass_use_qe && cast_or_busy(try_cast_linear(ABILITY_QE, s_pred_qe, menu::combo_qe_hitchance)))
                 return;
 
-            if (menu::harass_use_qw && try_cast_circular(ABILITY_QW, s_pred_qw, menu::combo_qw_hitchance))
+            if (menu::harass_use_qw && cast_or_busy(try_cast_circular(ABILITY_QW, s_pred_qw, menu::combo_qw_hitchance)))
                 return;
 
-            if (menu::harass_use_qq && try_cast_linear(ABILITY_QQ, s_pred_qq, menu::combo_qq_hitchance))
+            if (menu::harass_use_qq && cast_or_busy(try_cast_linear(ABILITY_QQ, s_pred_qq, menu::combo_qq_hitchance)))
+                return;
+
+            if (menu::harass_use_we && cast_or_busy(try_cast_we()))
                 return;
         }
 
         void flee()
         {
-            if (is_casting())
+            if (consume_cast_engine_busy())
                 return;
-            if (s_intent.active)
-            {
-                execute_cast_engine();
-                return;
-            }
 
             cast_wq_flee();
         }
 
-        void lane()
+        bool lane_qq_lasthit()
         {
-            if (is_casting())
-                return;
-            if (s_intent.active)
+            if (!menu::lane_use_qq) return false;
+            if (!is_spell_ready(SLOT_Q) || !has_mana_for(SLOT_Q)) return false;
+
+            auto* player = get_player();
+            if (!player || !g_sdk || !g_sdk->object_manager) return false;
+
+            const auto ppos = player->get_position();
+            const float range  = spell_data::qq_range;
+            const float speed  = spell_data::qq_speed;
+            const float delay  = spell_data::qq_delay;
+
+            game_object*  best_target   = nullptr;
+            float         best_dist     = FLT_MAX;
+            math::vector3 best_cast_pos{};
+
+            for (auto* m : g_sdk->object_manager->get_minions())
+            {
+                if (!m || !m->is_valid() || m->is_dead() || !m->is_targetable())
+                    continue;
+                if (m->get_team_id() == player->get_team_id())
+                    continue;
+                if (!m->is_lane_minion())
+                    continue;
+
+                const float dist = ppos.distance(m->get_position());
+                if (dist > range) continue;
+
+                const float hit_time = delay + dist / speed;
+
+                float hp = m->get_hp();
+                if (sdk::health_prediction)
+                {
+                    const float pred_hp = sdk::health_prediction->get_predicted_health(m, now() + hit_time);
+                    if (pred_hp > 0.f && pred_hp <= m->get_max_hp())
+                        hp = pred_hp;
+                }
+
+                const float dmg = get_qq_damage(m);
+                if (hp <= 0.f || hp > dmg) continue;
+
+                // Skip if another enemy minion sits on the path and would absorb the bolt
+                if (line_blocked_by_enemy_minion(m->get_position(), spell_data::qq_radius, m))
+                    continue;
+
+                // Pick the closest killable, unobstructed minion
+                if (dist < best_dist)
+                {
+                    best_dist     = dist;
+                    best_target   = m;
+                    best_cast_pos = m->get_position();
+                }
+            }
+
+            if (!best_target) return false;
+
+            if (queue_cast_intent(ABILITY_QQ, best_cast_pos, best_target, range))
             {
                 execute_cast_engine();
-                return;
+                return true;
             }
+            return false;
+        }
+
+        void lane_lasthit()
+        {
+            if (consume_cast_engine_busy())
+                return;
+
+            if (mana_percent() < static_cast<float>(menu::lane_mana_pct))
+                return;
+
+            lane_qq_lasthit();
+        }
+
+        void lane()
+        {
+            if (!sdk::orbwalker || !sdk::orbwalker->is_spell_farm_enabled())
+                return;
+
+            if (consume_cast_engine_busy())
+                return;
+
+            if (mana_percent() < static_cast<float>(menu::lane_mana_pct))
+                return;
+
+            if (lane_qq_lasthit())
+                return;
 
             if (!menu::lane_use_qe)
                 return;
@@ -895,6 +2231,63 @@ namespace hwei
                     g_sdk->renderer->add_circle_3d(pos, radius, 2.f, color);
             };
 
+            auto draw_qq_range = [&]() { draw_circle(s_pred_qq.range, draw_ability_color(ABILITY_QQ, menu::color_qq)); };
+            auto draw_qw_range = [&]() { draw_circle(s_pred_qw.range, draw_ability_color(ABILITY_QW, menu::color_qw)); };
+            auto draw_qe_range = [&]() { draw_circle(s_pred_qe.range, draw_ability_color(ABILITY_QE, menu::color_qe)); };
+            auto draw_eq_range = [&]() { draw_circle(s_pred_eq.range, draw_ability_color(ABILITY_EQ, menu::color_eq)); };
+            auto draw_ew_range = [&]() { draw_circle(s_pred_ew.range, draw_ability_color(ABILITY_EW, menu::color_ew)); };
+            auto draw_ee_range = [&]() { draw_circle(s_pred_ee.range, draw_ability_color(ABILITY_EE, menu::color_ee)); };
+            auto draw_r_range = [&]() { draw_circle(s_pred_r.range, draw_color(SLOT_R, menu::color_r)); };
+
+            auto draw_qq = [&]() { if (menu::draw_qq) draw_qq_range(); };
+            auto draw_qw = [&]() { if (menu::draw_qw) draw_qw_range(); };
+            auto draw_qe = [&]() { if (menu::draw_qe) draw_qe_range(); };
+            auto draw_eq = [&]() { if (menu::draw_eq) draw_eq_range(); };
+            auto draw_ew = [&]() { if (menu::draw_ew) draw_ew_range(); };
+            auto draw_ee = [&]() { if (menu::draw_ee) draw_ee_range(); };
+            auto draw_r = [&]() { if (menu::draw_r) draw_r_range(); };
+
+            if (menu::draw_only_mode_ranges)
+            {
+                switch (static_cast<combo_mode>(effective_combo_mode()))
+                {
+                case combo_mode::basic:
+                    draw_ee_range();
+                    draw_qq_range();
+                    break;
+                case combo_mode::qe_qw:
+                    draw_qe_range();
+                    draw_qw_range();
+                    break;
+                case combo_mode::ew_qw:
+                    draw_ew_range();
+                    draw_qw_range();
+                    break;
+                case combo_mode::ew_r_qw:
+                    draw_ew_range();
+                    draw_r_range();
+                    draw_qw_range();
+                    break;
+                case combo_mode::all_in_burst:
+                    draw_ee_range();
+                    draw_r_range();
+                    draw_qq_range();
+                    draw_qw_range();
+                    break;
+                case combo_mode::teamfight_all_in:
+                    draw_ee_range();
+                    draw_r_range();
+                    draw_qe_range();
+                    draw_qw_range();
+                    break;
+                default:
+                    draw_ee_range();
+                    draw_qq_range();
+                    break;
+                }
+                return;
+            }
+
             subject active_subject = get_game_subject();
 
             bool show_q_group = active_subject == subject::disaster;
@@ -903,37 +2296,27 @@ namespace hwei
             {
                 if (show_q_group)
                 {
-                    if (menu::draw_qq)
-                        draw_circle(s_pred_qq.range, draw_ability_color(ABILITY_QQ, menu::color_qq));
-                    else if (menu::draw_qw)
-                        draw_circle(s_pred_qw.range, draw_ability_color(ABILITY_QW, menu::color_qw));
-                    else if (menu::draw_qe)
-                        draw_circle(s_pred_qe.range, draw_ability_color(ABILITY_QE, menu::color_qe));
+                    if (menu::draw_qq) draw_qq();
+                    else if (menu::draw_qw) draw_qw();
+                    else if (menu::draw_qe) draw_qe();
                 }
                 if (show_e_group)
                 {
-                    if (menu::draw_eq)
-                        draw_circle(s_pred_eq.range, draw_ability_color(ABILITY_EQ, menu::color_eq));
-                    else if (menu::draw_ee)
-                        draw_circle(s_pred_ee.range, draw_ability_color(ABILITY_EE, menu::color_ee));
+                    if (menu::draw_eq) draw_eq();
+                    else if (menu::draw_ew) draw_ew();
+                    else if (menu::draw_ee) draw_ee();
                 }
-                if (menu::draw_r)
-                    draw_circle(s_pred_r.range, draw_color(SLOT_R, menu::color_r));
+                draw_r();
                 return;
             }
 
-            if (menu::draw_qq)
-                draw_circle(s_pred_qq.range, draw_ability_color(ABILITY_QQ, menu::color_qq));
-            if (menu::draw_qw)
-                draw_circle(s_pred_qw.range, draw_ability_color(ABILITY_QW, menu::color_qw));
-            if (menu::draw_qe)
-                draw_circle(s_pred_qe.range, draw_ability_color(ABILITY_QE, menu::color_qe));
-            if (menu::draw_eq)
-                draw_circle(s_pred_eq.range, draw_ability_color(ABILITY_EQ, menu::color_eq));
-            if (menu::draw_ee)
-                draw_circle(s_pred_ee.range, draw_ability_color(ABILITY_EE, menu::color_ee));
-            if (menu::draw_r)
-                draw_circle(s_pred_r.range, draw_color(SLOT_R, menu::color_r));
+            draw_qq();
+            draw_qw();
+            draw_qe();
+            draw_eq();
+            draw_ew();
+            draw_ee();
+            draw_r();
         }
     }
 
@@ -943,6 +2326,14 @@ namespace hwei
             return;
 
         setup_prediction_templates();
+        HWEI_DEBUG_LOGS = menu::debug_logs;
+        s_cached_subject = subject::none;
+        s_subject_cache_authoritative = false;
+
+        // Seed subject cache immediately — handles reconnect mid-game correctly
+        const subject live_at_load = read_live_game_subject();
+        if (live_at_load != subject::none)
+            cache_selected_subject(live_at_load, "load-seed");
 
         s_menu = g_sdk->menu_manager->add_category("hwei", "MeowAIO - Hwei");
         if (!s_menu)
@@ -951,27 +2342,82 @@ namespace hwei
             return;
         }
 
-        if (auto* combo_menu = s_menu->add_sub_category("combo", "Combo"))
+        if (auto* combo_menu = s_menu->add_sub_category("combo", "Combo Modes"))
         {
             combo_menu->add_combo("mode", "Combo Mode",
-                { "Basic (WE > EE > QQ)" }, menu::combo_mode_sel,
+                {
+                    "Basic (WE > EE > QQ)",
+                    "Zone (WE > QE > QW)",
+                    "Root Execute (EW > QW)",
+                    "Root (EW > R > QW)",
+                    "Burst (WE > EE > R > QQ > QW)",
+                    "Teamfight (WE > EE > R > QE > QW)"
+                }, menu::combo_mode_sel,
                 [](int v) { menu::combo_mode_sel = v; });
+            combo_menu->add_separator();
+            combo_menu->add_checkbox("cycle_enabled", "Enable Cycle Key", menu::combo_mode_cycle_enabled,
+                [](bool v) { menu::combo_mode_cycle_enabled = v; });
             combo_menu->add_hotkey("mode_cycle", "Cycle Combo Mode", 'J', false, false,
                 [](std::string* key, bool pressed) {
-                    if (key && menu::combo_mode_cycle_key.empty())
-                        menu::combo_mode_cycle_key = *key;
-                    if (pressed && !s_combo_mode_was_pressed)
+                    (void)key;
+                    if (pressed && !s_combo_mode_was_pressed && menu::combo_mode_cycle_enabled)
                     {
-                        constexpr int MODE_COUNT = 1;
+                        constexpr int MODE_COUNT = 6;
                         menu::combo_mode_sel = (menu::combo_mode_sel + 1) % MODE_COUNT;
                         if (g_sdk)
                         {
-                            static constexpr const char* names[] = { "Basic" };
-                            g_sdk->log_console("[+] Hwei Combo Mode: %s", names[menu::combo_mode_sel]);
+                            static constexpr const char* names[] = {
+                                "Basic",
+                                "Zone Execute",
+                                "Root Execute",
+                                "Root",
+                                "Burst",
+                                "Teamfight"
+                            };
+                            const int m = std::clamp(menu::combo_mode_sel, 0, MODE_COUNT - 1);
+                            g_sdk->log_console("[+] Hwei Combo Mode: %s", names[m]);
                         }
                     }
                     s_combo_mode_was_pressed = pressed;
                 });
+            combo_menu->add_separator();
+            combo_menu->add_hotkey("bind_basic", "Basic (WE > EE > QQ)", 0, false, false,
+                [](std::string* /*key*/, bool pressed) {
+                    static bool s_was = false;
+                    if (pressed && !s_was) toggle_mode_bind(menu::bind_mode_basic_active);
+                    s_was = pressed;
+                });
+            combo_menu->add_hotkey("bind_qeqw", "Zone (WE > QE > QW)", 0, false, false,
+                [](std::string* /*key*/, bool pressed) {
+                    static bool s_was = false;
+                    if (pressed && !s_was) toggle_mode_bind(menu::bind_mode_qeqw_active);
+                    s_was = pressed;
+                });
+            combo_menu->add_hotkey("bind_ewqw", "Root Execute (EW > QW)", 0, false, false,
+                [](std::string* /*key*/, bool pressed) {
+                    static bool s_was = false;
+                    if (pressed && !s_was) toggle_mode_bind(menu::bind_mode_ewqw_active);
+                    s_was = pressed;
+                });
+            combo_menu->add_hotkey("bind_ewrqw", "Root (EW > R > QW)", 0, false, false,
+                [](std::string* /*key*/, bool pressed) {
+                    static bool s_was = false;
+                    if (pressed && !s_was) toggle_mode_bind(menu::bind_mode_ewrqw_active);
+                    s_was = pressed;
+                });
+            combo_menu->add_hotkey("bind_burst", "Burst (WE > EE > R > QQ > QW)", 0, false, false,
+                [](std::string* /*key*/, bool pressed) {
+                    static bool s_was = false;
+                    if (pressed && !s_was) toggle_mode_bind(menu::bind_mode_burst_active);
+                    s_was = pressed;
+                });
+            combo_menu->add_hotkey("bind_teamfight", "Teamfight (WE > EE > R > QE > QW)", 0, false, false,
+                [](std::string* /*key*/, bool pressed) {
+                    static bool s_was = false;
+                    if (pressed && !s_was) toggle_mode_bind(menu::bind_mode_teamfight_active);
+                    s_was = pressed;
+                });
+            combo_menu->add_separator();
             combo_menu->add_checkbox("draw_indicator", "Draw Mode Indicator", menu::draw_combo_mode_indicator,
                 [](bool v) { menu::draw_combo_mode_indicator = v; });
         }
@@ -982,7 +2428,12 @@ namespace hwei
                 [](std::string* key, bool pressed)
                 {
                     menu::bind_qw_active = pressed;
-                    if (key) menu::bind_qw_key = *key;
+                    if (sdk::infotab && s_infotab_bind_qw == 0 && key)
+                        s_infotab_bind_qw = sdk::infotab->add_hotkey_text(key, { "QW" },
+                            []() -> infotab_sdk::text_entry {
+                                return { menu::bind_qw_active ? "ON" : "OFF",
+                                         menu::bind_qw_active ? 0xFF00FF00u : 0xFFFF0000u };
+                            });
                 });
             q_menu->add_slider_int("hc_qq", "  QQ Hitchance", 0, 100, 5, menu::combo_qq_hitchance,
                 [](int v) { menu::combo_qq_hitchance = v; });
@@ -990,22 +2441,32 @@ namespace hwei
                 [](int v) { menu::combo_qw_hitchance = v; });
             q_menu->add_slider_int("hc_qe", "  QE Hitchance", 0, 100, 5, menu::combo_qe_hitchance,
                 [](int v) { menu::combo_qe_hitchance = v; });
-            q_menu->add_checkbox("draw_qq", "Draw QQ", menu::draw_qq,
-                [](bool v) { menu::draw_qq = v; });
-            q_menu->add_checkbox("draw_qw", "Draw QW", menu::draw_qw,
-                [](bool v) { menu::draw_qw = v; });
-            q_menu->add_checkbox("draw_qe", "Draw QE", menu::draw_qe,
-                [](bool v) { menu::draw_qe = v; });
+            q_menu->add_checkbox("harass_qq", "Use in Harass QQ", menu::harass_use_qq,
+                [](bool v) { menu::harass_use_qq = v; });
+            q_menu->add_checkbox("harass_qw", "Use in Harass QW", menu::harass_use_qw,
+                [](bool v) { menu::harass_use_qw = v; });
+            q_menu->add_checkbox("harass_qe", "Use in Harass QE", menu::harass_use_qe,
+                [](bool v) { menu::harass_use_qe = v; });
+            q_menu->add_separator();
+            q_menu->add_checkbox("ks_qw", "Killsteal QW", menu::killsteal_qw,
+                [](bool v) { menu::killsteal_qw = v; });
+            q_menu->add_separator();
+            q_menu->add_checkbox("lane_qq", "Use QQ to Lasthit", menu::lane_use_qq,
+                [](bool v) { menu::lane_use_qq = v; });
             q_menu->add_checkbox("lane_qe", "Lane Clear QE", menu::lane_use_qe,
                 [](bool v) { menu::lane_use_qe = v; });
             q_menu->add_slider_int("lane_qe_min", "Lane Clear Min Minions", 1, 10, 1, menu::lane_qe_min_minions,
                 [](int v) { menu::lane_qe_min_minions = v; });
-            q_menu->add_checkbox("harass_qq", "Harass QQ", menu::harass_use_qq,
-                [](bool v) { menu::harass_use_qq = v; });
-            q_menu->add_checkbox("harass_qw", "Harass QW", menu::harass_use_qw,
-                [](bool v) { menu::harass_use_qw = v; });
-            q_menu->add_checkbox("harass_qe", "Harass QE", menu::harass_use_qe,
-                [](bool v) { menu::harass_use_qe = v; });
+            q_menu->add_separator();
+            q_menu->add_checkbox("draw_qq", "Draw QQ", menu::draw_qq,
+                [](bool v) { menu::draw_qq = v; });
+            q_menu->add_checkbox("draw_qw", "Draw QW", menu::draw_qw,
+                [](bool v) { menu::draw_qw = v; });
+            q_menu->add_checkbox("draw_qw_mm", "Draw QW On Minimap", menu::draw_qw_minimap,
+                [](bool v) { menu::draw_qw_minimap = v; });
+            q_menu->add_checkbox("draw_qe", "Draw QE", menu::draw_qe,
+                [](bool v) { menu::draw_qe = v; });
+           
         }
 
         if (auto* w_menu = s_menu->add_sub_category("w", "W - Subject: Serenity"))
@@ -1014,12 +2475,24 @@ namespace hwei
                 [](std::string* key, bool pressed)
                 {
                     menu::bind_we_active = pressed;
-                    if (key) menu::bind_we_key = *key;
+                    if (sdk::infotab && s_infotab_bind_we == 0 && key)
+                        s_infotab_bind_we = sdk::infotab->add_hotkey_text(key, { "WE" },
+                            []() -> infotab_sdk::text_entry {
+                                return { menu::bind_we_active ? "ON" : "OFF",
+                                         menu::bind_we_active ? 0xFF00FF00u : 0xFFFF0000u };
+                            });
                 });
             w_menu->add_checkbox("flee_wq", "Use in Flee WQ", menu::flee_use_wq,
                 [](bool v) { menu::flee_use_wq = v; });
-            w_menu->add_checkbox("harass_we", "Harass WE", menu::harass_use_we,
+            w_menu->add_checkbox("harass_we", "Use in Harass WE", menu::harass_use_we,
                 [](bool v) { menu::harass_use_we = v; });
+            w_menu->add_separator();
+            w_menu->add_checkbox("use_ww", "Use WW", menu::use_ww,
+                [](bool v) { menu::use_ww = v; });
+            w_menu->add_slider_int("ww_self_hp", "  WW Self HP %", 0, 100, 5, menu::ww_self_hp_pct,
+                [](int v) { menu::ww_self_hp_pct = v; });
+            w_menu->add_slider_int("ww_ally_hp", "  WW Ally HP %", 0, 100, 5, menu::ww_ally_hp_pct,
+                [](int v) { menu::ww_ally_hp_pct = v; });
         }
 
         if (auto* e_menu = s_menu->add_sub_category("e", "E - Subject: Torment"))
@@ -1028,48 +2501,86 @@ namespace hwei
                 [](std::string* key, bool pressed)
                 {
                     menu::bind_ee_active = pressed;
-                    if (key) menu::bind_ee_key = *key;
+                    if (sdk::infotab && s_infotab_bind_ee == 0 && key)
+                        s_infotab_bind_ee = sdk::infotab->add_hotkey_text(key, { "EE" },
+                            []() -> infotab_sdk::text_entry {
+                                return { menu::bind_ee_active ? "ON" : "OFF",
+                                         menu::bind_ee_active ? 0xFF00FF00u : 0xFFFF0000u };
+                            });
+                });
+            e_menu->add_hotkey("bind_eq", "Semi-Manual EQ", 'N', false, false,
+                [](std::string* key, bool pressed)
+                {
+                    menu::bind_eq_active = pressed;
+                    if (sdk::infotab && s_infotab_bind_eq == 0 && key)
+                        s_infotab_bind_eq = sdk::infotab->add_hotkey_text(key, { "EQ" },
+                            []() -> infotab_sdk::text_entry {
+                                return { menu::bind_eq_active ? "ON" : "OFF",
+                                         menu::bind_eq_active ? 0xFF00FF00u : 0xFFFF0000u };
+                            });
                 });
             e_menu->add_slider_int("hc_eq", "  EQ Hitchance", 0, 100, 5, menu::combo_eq_hitchance,
                 [](int v) { menu::combo_eq_hitchance = v; });
             e_menu->add_slider_int("hc_ee", "  EE Hitchance", 0, 100, 5, menu::combo_ee_hitchance,
                 [](int v) { menu::combo_ee_hitchance = v; });
+            e_menu->add_separator();
+            e_menu->add_checkbox("harass_eq", "Use in Harass EQ", menu::harass_use_eq,
+                [](bool v) { menu::harass_use_eq = v; });
+            e_menu->add_separator();
             e_menu->add_checkbox("draw_eq", "Draw EQ", menu::draw_eq,
                 [](bool v) { menu::draw_eq = v; });
+            e_menu->add_checkbox("draw_ew", "Draw EW", menu::draw_ew,
+                [](bool v) { menu::draw_ew = v; });
             e_menu->add_checkbox("draw_ee", "Draw EE", menu::draw_ee,
                 [](bool v) { menu::draw_ee = v; });
         }
 
         if (auto* r_menu = s_menu->add_sub_category("r", "R - Spiraling Despair"))
         {
-            r_menu->add_checkbox("combo_r", "Use in Combo R", menu::combo_use_r,
-                [](bool v) { menu::combo_use_r = v; });
             r_menu->add_hotkey("bind_r", "Semi-Manual R", 'T', false, false,
                 [](std::string* key, bool pressed)
                 {
                     menu::bind_r_active = pressed;
-                    if (key) menu::bind_r_key = *key;
+                    if (sdk::infotab && s_infotab_bind_r == 0 && key)
+                        s_infotab_bind_r = sdk::infotab->add_hotkey_text(key, { "R" },
+                            []() -> infotab_sdk::text_entry {
+                                return { menu::bind_r_active ? "ON" : "OFF",
+                                         menu::bind_r_active ? 0xFF00FF00u : 0xFFFF0000u };
+                            });
                 });
+            r_menu->add_checkbox("ks_r", "Killsteal R", menu::killsteal_r,
+                [](bool v) { menu::killsteal_r = v; });
             r_menu->add_slider_int("hc_r", "  R Hitchance", 0, 100, 5, menu::combo_r_hitchance,
                 [](int v) { menu::combo_r_hitchance = v; });
             r_menu->add_checkbox("draw_r", "Draw R", menu::draw_r,
                 [](bool v) { menu::draw_r = v; });
         }
 
-        if (auto* mana_menu = s_menu->add_sub_category("mana", "Mana"))
+        if (auto* mana_menu = s_menu->add_sub_category("mana", "Mana Thresholds"))
         {
             mana_menu->add_slider_int("harass_mana", "Harass Min Mana %", 0, 100, 5, menu::harass_mana_pct,
                 [](int v) { menu::harass_mana_pct = v; });
+            mana_menu->add_slider_int("lane_mana", "Lane Clear Min Mana %", 0, 100, 5, menu::lane_mana_pct,
+                [](int v) { menu::lane_mana_pct = v; });
         }
 
         if (auto* draw_menu = s_menu->add_sub_category("draw", "Drawings"))
         {
             draw_menu->add_checkbox("only_ready", "Only Ready Spells", menu::draw_only_ready,
                 [](bool v) { menu::draw_only_ready = v; });
+            draw_menu->add_separator();
             draw_menu->add_checkbox("draw_only_active", "Only Active Spells (off will draw all ranges at once)", menu::draw_only_active_spell,
                 [](bool v) { menu::draw_only_active_spell = v; });
+            draw_menu->add_checkbox("draw_only_mode", "Only Draw Active Combo Mode Ranges", menu::draw_only_mode_ranges,
+                [](bool v) { menu::draw_only_mode_ranges = v; });
             draw_menu->add_checkbox("draw_r_damage", "Draw R Damage Indicator", menu::draw_r_damage_indicator,
                 [](bool v) { menu::draw_r_damage_indicator = v; });
+            draw_menu->add_checkbox("debug_logs", "Debug Logs", menu::debug_logs,
+                [](bool v) {
+                    menu::debug_logs = v;
+                    HWEI_DEBUG_LOGS = v;
+                });
+            draw_menu->add_separator();
             draw_menu->add_colorpicker("color_qq", "  QQ Color", menu::color_qq,
                 [](uint32_t c) { menu::color_qq = c; });
             draw_menu->add_colorpicker("color_qw", "  QW Color", menu::color_qw,
@@ -1078,6 +2589,8 @@ namespace hwei
                 [](uint32_t c) { menu::color_qe = c; });
             draw_menu->add_colorpicker("color_eq", "  EQ Color", menu::color_eq,
                 [](uint32_t c) { menu::color_eq = c; });
+            draw_menu->add_colorpicker("color_ew", "  EW Color", menu::color_ew,
+                [](uint32_t c) { menu::color_ew = c; });
             draw_menu->add_colorpicker("color_ee", "  EE Color", menu::color_ee,
                 [](uint32_t c) { menu::color_ee = c; });
             draw_menu->add_colorpicker("color_r", "  R Color", menu::color_r,
@@ -1091,11 +2604,26 @@ namespace hwei
             s_infotab_combo_mode = sdk::infotab->add_text(
                 infotab_sdk::text_entry{ "Combo", 0xFFFFFFFFu },
                 []() -> infotab_sdk::text_entry {
-                    static constexpr const char* names[] = { "Basic" };
-                    static constexpr uint32_t colors[] = { 0xFF00FF80u };
-                    const int m = (menu::combo_mode_sel >= 0) ? menu::combo_mode_sel : 0;
+                    static constexpr const char* names[] = {
+                        "Basic",
+                        "Zone Execute",
+                        "Root Execute",
+                        "Root",
+                        "Burst",
+                        "Teamfight"
+                    };
+                    static constexpr uint32_t colors[] = {
+                        0xFF00FF80u,
+                        0xFF40D0FFu,
+                        0xFFE87C9Eu,
+                        0xFFFF5050u,
+                        0xFFFFA040u,
+                        0xFFA080FFu
+                    };
+                    const int m = std::clamp(effective_combo_mode(), 0, 5);
                     return { names[m], colors[m] };
                 });
+
         }
 
         if (g_sdk->event_manager)
@@ -1108,6 +2636,8 @@ namespace hwei
                 reinterpret_cast<void*>(on_present));
             g_sdk->event_manager->register_callback(event_manager::event::process_cast,
                 reinterpret_cast<void*>(on_process_cast));
+            g_sdk->event_manager->register_callback(event_manager::event::buff_gain,
+                reinterpret_cast<void*>(on_buff_gain));
         }
 
         g_sdk->log_console("[MeowAIO] Hwei module loaded");
@@ -1125,15 +2655,41 @@ namespace hwei
                 reinterpret_cast<void*>(on_present));
             g_sdk->event_manager->unregister_callback(event_manager::event::process_cast,
                 reinterpret_cast<void*>(on_process_cast));
+            g_sdk->event_manager->unregister_callback(event_manager::event::buff_gain,
+                reinterpret_cast<void*>(on_buff_gain));
         }
 
-        if (sdk::infotab && s_infotab_combo_mode)
-            sdk::infotab->remove_text(s_infotab_combo_mode);
+        if (sdk::infotab)
+        {
+            if (s_infotab_combo_mode) sdk::infotab->remove_text(s_infotab_combo_mode);
+            if (s_infotab_bind_qw)   sdk::infotab->remove_text(s_infotab_bind_qw);
+            if (s_infotab_bind_we)   sdk::infotab->remove_text(s_infotab_bind_we);
+            if (s_infotab_bind_ee)   sdk::infotab->remove_text(s_infotab_bind_ee);
+            if (s_infotab_bind_eq)   sdk::infotab->remove_text(s_infotab_bind_eq);
+            if (s_infotab_bind_r)    sdk::infotab->remove_text(s_infotab_bind_r);
+        }
         s_infotab_combo_mode = 0;
+        s_infotab_bind_qw    = 0;
+        s_infotab_bind_we    = 0;
+        s_infotab_bind_ee    = 0;
+        s_infotab_bind_eq    = 0;
+        s_infotab_bind_r     = 0;
 
         s_menu = nullptr;
         s_last_cast_time = 0.f;
         s_ee_qq_followup_until = 0.f;
+        s_ew_qw_followup_ready_at = 0.f;
+        s_ew_qw_followup_until = 0.f;
+        s_subject_lockout_until[0] = 0.f;
+        s_subject_lockout_until[1] = 0.f;
+        s_subject_lockout_until[2] = 0.f;
+        for (auto& row : s_subspell_ready_at)
+            for (auto& v : row)
+                v = 0.f;
+        s_cached_subject = subject::none;
+        s_subject_cache_authoritative = false;
+        s_r_wait_started_at = 0.f;
+        clear_all_mode_binds();
         reset_cast_engine();
 
         g_sdk->log_console("[-] Hwei module unloaded");
@@ -1149,6 +2705,15 @@ namespace hwei
             return;
 
         if (handle_hotkeys())
+            return;
+
+        if (killsteal_qw())
+            return;
+
+        if (killsteal_r())
+            return;
+
+        if (handle_ww())
             return;
 
         if (!sdk::orbwalker)
@@ -1170,6 +2735,10 @@ namespace hwei
         {
             lane();
         }
+        else if (sdk::orbwalker->lasthit())
+        {
+            lane_lasthit();
+        }
     }
 
     void __fastcall on_draw()
@@ -1182,11 +2751,27 @@ namespace hwei
             if (player && !player->is_dead())
             {
                 const auto screen = g_sdk->renderer->world_to_screen(player->get_position());
-                static constexpr const char* mode_names[] = { "Basic" };
-                const int m = (menu::combo_mode_sel >= 0) ? menu::combo_mode_sel : 0;
-                const std::string text = std::string("Combo: ") + mode_names[m];
+                static constexpr const char* mode_names[] = {
+                    "Basic",
+                    "Zone",
+                    "Root Execute",
+                    "Root (R)",
+                    "Burst (R)",
+                    "Teamfight (R)"
+                };
+                static constexpr uint32_t mode_colors[] = {
+                    0xFF00FF80u,
+                    0xFF40D0FFu,
+                    0xFFE87C9Eu,
+                    0xFFFF5050u,
+                    0xFFFFA040u,
+                    0xFFA080FFu
+                };
+                const int m = std::clamp(effective_combo_mode(), 0, 5);
+                const bool toggled = any_mode_bind_active();
+                const std::string text = std::string(toggled ? "* " : "") + mode_names[m];
                 g_sdk->renderer->add_text(text.c_str(), 16.f,
-                    { screen.x, screen.y + 42.f }, 1, 0xFF00FF80u);
+                    { screen.x, screen.y + 42.f }, 1, mode_colors[m]);
             }
         }
     }
@@ -1196,11 +2781,17 @@ namespace hwei
         if (!g_sdk || !g_sdk->object_manager || !g_sdk->renderer)
             return;
 
-        if (!menu::draw_r_damage_indicator)
-            return;
-
         auto* player = get_player();
         if (!player || player->is_dead())
+            return;
+
+        if (menu::draw_qw_minimap && is_spell_learned(SLOT_Q))
+        {
+            g_sdk->renderer->add_circle_minimap(player->get_position(),
+                s_pred_qw.range, 1.f, menu::color_qw);
+        }
+
+        if (!menu::draw_r_damage_indicator)
             return;
 
         auto* r_spell = player->get_spell(SLOT_R);
@@ -1263,14 +2854,28 @@ namespace hwei
         if (slot == SLOT_Q || slot == SLOT_W || slot == SLOT_E)
         {
             const char* cast_name = get_cast_name(cast);
+            if (cast_name)
+                s_last_observed_cast_name = cast_name;
+
             const subject selected_subject = get_subject_from_selector_name(cast_name);
             if (selected_subject != subject::none)
             {
-                if (s_intent.active && s_intent.info.mood == selected_subject)
+                cache_selected_subject(selected_subject, "selector-process-cast");
+
+                if (s_intent.active
+                    && s_cast_state != cast_engine_state::casting_followup
+                    && s_intent.info.mood == selected_subject)
                 {
                     s_intent.selector_sent = true;
                     s_intent.selector_sent_at = now();
                     s_cast_state = cast_engine_state::await_followup_window;
+                }
+                else if (s_intent.active && HWEI_DEBUG_LOGS && g_sdk)
+                {
+                    g_sdk->log_console("[MeowAIO] selector observed during %s expected=%s got=%s",
+                        s_cast_state == cast_engine_state::casting_followup ? "followup-wait" : "request",
+                        s_intent.expected_followup_name ? s_intent.expected_followup_name : "unknown",
+                        cast_name ? cast_name : "unknown");
                 }
                 return;
             }
@@ -1278,13 +2883,63 @@ namespace hwei
             if (!is_hwei_followup_spell_name(cast_name))
                 return;
 
+            cache_selected_subject(subject::none, cast_name ? cast_name : "followup-process-cast");
+            register_subspell_cooldown(cast_name);
+
             if (cast_name && std::strcmp(cast_name, "HweiEE") == 0)
                 s_ee_qq_followup_until = now() + EE_QQ_FOLLOWUP_WINDOW;
+            else if (cast_name && std::strcmp(cast_name, "HweiEW") == 0)
+            {
+                open_ew_qw_followup_window(EW_ROOT_FOLLOWUP_DELAY, "ew-confirm-fallback");
+            }
             else if (cast_name && std::strcmp(cast_name, "HweiQQ") == 0)
                 s_ee_qq_followup_until = 0.f;
+            else if (cast_name && std::strcmp(cast_name, "HweiQW") == 0)
+            {
+                s_ew_qw_followup_ready_at = 0.f;
+                s_ew_qw_followup_until = 0.f;
+            }
 
-            s_last_cast_time = now();
-            reset_cast_engine();
+            if (!s_intent.active || is_expected_followup_name(cast_name))
+            {
+                if (HWEI_DEBUG_LOGS && g_sdk)
+                {
+                    g_sdk->log_console("[MeowAIO] confirm expected=%s got=%s",
+                        s_intent.active && s_intent.expected_followup_name ? s_intent.expected_followup_name : "none",
+                        cast_name ? cast_name : "unknown");
+                }
+                s_last_cast_time = now();
+                reset_cast_engine(false, "confirmed-followup");
+            }
+            else if (HWEI_DEBUG_LOGS && g_sdk)
+            {
+                g_sdk->log_console("[MeowAIO] nonmatching followup expected=%s got=%s",
+                    s_intent.expected_followup_name ? s_intent.expected_followup_name : "unknown",
+                    cast_name ? cast_name : "unknown");
+            }
         }
+    }
+
+    void __fastcall on_buff_gain(game_object* obj, buff_instance* buff)
+    {
+        if (!obj || !buff)
+            return;
+
+        auto* player = get_player();
+        if (!player || obj->get_team_id() == player->get_team_id())
+            return;
+
+        auto* caster = buff->get_caster();
+        if (!caster || caster->get_network_id() != player->get_network_id())
+            return;
+
+        const auto name = buff->get_name();
+        if (name != "HweiEWRoot")
+            return;
+
+        open_ew_qw_followup_window(EW_ROOT_FOLLOWUP_DELAY, "root-buff");
+
+        if (HWEI_DEBUG_LOGS && g_sdk)
+            g_sdk->log_console("[MeowAIO] EW root confirmed, QW followup window opened");
     }
 }

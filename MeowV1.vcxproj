@@ -151,6 +151,7 @@
     <ClInclude Include="..\shader_sdk.hpp" />
     <ClInclude Include="..\sm_sdk.hpp" />
     <ClInclude Include="..\ts_sdk.hpp" />
+    <ClInclude Include="aphelios.h" />
     <ClInclude Include="mel.h" />
     <ClInclude Include="mel_spell_db.hpp" />
     <ClInclude Include="annie.h" />
@@ -169,6 +170,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\main.cpp" />
+    <ClCompile Include="aphelios.cpp" />
     <ClCompile Include="mel.cpp" />
     <ClCompile Include="annie.cpp" />
     <ClCompile Include="taliyah.cpp" />

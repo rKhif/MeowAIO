@@ -64,6 +64,8 @@ namespace
         inline bool semi_w = false;
         inline std::string semi_w_key;
         inline uint32_t infotab_semi_w = 0;
+        inline std::string w_mode_key;
+        inline uint32_t infotab_w_mode = 0;
 
         inline int q_hitchance = pred_sdk::hitchance::high;
         inline int w_hitchance = pred_sdk::hitchance::medium;
@@ -73,6 +75,7 @@ namespace
         inline bool draw_w = true;
         inline bool draw_e = true;
         inline bool draw_r = false;
+        inline bool draw_w_mode = true;
         inline bool draw_worked_ground = false;
         inline bool draw_only_ready = true;
         inline uint32_t color_q = 0xFF80FFF0u;
@@ -88,6 +91,7 @@ namespace
     math::vector3 s_q_cast_pos {};
     float s_q_magnet_until = 0.f;
     float s_last_ride = 0.f;
+    float s_last_w_mode_switch = 0.f;
     math::vector3 s_last_e_pos {};
     float s_e_active_until = 0.f;
 
@@ -240,6 +244,45 @@ namespace
     {
         s_last_e_pos = pos;
         s_e_active_until = game_time() + 4.15f;
+    }
+
+    const char* w_mode_name()
+    {
+        switch (menu::w_direction)
+        {
+        case 1:
+            return "Toward";
+        case 2:
+            return "Cursor";
+        default:
+            return "Away";
+        }
+    }
+
+    uint32_t w_mode_color()
+    {
+        switch (menu::w_direction)
+        {
+        case 1:
+            return 0xFFFFC040u;
+        case 2:
+            return 0xFF80B0FFu;
+        default:
+            return 0xFF80FFF0u;
+        }
+    }
+
+    void cycle_w_mode()
+    {
+        const float now = game_time();
+        if (now - s_last_w_mode_switch < 0.2f)
+            return;
+
+        menu::w_direction = (menu::w_direction + 1) % 3;
+        s_last_w_mode_switch = now;
+
+        if (g_sdk)
+            g_sdk->log_console("[MeowAIO] Taliyah W mode: %s", w_mode_name());
     }
 
     pred_sdk::spell_data q_data(bool boulder)
@@ -622,6 +665,12 @@ void __fastcall on_draw()
         for (const auto& ground : s_worked_ground)
             draw_circle(ground.position, 275.f, 0x5530C8FFu);
     }
+    if (menu::draw_w_mode && g_sdk && g_sdk->renderer)
+    {
+        const auto screen = g_sdk->renderer->world_to_screen(pos);
+        const std::string text = "W: " + std::string(w_mode_name());
+        g_sdk->renderer->add_text(text, 14.f, { screen.x, screen.y + 52.f }, 1, w_mode_color());
+    }
 }
 
 void __fastcall on_process_cast(game_object* obj, spell_cast* cast)
@@ -701,6 +750,13 @@ void load()
         });
     w->add_combo("direction", "Shove Direction", { "Away", "Toward", "Cursor" }, menu::w_direction,
         [](int v) { menu::w_direction = v; });
+    w->add_hotkey("switch_mode", "Switch W Mode", 'U', false, false,
+        [](std::string* hk, bool pressed) {
+            if (hk)
+                menu::w_mode_key = *hk;
+            if (pressed)
+                cycle_w_mode();
+        });
     w->add_checkbox("into_e", "Prioritize W Into E", menu::combo_w_into_e,
         [](bool v) { menu::combo_w_into_e = v; });
     w->add_checkbox("clear", "Use in Clear", menu::clear_w, [](bool v) { menu::clear_w = v; });
@@ -732,6 +788,8 @@ void load()
     auto* draw = s_menu->add_sub_category("drawings", "Drawings");
     draw->add_checkbox("only_ready", "Only Ready Spells", menu::draw_only_ready,
         [](bool v) { menu::draw_only_ready = v; });
+    draw->add_checkbox("w_mode", "Draw W Mode", menu::draw_w_mode,
+        [](bool v) { menu::draw_w_mode = v; });
     draw->add_checkbox("worked_ground", "Draw Worked Ground", menu::draw_worked_ground,
         [](bool v) { menu::draw_worked_ground = v; });
     draw->add_colorpicker("col_q", "Q Color", menu::color_q, [](uint32_t c) { menu::color_q = c; });
@@ -752,6 +810,12 @@ void load()
 
     if (sdk::infotab)
     {
+        menu::infotab_w_mode = sdk::infotab->add_hotkey_text(
+            &menu::w_mode_key, { "W Mode", 0xFFFFFFFFu },
+            []() -> infotab_sdk::text_entry {
+                return { w_mode_name(), w_mode_color() };
+            });
+
         menu::infotab_semi_w = sdk::infotab->add_hotkey_text(
             &menu::semi_w_key, { "Semi W", 0xFFFFFFFFu },
             []() -> infotab_sdk::text_entry {
@@ -783,6 +847,11 @@ void unload()
         sdk::infotab->remove_text(menu::infotab_semi_w);
         menu::infotab_semi_w = 0;
     }
+    if (sdk::infotab && menu::infotab_w_mode)
+    {
+        sdk::infotab->remove_text(menu::infotab_w_mode);
+        menu::infotab_w_mode = 0;
+    }
 
     s_menu = nullptr;
     s_last_spell_cast = 0.f;
@@ -791,6 +860,7 @@ void unload()
     s_q_cast_pos = {};
     s_q_magnet_until = 0.f;
     s_last_ride = 0.f;
+    s_last_w_mode_switch = 0.f;
     s_last_e_pos = {};
     s_e_active_until = 0.f;
     s_worked_ground.clear();

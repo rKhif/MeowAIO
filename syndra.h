@@ -210,7 +210,7 @@ namespace syndra
     bool cast_q_on(game_object* target, int hitchance);
     bool cast_q_at(const math::vector3& pos);
     bool cast_w_grab();
-    bool cast_w_throw(game_object* target, int hitchance);
+    bool cast_w_throw(game_object* target, int hitchance, bool aggressive = false);
     bool cast_e_push(game_object* target);
     bool cast_e_cone(game_object* target);
     bool cast_qe_combo(game_object* target);

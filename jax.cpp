@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
 
 namespace jax
 {
@@ -14,10 +15,17 @@ namespace menu
 {
     inline bool combo_use_q = true;
     inline int  combo_q_min_range = 250;
+    inline bool combo_q_only_out_aa = true;
+    inline bool combo_q_killable = true;
+    inline bool combo_q_escaping = true;
     inline bool combo_use_w = true;
     inline bool combo_w_q_gapclose = true;
     inline bool combo_use_e = true;
     inline bool combo_e_midair_recast = true;
+    inline bool combo_e_wait_max_charge = true;
+    inline int  combo_e_recast_min_enemies = 1;
+    inline bool auto_e_critical_aa = true;
+    inline int  auto_e_critical_min_chance = 25;
     inline bool combo_use_r = true;
     inline int  combo_r_hp  = 40;
 
@@ -39,6 +47,7 @@ namespace menu
 
     inline bool draw_q_range = true;
     inline bool draw_e_range = true;
+    inline bool draw_e_timer = true;
     inline bool draw_only_ready = true;
     inline uint32_t color_q = 0x8000FFFF;
     inline uint32_t color_e = 0x80FFFFFF;
@@ -54,10 +63,17 @@ namespace
     menu_category* s_menu = nullptr;
     bool  e_active = false;
     float e_start_time = 0.f;
+    bool  pending_e_recast = false;
+    uint32_t pending_e_recast_target_id = 0;
+    float pending_e_recast_time = 0.f;
     bool  ward_jump_pending = false;
     float ward_jump_time = 0.f;
     constexpr float WARD_JUMP_TIMEOUT = 0.6f;
     constexpr float WARD_PLACE_RANGE = 600.f;
+    constexpr float Q_LEAP_SPEED = 1600.f;
+    constexpr float E_RECAST_EXPIRY_BUFFER = 0.15f;
+    constexpr float E_LEAVE_RANGE_CHECK_TIME = 0.25f;
+    constexpr float E_LEAVE_RANGE_BUFFER = 35.f;
 
     bool is_jax_buff(buff_instance* buff, uint32_t hash, const char* name_fragment)
     {
@@ -70,6 +86,58 @@ namespace
     {
         if (!g_sdk || !g_sdk->object_manager) return nullptr;
         return g_sdk->object_manager->get_local_player();
+    }
+
+    buff_instance* active_e_buff()
+    {
+        auto* p = player();
+        if (!p) return nullptr;
+
+        if constexpr (data::BUFF_E_EVASION != 0u)
+        {
+            auto* buff = p->get_buff_by_hash(data::BUFF_E_EVASION);
+            if (buff && buff->is_active())
+                return buff;
+        }
+
+        static std::string e_buff_name = "JaxCounterStrike";
+        if (auto* buff = p->get_buff_by_name(e_buff_name); buff && buff->is_active())
+            return buff;
+
+        for (auto* buff : p->get_buffs())
+        {
+            if (is_jax_buff(buff, data::BUFF_E_EVASION, data::BUFF_NAME_E) && buff->is_active())
+                return buff;
+        }
+
+        return nullptr;
+    }
+
+    void sync_e_state_from_buff()
+    {
+        if (!g_sdk || !g_sdk->clock_facade) return;
+
+        auto* buff = active_e_buff();
+        if (!buff)
+        {
+            if (e_active)
+            {
+                e_active = false;
+                e_start_time = 0.f;
+                pending_e_recast = false;
+                pending_e_recast_target_id = 0;
+                pending_e_recast_time = 0.f;
+            }
+            return;
+        }
+
+        const bool was_active = e_active;
+        e_active = true;
+        const float start_time = buff->get_start_time();
+        if (start_time > 0.f)
+            e_start_time = start_time;
+        else if (!was_active || e_start_time <= 0.f)
+            e_start_time = g_sdk->clock_facade->get_game_time();
     }
 
     bool is_spell_ready(int slot)
@@ -130,6 +198,155 @@ namespace
         const float d = p->get_position().distance(t->get_position());
         if (d < min_q_range) return false;
         return d <= data::Q_RANGE + t->get_bounding_radius();
+    }
+
+    bool is_in_aa_range(game_object* t)
+    {
+        auto* p = player();
+        if (!p || !t) return false;
+        if (sdk::orbwalker)
+            return sdk::orbwalker->is_in_auto_attack_range(p, t);
+
+        const float range = p->get_attack_range()
+                          + p->get_bounding_radius()
+                          + t->get_bounding_radius();
+        return p->get_position().distance(t->get_position()) <= range;
+    }
+
+    bool is_target_escaping(game_object* t)
+    {
+        auto* p = player();
+        if (!p || !t) return false;
+        if (t->is_dashing()) return true;
+
+        const auto pos = t->get_position();
+        const auto vel = t->get_velocity();
+        const float speed_sq = vel.x * vel.x + vel.z * vel.z;
+        if (speed_sq < 150.f * 150.f) return false;
+
+        const float away_x = pos.x - p->get_position().x;
+        const float away_z = pos.z - p->get_position().z;
+        const float away_len = std::sqrt(away_x * away_x + away_z * away_z);
+        if (away_len <= 1.f) return false;
+
+        const float away_speed = (vel.x * away_x + vel.z * away_z) / away_len;
+        return away_speed > 120.f;
+    }
+
+    float q_damage(game_object* t, bool include_w)
+    {
+        auto* p = player();
+        if (!p || !t || !sdk::damage) return 0.f;
+
+        float damage = sdk::damage->get_spell_damage(p, t, SLOT_Q);
+        if (include_w && is_spell_ready(SLOT_W) && has_mana(SLOT_W))
+            damage += sdk::damage->get_spell_damage(p, t, SLOT_W);
+
+        return damage;
+    }
+
+    bool is_q_killable(game_object* t, bool include_w)
+    {
+        if (!t || !sdk::damage) return false;
+
+        float hp = t->get_hp()
+                 + t->get_all_shield()
+                 + t->get_physical_shield()
+                 + t->get_magical_shield();
+        if (sdk::health_prediction)
+        {
+            const float pred = sdk::health_prediction->get_predicted_health(t, 0.25f);
+            if (pred > 0.f && pred <= t->get_max_hp())
+                hp = pred + t->get_all_shield()
+                          + t->get_physical_shield()
+                          + t->get_magical_shield();
+        }
+
+        return hp > 0.f && q_damage(t, include_w) >= hp;
+    }
+
+    int enemies_in_e_radius()
+    {
+        auto* p = player();
+        if (!p || !g_sdk || !g_sdk->object_manager) return 0;
+
+        int count = 0;
+        const auto ppos = p->get_position();
+        for (auto* h : g_sdk->object_manager->get_heroes())
+        {
+            if (!valid_enemy(h)) continue;
+            if (ppos.distance(h->get_position()) <= data::E_RADIUS + h->get_bounding_radius())
+                ++count;
+        }
+        return count;
+    }
+
+    bool enemy_about_to_leave_e(game_object* t)
+    {
+        auto* p = player();
+        if (!p || !t || !valid_enemy(t)) return false;
+
+        const float hit_radius = data::E_RADIUS + t->get_bounding_radius();
+        const float current_dist = p->get_position().distance(t->get_position());
+        if (current_dist > hit_radius)
+            return false;
+
+        math::vector3 predicted = t->get_position();
+        if (t->is_dashing())
+        {
+            auto path = t->get_path();
+            if (!path.empty())
+                predicted = path.back();
+            else
+            {
+                const auto vel = t->get_velocity();
+                predicted = {
+                    predicted.x + vel.x * E_LEAVE_RANGE_CHECK_TIME,
+                    predicted.y,
+                    predicted.z + vel.z * E_LEAVE_RANGE_CHECK_TIME
+                };
+            }
+        }
+        else
+        {
+            const auto vel = t->get_velocity();
+            predicted = {
+                predicted.x + vel.x * E_LEAVE_RANGE_CHECK_TIME,
+                predicted.y,
+                predicted.z + vel.z * E_LEAVE_RANGE_CHECK_TIME
+            };
+        }
+
+        const float predicted_dist = p->get_position().distance(predicted);
+        return predicted_dist > hit_radius - E_LEAVE_RANGE_BUFFER;
+    }
+
+    bool any_enemy_about_to_leave_e()
+    {
+        if (!g_sdk || !g_sdk->object_manager) return false;
+        for (auto* h : g_sdk->object_manager->get_heroes())
+        {
+            if (enemy_about_to_leave_e(h))
+                return true;
+        }
+        return false;
+    }
+
+    bool should_combo_q(game_object* t)
+    {
+        if (!t) return false;
+
+        const bool outside_aa = !is_in_aa_range(t);
+        const bool killable = menu::combo_q_killable
+                           && is_q_killable(t, menu::combo_use_w && menu::combo_w_q_gapclose);
+        const bool escaping = menu::combo_q_escaping && is_target_escaping(t);
+
+        if (menu::combo_q_only_out_aa && outside_aa)
+            return true;
+        if (killable || escaping)
+            return true;
+
+        return !menu::combo_q_only_out_aa;
     }
 
     bool is_in_flee_direction(const math::vector3& candidate)
@@ -227,6 +444,123 @@ namespace
         return true;
     }
 
+    void schedule_e_recast_for_q(game_object* t)
+    {
+        if (!menu::combo_e_midair_recast || !t || !e_active || !g_sdk || !g_sdk->clock_facade)
+            return;
+        if (!sdk::orbwalker || !sdk::orbwalker->combo())
+            return;
+        if (!is_spell_ready(SLOT_E))
+            return;
+
+        auto* p = player();
+        if (!p) return;
+
+        const float now = g_sdk->clock_facade->get_game_time();
+        const float dist = p->get_position().distance(t->get_position());
+        const float leap_time = std::clamp(dist / Q_LEAP_SPEED, 0.05f, 0.45f);
+        const float min_recast_time = e_start_time + data::E_MIN_RECAST_DELAY;
+
+        pending_e_recast = true;
+        pending_e_recast_target_id = t->get_network_id();
+        pending_e_recast_time = std::max(min_recast_time, now + leap_time - 0.05f);
+    }
+
+    bool try_e_recast(bool force)
+    {
+        if (!menu::combo_use_e || !e_active || !sdk::common || !g_sdk || !g_sdk->clock_facade)
+            return false;
+        if (!is_spell_ready(SLOT_E))
+            return false;
+
+        const float now = g_sdk->clock_facade->get_game_time();
+        if (now < e_start_time + data::E_MIN_RECAST_DELAY)
+            return false;
+
+        const bool expiring = now >= e_start_time + data::E_EVASION_DURATION - E_RECAST_EXPIRY_BUFFER;
+        const bool enough_enemies = enemies_in_e_radius() >= menu::combo_e_recast_min_enemies;
+        const bool leaving_range = any_enemy_about_to_leave_e();
+        if (menu::combo_e_wait_max_charge && !expiring && !leaving_range)
+            return false;
+        if (!force && !expiring && !enough_enemies && !leaving_range)
+            return false;
+
+        if (!sdk::common->cast_spell(SLOT_E))
+            return false;
+
+        pending_e_recast = false;
+        pending_e_recast_target_id = 0;
+        pending_e_recast_time = 0.f;
+        return true;
+    }
+
+    bool handle_pending_e_recast()
+    {
+        if (!pending_e_recast || !g_sdk || !g_sdk->clock_facade || !g_sdk->object_manager)
+            return false;
+
+        const float now = g_sdk->clock_facade->get_game_time();
+        if (!e_active || now > e_start_time + data::E_EVASION_DURATION + 0.1f)
+        {
+            pending_e_recast = false;
+            pending_e_recast_target_id = 0;
+            pending_e_recast_time = 0.f;
+            return false;
+        }
+
+        if (now < pending_e_recast_time)
+            return false;
+
+        bool force = false;
+        auto* p = player();
+        if (auto* t = g_sdk->object_manager->get_object_by_network_id(pending_e_recast_target_id))
+            force = p && valid_enemy(t) && p->get_position().distance(t->get_position()) <= data::E_RADIUS + t->get_bounding_radius();
+
+        return try_e_recast(force);
+    }
+
+    bool is_crit_threat(game_object* source)
+    {
+        if (!source || !source->is_hero()) return false;
+
+        const float raw_crit = source->get_crit();
+        const float crit = raw_crit <= 1.f ? raw_crit * 100.f : raw_crit;
+        if (crit >= static_cast<float>(menu::auto_e_critical_min_chance))
+            return true;
+
+        return source->get_crit_damage_multiplier() > 2.05f;
+    }
+
+    void __fastcall on_process_cast(game_object* obj, spell_cast* cast)
+    {
+        if (!menu::auto_e_critical_aa || !obj || !cast || !cast->is_basic_attack())
+            return;
+        if (!sdk::common || !g_sdk || !g_sdk->clock_facade)
+            return;
+
+        auto* p = player();
+        if (!p || p->is_dead() || e_active)
+            return;
+
+        auto* source = cast->get_source();
+        auto* target = cast->get_target();
+        if (!source) source = obj;
+        if (target != p)
+            return;
+        if (!valid_enemy(source))
+            return;
+        if (!is_crit_threat(source))
+            return;
+        if (!is_spell_ready(SLOT_E) || !has_mana(SLOT_E))
+            return;
+
+        const float now = g_sdk->clock_facade->get_game_time();
+        if (now - cast->get_process_time() > 0.25f)
+            return;
+
+        sdk::common->cast_spell(SLOT_E);
+    }
+
     bool try_q_target(game_object* t, bool use_w_gapclose)
     {
         if (!t || !sdk::common) return false;
@@ -240,16 +574,7 @@ namespace
 
         if (!sdk::common->cast_spell(SLOT_Q, t)) return false;
 
-        // Mid-air Counter Strike recast: if E is already active and recast window is open,
-        // trigger E2 during leap so stun pops right as we arrive.
-        const float now = g_sdk->clock_facade->get_game_time();
-        if (menu::combo_e_midair_recast
-            && e_active
-            && is_spell_ready(SLOT_E)
-            && now >= e_start_time + data::E_MIN_RECAST_DELAY)
-        {
-            sdk::common->cast_spell(SLOT_E);
-        }
+        schedule_e_recast_for_q(t);
         return true;
     }
 
@@ -296,17 +621,28 @@ namespace
             return;
         }
 
-        if (menu::combo_use_e && is_spell_ready(SLOT_E) && has_mana(SLOT_E))
+        if (menu::combo_use_e && !e_active && is_spell_ready(SLOT_E) && has_mana(SLOT_E))
         {
-            if (p->get_position().distance(t->get_position()) <= data::E_RADIUS)
+            const bool in_e_range = p->get_position().distance(t->get_position()) <= data::E_RADIUS + t->get_bounding_radius();
+            const bool preparing_q = menu::combo_use_q
+                                  && is_q_range_ok(t, static_cast<float>(menu::combo_q_min_range))
+                                  && should_combo_q(t);
+            if (in_e_range || preparing_q)
             {
                 sdk::common->cast_spell(SLOT_E);
                 return;
             }
         }
 
-        if (menu::combo_use_q && is_q_range_ok(t, static_cast<float>(menu::combo_q_min_range)))
+        if (e_active && try_e_recast(false))
+            return;
+
+        if (menu::combo_use_q
+            && is_q_range_ok(t, static_cast<float>(menu::combo_q_min_range))
+            && should_combo_q(t))
+        {
             try_q_target(t, /*use_w_gapclose=*/true);
+        }
     }
 
     void harass()
@@ -443,7 +779,8 @@ namespace
         if (is_jax_buff(buff, data::BUFF_E_EVASION, data::BUFF_NAME_E))
         {
             e_active = true;
-            e_start_time = g_sdk->clock_facade->get_game_time();
+            const float start_time = buff->get_start_time();
+            e_start_time = start_time > 0.f ? start_time : g_sdk->clock_facade->get_game_time();
         }
     }
 
@@ -456,6 +793,9 @@ namespace
         {
             e_active = false;
             e_start_time = 0.f;
+            pending_e_recast = false;
+            pending_e_recast_target_id = 0;
+            pending_e_recast_time = 0.f;
         }
     }
 
@@ -481,7 +821,9 @@ void __fastcall on_update()
 {
     if (!g_sdk || !sdk::orbwalker || !g_sdk->renderer) return;
     if (!player() || player()->is_dead()) return;
+    sync_e_state_from_buff();
     q_killsteal();
+    if (handle_pending_e_recast()) return;
 
     if (sdk::orbwalker->combo())
         combo();
@@ -497,6 +839,7 @@ void __fastcall on_draw()
 {
     auto* p = player();
     if (!p || !g_sdk || !g_sdk->renderer) return;
+    sync_e_state_from_buff();
 
     auto draw_circle = [&](math::vector3 const& center, float range, uint32_t color)
     {
@@ -508,6 +851,26 @@ void __fastcall on_draw()
         draw_circle(p->get_position(), data::Q_RANGE, menu::color_q);
     if (menu::draw_e_range && (!menu::draw_only_ready || is_spell_ready(SLOT_E)))
         draw_circle(p->get_position(), data::E_RADIUS, menu::color_e);
+
+    if (menu::draw_e_timer && e_active && g_sdk->clock_facade)
+    {
+        const float now = g_sdk->clock_facade->get_game_time();
+        const float remaining = std::max(0.f, e_start_time + data::E_EVASION_DURATION - now);
+        const float elapsed = std::clamp(now - e_start_time, 0.f, data::E_EVASION_DURATION);
+        const float pct = elapsed / data::E_EVASION_DURATION;
+
+        const auto screen = g_sdk->renderer->world_to_screen(p->get_position());
+        if (screen.x > 0.f && screen.y > 0.f)
+        {
+            char text[32]{};
+            std::snprintf(text, sizeof(text), "E %.1fs", remaining);
+            const uint32_t clr = remaining <= E_RECAST_EXPIRY_BUFFER + 0.1f ? 0xFFFF4040u : 0xFFB8F7FFu;
+            g_sdk->renderer->add_text(text, 15.f, { screen.x, screen.y - 72.f }, 1, clr);
+
+            if (sdk::shaders)
+                sdk::shaders->draw_percentage_circle({ screen.x, screen.y - 54.f }, 20.f, 3.f, pct, clr);
+        }
+    }
 }
 
 void load()
@@ -520,18 +883,16 @@ void load()
             [](bool v) { menu::combo_use_q = v; });
         q_menu->add_slider_int("combo_min_range", "Combo Min Q Range", 0, 700, 10, menu::combo_q_min_range,
             [](int v) { menu::combo_q_min_range = v; });
+        q_menu->add_checkbox("combo_out_aa", "Combo: Q if Outside AA", menu::combo_q_only_out_aa,
+            [](bool v) { menu::combo_q_only_out_aa = v; });
+        q_menu->add_checkbox("combo_killable", "Combo: Q if Killable", menu::combo_q_killable,
+            [](bool v) { menu::combo_q_killable = v; });
+        q_menu->add_checkbox("combo_escaping", "Combo: Q if Escaping", menu::combo_q_escaping,
+            [](bool v) { menu::combo_q_escaping = v; });
         q_menu->add_checkbox("harass", "Use in Harass", menu::harass_use_q,
             [](bool v) { menu::harass_use_q = v; });
         q_menu->add_slider_int("harass_min_range", "Harass Min Q Range", 0, 700, 10, menu::harass_q_min_range,
             [](int v) { menu::harass_q_min_range = v; });
-        q_menu->add_checkbox("flee", "Use in Flee (Ally Minion Jump)", menu::flee_use_q,
-            [](bool v) { menu::flee_use_q = v; });
-        q_menu->add_checkbox("flee_ally_heroes", "Flee: Q to Ally Heroes", menu::flee_q_ally_heroes,
-            [](bool v) { menu::flee_q_ally_heroes = v; });
-        q_menu->add_checkbox("flee_ally_minions", "Flee: Q to Ally Minions", menu::flee_q_ally_minions,
-            [](bool v) { menu::flee_q_ally_minions = v; });
-        q_menu->add_checkbox("flee_ward_jump", "Flee: Ward Jump (Place + Q)", menu::flee_q_ward_jump,
-            [](bool v) { menu::flee_q_ward_jump = v; });
         q_menu->add_hotkey("ks_q", "Instant Q Killsteal (Hold)", 'X', false, false,
             [](std::string* hk, bool pressed) {
                 menu::ks_q_active = pressed;
@@ -555,6 +916,14 @@ void load()
             [](bool v) { menu::combo_use_e = v; });
         e_menu->add_checkbox("midair_recast", "Mid-air E recast with Q", menu::combo_e_midair_recast,
             [](bool v) { menu::combo_e_midair_recast = v; });
+        e_menu->add_checkbox("wait_max_charge", "Wait Max Charge", menu::combo_e_wait_max_charge,
+            [](bool v) { menu::combo_e_wait_max_charge = v; });
+        e_menu->add_slider_int("recast_min_enemies", "Recast if Enemies Hit", 1, 5, 1, menu::combo_e_recast_min_enemies,
+            [](int v) { menu::combo_e_recast_min_enemies = v; });
+        e_menu->add_checkbox("auto_crit_aa", "Auto E Critical AA", menu::auto_e_critical_aa,
+            [](bool v) { menu::auto_e_critical_aa = v; });
+        e_menu->add_slider_int("auto_crit_chance", "Crit Chance Threshold", 1, 100, 1, menu::auto_e_critical_min_chance,
+            [](int v) { menu::auto_e_critical_min_chance = v; });
         e_menu->add_checkbox("clear", "Use in Clear", menu::clear_use_e,
             [](bool v) { menu::clear_use_e = v; });
         e_menu->add_checkbox("draw_range", "Draw Range", menu::draw_e_range,
@@ -566,6 +935,16 @@ void load()
         r_menu->add_slider_int("hp", "Use if HP % below", 1, 100, 1, menu::combo_r_hp,
             [](int v) { menu::combo_r_hp = v; });
 
+        auto* flee_menu = s_menu->add_sub_category("flee", "Flee");
+        flee_menu->add_checkbox("use", "Use in Flee", menu::flee_use_q,
+            [](bool v) { menu::flee_use_q = v; });
+        flee_menu->add_checkbox("ally_heroes", "Q to Ally Heroes", menu::flee_q_ally_heroes,
+            [](bool v) { menu::flee_q_ally_heroes = v; });
+        flee_menu->add_checkbox("ally_minions", "Q to Ally Minions", menu::flee_q_ally_minions,
+            [](bool v) { menu::flee_q_ally_minions = v; });
+        flee_menu->add_checkbox("ward_jump", "Ward Jump (Place + Q)", menu::flee_q_ward_jump,
+            [](bool v) { menu::flee_q_ward_jump = v; });
+
         auto* mana_menu = s_menu->add_sub_category("mana", "Mana Thresholds");
         mana_menu->add_slider_int("harass", "Harass Mana %", 0, 100, 1, menu::harass_mana,
             [](int v) { menu::harass_mana = v; });
@@ -575,6 +954,8 @@ void load()
         auto* draw_menu = s_menu->add_sub_category("drawings", "Drawings");
         draw_menu->add_checkbox("only_ready", "Only Ready Spells", menu::draw_only_ready,
             [](bool v) { menu::draw_only_ready = v; });
+        draw_menu->add_checkbox("e_timer", "Draw E Timer", menu::draw_e_timer,
+            [](bool v) { menu::draw_e_timer = v; });
         draw_menu->add_colorpicker("col_q", "Q Color", menu::color_q,
             [](uint32_t c) { menu::color_q = c; });
         draw_menu->add_colorpicker("col_e", "E Color", menu::color_e,
@@ -589,6 +970,8 @@ void load()
         reinterpret_cast<void*>(on_buff_gain));
     g_sdk->event_manager->register_callback(event_manager::event::buff_loss,
         reinterpret_cast<void*>(on_buff_loss));
+    g_sdk->event_manager->register_callback(event_manager::event::process_cast,
+        reinterpret_cast<void*>(on_process_cast));
     g_sdk->event_manager->register_callback(event_manager::event::create_object,
         reinterpret_cast<void*>(on_create_object));
     if (sdk::orbwalker)
@@ -610,6 +993,8 @@ void unload()
             reinterpret_cast<void*>(on_buff_gain));
         g_sdk->event_manager->unregister_callback(event_manager::event::buff_loss,
             reinterpret_cast<void*>(on_buff_loss));
+        g_sdk->event_manager->unregister_callback(event_manager::event::process_cast,
+            reinterpret_cast<void*>(on_process_cast));
         g_sdk->event_manager->unregister_callback(event_manager::event::create_object,
             reinterpret_cast<void*>(on_create_object));
     }
@@ -622,6 +1007,9 @@ void unload()
     s_menu = nullptr;
     e_active = false;
     e_start_time = 0.f;
+    pending_e_recast = false;
+    pending_e_recast_target_id = 0;
+    pending_e_recast_time = 0.f;
     ward_jump_pending = false;
     ward_jump_time = 0.f;
 }

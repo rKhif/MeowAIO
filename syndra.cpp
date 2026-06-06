@@ -424,6 +424,9 @@ namespace syndra
     bool cast_q_at(const math::vector3& pos)
     {
         if (!sdk::common) return false;
+        // Never drop a Q sphere while W is mid-grab: it stalls the throw and the
+        // fresh Seed can be mis-tagged as the held sphere in on_create_object.
+        if (w_holding) return false;
         if (!is_spell_ready(SLOT_Q) || !has_enough_mana(SLOT_Q)) return false;
 
         auto p = g_sdk->object_manager->get_local_player();
@@ -470,24 +473,26 @@ namespace syndra
         return ok;
     }
 
-    bool cast_w_throw(game_object* target, int hitchance)
+    bool cast_w_throw(game_object* target, int hitchance, bool aggressive)
     {
         if (!target || !w_holding) return false;
         if (!target->is_hero()) return false;
 
-        const float now = g_sdk->clock_facade->get_game_time();
-        if ((now - w_grab_time) < spell_data::w_min_hold_time) return false;
+        const float now  = g_sdk->clock_facade->get_game_time();
+        const float held = now - w_grab_time;
+        if (held < spell_data::w_min_hold_time) return false;
 
         auto p = g_sdk->object_manager->get_local_player();
         if (!p) return false;
 
-        const float dist = p->get_position().distance(target->get_position());
-        const float w_range = spell_data::w_throw_range;
+        const float dist          = p->get_position().distance(target->get_position());
+        const float w_range       = spell_data::w_throw_range;
         const float min_pred_dist = target->get_bounding_radius() * 3.f;
+        const bool  held_too_long = held > spell_data::w_force_throw_time;
 
         if (dist > w_range) {
             // Force-throw if we've held too long
-            if ((now - w_grab_time) > spell_data::w_force_throw_time)
+            if (held_too_long)
                 return issue_w_cast(target->get_server_position());
             return false;
         }
@@ -500,8 +505,18 @@ namespace syndra
                                  w_range, spell_data::w_throw_radius,
                                  spell_data::w_throw_delay, spell_data::w_throw_speed,
                                  hitchance);
-        if (!pred.is_valid || pred.hitchance < hitchance) return false;
-        return issue_w_cast(pred.cast_position);
+        if (pred.is_valid && pred.hitchance >= hitchance)
+            return issue_w_cast(pred.cast_position);
+
+        // Target is in range but prediction is below the requested hitchance.
+        // In aggressive (combo) mode we throw anyway instead of sitting on the
+        // sphere — W is a fast, wide missile and holding stalls the whole combo.
+        // Outside aggressive mode we only dump it once we've held too long.
+        if (aggressive || held_too_long) {
+            if (pred.is_valid) return issue_w_cast(pred.cast_position);
+            return issue_w_cast(target->get_server_position());
+        }
+        return false;
     }
 
     bool cast_w_grab()
@@ -823,7 +838,7 @@ namespace syndra
 
         // 2) W throw if currently holding.
         if (menu::combo_use_w && w_holding) {
-            if (cast_w_throw(target, menu::combo_hitchance)) return;
+            if (cast_w_throw(target, menu::combo_hitchance, /*aggressive=*/true)) return;
         }
 
         // 3) E sphere push — when Q is on CD but a ground sphere is up,
@@ -1342,6 +1357,13 @@ namespace syndra
             }
         }
 
+        // "AUTO Q" status indicator below player — only while Auto Q is on
+        if (menu::auto_q_active && g_sdk->renderer) {
+            const auto screen = g_sdk->renderer->world_to_screen(player_pos);
+            g_sdk->renderer->add_text("AUTO Q", 16.f,
+                { screen.x - 30.f, screen.y + 20.f }, 0, 0xFF00FF00u);
+        }
+
         // Sphere markers + remaining time
         if (menu::draw_spheres && g_sdk->renderer) {
             const float now = g_sdk->clock_facade->get_game_time();
@@ -1681,14 +1703,29 @@ namespace syndra
 
     bool __stdcall on_before_attack(orb_sdk::event_data* data)
     {
-        // AA-weave Q on hero AAs in combo/harass — always on.
+        // AA-weave Q on hero AAs — respects the per-mode Q toggles, mana floor,
+        // and hitchance so it never overrides the user's menu settings.
         if (!data || !data->target || !sdk::orbwalker) return true;
-        if (!sdk::orbwalker->combo() && !sdk::orbwalker->harass()) return true;
         if (!data->target->is_hero()) return true;
-        if (!is_spell_ready(SLOT_Q) || !has_enough_mana(SLOT_Q)) return true;
+        if (w_holding) return true;
         if (!sdk::common) return true;
+        if (!is_spell_ready(SLOT_Q) || !has_enough_mana(SLOT_Q)) return true;
 
-        cast_q_on(data->target, menu::combo_hitchance);
+        int hitchance;
+        if (sdk::orbwalker->combo()) {
+            if (!menu::combo_use_q) return true;
+            hitchance = menu::combo_hitchance;
+        }
+        else if (sdk::orbwalker->harass()) {
+            if (!menu::harass_use_q) return true;
+            if (mana_pct() < (float)menu::harass_mana_pct) return true;
+            hitchance = menu::harass_hitchance;
+        }
+        else {
+            return true;
+        }
+
+        cast_q_on(data->target, hitchance);
         return true;
     }
 

@@ -13,6 +13,7 @@
 #include "MeowV1/vex.h"
 #include "MeowV1/annie.h"
 #include "MeowV1/katarina.h"
+#include "MeowV1/hwei.h"
 
 
 extern "C" __declspec(dllexport) int SDKVersion = SDK_VERSION;
@@ -228,10 +229,23 @@ extern "C" __declspec(dllexport) bool PluginLoad(core_sdk* sdk, void** custom_sd
             return false;
         }
     }
+    else if (champion_name == "Hwei")
+    {
+        try
+        {
+            hwei::load();
+            g_sdk->log_console("[MeowAIO] Hwei loaded MEOW!");
+        }
+        catch (...)
+        {
+            g_sdk->log_console("[MeowAIO] Failed to load Hwei MEOW!");
+            return false;
+        }
+    }
     else
     {
         g_sdk->log_console("[MeowAIO] Champion not supported >.<'' (Current: %s)", champion_name.c_str());
-        g_sdk->log_console("[MeowAIO] Supported champions: Viktor, Veigar, Zaahen, Syndra, Orianna, Shyvana, Vex, Annie, Katarina");
+        g_sdk->log_console("[MeowAIO] Supported champions: Viktor, Veigar, Zaahen, Syndra, Orianna, Shyvana, Vex, Annie, Katarina, Hwei");
         return false;
     }
 
@@ -285,6 +299,11 @@ extern "C" __declspec(dllexport) void PluginUnload()
     {
         katarina::unload();
         g_sdk->log_console("[MeowAIO] Katarina unloaded successfully!");
+    }
+    else if (s_loaded_champion == "Hwei")
+    {
+        hwei::unload();
+        g_sdk->log_console("[MeowAIO] Hwei unloaded successfully!");
     }
 
     sdk::orbwalker = nullptr;
