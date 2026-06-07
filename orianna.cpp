@@ -1402,10 +1402,10 @@ namespace orianna
             }
         }
 
-        // Auto Q / Auto R / E Mode indicators stacked above the player
+        // Auto Q / Auto R / E Mode indicators stacked below the player
         if (g_sdk->renderer) {
             const auto base = g_sdk->renderer->world_to_screen(ppos);
-            float y = base.y - 55.f;  // start above the champion model
+            float y = base.y + 30.f;  // start below the champion model
             if (menu::auto_q_enabled) {
                 math::vector2 pos{ base.x, y };
                 g_sdk->renderer->add_text("AUTO Q", 14.f, pos, 1, 0xFF00FF80u);

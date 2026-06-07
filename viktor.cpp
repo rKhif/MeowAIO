@@ -2458,231 +2458,155 @@ namespace viktor
         const bool nearly_still = spd_sq < (50.f * 50.f);
         const bool is_dash      = target->is_dashing();
 
-        // Place FP/CP along `dir`. beam_bias controls where the target sits
-        // in the beam (0 = start, 1 = end). FP is clamped to first_click.
-        auto fire = [&](const math::vector3& aim_pos, const math::vector3& dir,
-                        float beam_bias, const char* branch_name) -> bool
+        const float speed   = spell_data::e_speed;   // laser projectile speed
+        const float windup  = spell_data::e_delay;    // cast windup before the laser travels
+        const float tgt_spd = std::sqrt(spd_sq);
+        // Beam half-width plus the target's body: the laser only has to reach
+        // the hitbox edge to connect, not the center.
+        const float hit_radius = spell_data::e_radius + target->get_bounding_radius();
+
+        // Bias = where along the 700-unit beam the aim point should sit
+        // (0 = near end, 1 = far end). Push toward the far end for distant or
+        // fleeing targets so the beam reaches them rather than falling short.
+        const float range_frac = std::clamp(tgt_d / e_reach, 0.f, 1.f);
+        float bias = 0.5f + (range_frac - 0.5f) * 0.5f; // 0.25 → 0.75
         {
-            const float dlen_sq = dir.x * dir.x + dir.z * dir.z;
-            if (dlen_sq < 0.01f)
-            {
-                log_e("[E] reject: invalid dir (branch=%s)", branch_name);
-                return false;
-            }
+            const auto  fwd          = direction_2d(ppos, tpos);
+            const float longitudinal = vel.x * fwd.x + vel.z * fwd.z;
+            if (longitudinal > 0.f) // moving away
+                bias += std::min(longitudinal / 600.f, 0.35f);
+        }
+        bias = std::clamp(bias, 0.2f, 0.9f);
 
-            const float aim_dist = distance_2d(ppos, aim_pos);
-            if (aim_dist < 10.f)
-            {
-                log_e("[E] reject: aim too close %.1f (branch=%s)", aim_dist, branch_name);
-                return false;
-            }
-
-            const float clamped_aim = std::min(aim_dist, e_reach);
-            const float ideal_fp    = clamped_aim - beam_len * std::clamp(beam_bias, 0.f, 1.f);
-            const float fp_dist     = std::clamp(ideal_fp, 0.f, first_click);
-
-            const math::vector3 fp = ppos + dir * fp_dist;
-            const math::vector3 cp = fp   + dir * beam_len;
-
-            player->cast_spell(SLOT_E, fp, cp);
-            last_cast_e            = now_e;
-            m_last_spell_cast_time = now_e;
-
-            if (menu::log_e_casts)
-            {
-                const float beam_time = beam_len / spell_data::e_speed;
-                m_e_log.armed             = true;
-                m_e_log.target_net_id     = target->get_network_id();
-                m_e_log.target_name       = target->get_char_name();
-                m_e_log.fp                = fp;
-                m_e_log.cp                = cp;
-                m_e_log.eval_time         = now_e + spell_data::e_delay + beam_time;
-                m_e_log.tgt_dist_at_cast  = tgt_d;
-                m_e_log.tgt_speed_at_cast = std::sqrt(spd_sq);
-                m_e_log.branch            = branch_name;
-
-                log_e("[E] CAST tgt=%s d=%.0f vel=%.0f branch=%s fp_d=%.0f cp_d=%.0f",
-                      m_e_log.target_name.c_str(), tgt_d, m_e_log.tgt_speed_at_cast,
-                      branch_name, fp_dist, fp_dist + beam_len);
-            }
-            return true;
+        // Time for the laser to reach a point `dist` units from Viktor:
+        //   windup + (gap from beam start to that point - hit radius) / speed.
+        // The beam start sits at (dist - beam_len*bias) clamped to first_click,
+        // so this single expression folds in our distance, their distance, the
+        // projectile travel, the beam radius, the target hitbox and the windup.
+        auto time_to_reach = [&](float dist) -> float
+        {
+            const float fp_d   = std::clamp(dist - beam_len * bias, 0.f, first_click);
+            const float travel = std::max(0.f, (dist - fp_d) - hit_radius);
+            return windup + travel / speed;
         };
 
-        // Anti-dodge perpendicular E for close moving targets — guarantees a
-        // hit on a 180-strafe where SDK prediction would jitter.
-        if (tgt_d < 300.f && !immobile && !nearly_still && !is_dash
-            && spd_sq > (100.f * 100.f))
-        {
-            const float speed = std::sqrt(spd_sq);
-            const float perp_x = -vel.z / speed;
-            const float perp_z =  vel.x / speed;
-            const auto  to_tgt = direction_2d(ppos, tpos);
-            const float sign   = (to_tgt.x * perp_x + to_tgt.z * perp_z > 0.f) ? 1.f : -1.f;
-
-            const float offset = spell_data::e_radius + target->get_bounding_radius() + 50.f;
-            math::vector3 aim_pos = {
-                tpos.x + perp_x * sign * offset,
-                tpos.y,
-                tpos.z + perp_z * sign * offset
-            };
-            if (distance_2d(ppos, aim_pos) > e_reach)
-                aim_pos = ppos + direction_2d(ppos, aim_pos) * e_reach;
-
-            const auto dir = direction_2d(ppos, aim_pos);
-            return fire(aim_pos, dir, 0.5f, "close-perp");
-        }
-
-        // Dash endpoint is engine-guaranteed — free hit.
-        if (is_dash)
-        {
-            auto path = target->get_path();
-            if (!path.empty())
-            {
-                math::vector3 dash_end = path.back();
-                if (distance_2d(ppos, dash_end) > e_reach)
-                    dash_end = ppos + direction_2d(ppos, dash_end) * e_reach;
-                const auto dir = direction_2d(ppos, dash_end);
-                return fire(dash_end, dir, 0.5f, "dash-end");
-            }
-        }
+        // ---- Resolve the aim point (where the target is when the laser hits) ----
+        math::vector3 aim    = tpos;
+        const char*   branch = "still";
 
         if (immobile || nearly_still)
         {
-            const auto dir = direction_2d(ppos, tpos);
-            return fire(tpos, dir, 0.5f, immobile ? "cc'd" : "still");
+            aim    = tpos; // not moving -> hit the live position
+            branch = immobile ? "cc" : "still";
         }
-
-        // spell_type::vector knows about FP→CP geometry. With it, the SDK
-        // computes intercept from the actual beam start, not Viktor's position.
-        if (!sdk::prediction)
+        else if (is_dash)
         {
-            const float lead_t = spell_data::e_delay + std::max(0.f, tgt_d - first_click) / spell_data::e_speed;
-            math::vector3 aim_pos = { tpos.x + vel.x * lead_t, tpos.y, tpos.z + vel.z * lead_t };
-            if (distance_2d(ppos, aim_pos) > e_reach)
-                aim_pos = ppos + direction_2d(ppos, aim_pos) * e_reach;
-            const auto dir = direction_2d(ppos, aim_pos);
-            return fire(aim_pos, dir, 0.5f, "no-pred-fb");
-        }
-
-        pred_sdk::spell_data spell{};
-        spell.spell_type        = pred_sdk::spell_type::vector;
-        spell.targetting_type   = pred_sdk::targetting_type::center;
-        spell.spell_slot        = SLOT_E;
-        spell.range             = spell_data::e_range;
-        spell.cast_range        = first_click;
-        spell.radius            = spell_data::e_radius;
-        spell.delay             = spell_data::e_delay;
-        spell.projectile_speed  = spell_data::e_speed;
-        spell.expected_hitchance = menu::e_hitchance;
-
-        pred_sdk::pred_data pred{};
-        try { pred = sdk::prediction->predict(target, spell); }
-        catch (...) { pred.is_valid = false; }
-
-        if (!pred.is_valid)
-        {
-            log_e("[E] reject: pred invalid tgt=%s d=%.0f vel=%.0f",
-                  target->get_char_name().c_str(), tgt_d, std::sqrt(spd_sq));
-            return false;
-        }
-        if (pred.hitchance < menu::e_hitchance)
-        {
-            log_e("[E] reject: hc %d<%d tgt=%s d=%.0f vel=%.0f",
-                  pred.hitchance, menu::e_hitchance,
-                  target->get_char_name().c_str(), tgt_d, std::sqrt(spd_sq));
-            return false;
-        }
-
-        math::vector3 fp = pred.first_cast_position;
-        math::vector3 cp = pred.cast_position;
-
-        auto beam_dir = direction_2d(fp, cp);
-        float beam_dir_sq = beam_dir.x * beam_dir.x + beam_dir.z * beam_dir.z;
-        if (beam_dir_sq < 0.01f)
-        {
-            // Fall back to ppos -> predicted target direction.
-            beam_dir = direction_2d(ppos, pred.predicted_position);
-            beam_dir_sq = beam_dir.x * beam_dir.x + beam_dir.z * beam_dir.z;
-            if (beam_dir_sq < 0.01f)
+            // The dash destination is engine-locked — aim straight at it.
+            auto path = target->get_path();
+            if (!path.empty())
             {
-                log_e("[E] reject: zero beam dir tgt=%s", target->get_char_name().c_str());
+                aim    = path.back();
+                branch = "dash-end";
+            }
+            else
+            {
+                const float t = time_to_reach(tgt_d);
+                aim    = { tpos.x + vel.x * t, tpos.y, tpos.z + vel.z * t };
+                branch = "dash-vel";
+            }
+        }
+        else
+        {
+            // Moving target: fixed-point intercept. Lead by velocity over the
+            // current time-to-hit, recompute the time at that spot, repeat.
+            // Champion speed << laser speed, so this settles in 2-3 passes.
+            for (int i = 0; i < 4; ++i)
+            {
+                const float t = time_to_reach(distance_2d(ppos, aim));
+                const math::vector3 next = { tpos.x + vel.x * t, tpos.y,
+                                             tpos.z + vel.z * t };
+                const bool converged = distance_2d(next, aim) < 5.f;
+                aim = next;
+                if (converged) break;
+            }
+            branch = "lead";
+        }
+
+        // Clamp the aim into reach and reject degenerate (on-top-of-us) aims.
+        if (distance_2d(ppos, aim) > e_reach)
+            aim = ppos + direction_2d(ppos, aim) * e_reach;
+        if (distance_2d(ppos, aim) < 10.f)
+        {
+            log_e("[E] reject: aim too close (branch=%s)", branch);
+            return false;
+        }
+
+        // ---- Hit-chance gate (dodge detection) -----------------------------
+        // The geometry below is entirely our own; the SDK is consulted only to
+        // decide whether the shot is worth taking. Guaranteed cases (cc / still
+        // / dash) and the no-prediction case skip the gate.
+        if (sdk::prediction && !immobile && !nearly_still && !is_dash)
+        {
+            pred_sdk::spell_data spell{};
+            spell.spell_type         = pred_sdk::spell_type::vector;
+            spell.targetting_type    = pred_sdk::targetting_type::center;
+            spell.spell_slot         = SLOT_E;
+            spell.range              = spell_data::e_range;
+            spell.cast_range         = first_click;
+            spell.radius             = spell_data::e_radius;
+            spell.delay              = windup;
+            spell.projectile_speed   = speed;
+            spell.expected_hitchance = menu::e_hitchance;
+
+            pred_sdk::pred_data pred{};
+            try { pred = sdk::prediction->predict(target, spell); }
+            catch (...) { pred.is_valid = false; }
+
+            if (!pred.is_valid || pred.hitchance < menu::e_hitchance)
+            {
+                log_e("[E] reject: hc gate tgt=%s d=%.0f vel=%.0f",
+                      target->get_char_name().c_str(), tgt_d, tgt_spd);
                 return false;
             }
         }
 
-        // Where along the 700-unit beam the predicted target should sit
-        // (0 = near end, 1 = far end). Nudge toward the far end for far /
-        // fleeing targets so the beam doesn't fall short.
-        const auto& pp_pred = pred.predicted_position;
-        const float range_frac = std::clamp(tgt_d / e_reach, 0.f, 1.f);
-        float bias = 0.5f + (range_frac - 0.5f) * 0.5f; // 0.25 → 0.75
-        const float longitudinal_vel = vel.x * beam_dir.x + vel.z * beam_dir.z;
-        if (longitudinal_vel > 0.f)
-            bias += std::min(longitudinal_vel / 600.f, 0.35f);
-        bias = std::clamp(bias, 0.2f, 0.9f);
-
-        // Anchor the beam ON the predicted position, then walk the near point
-        // backward along the beam direction. This preserves the perpendicular
-        // lead — a target strafing sideways gets hit where it WILL be, instead
-        // of on the player-radial line (which only kept the forward component
-        // and dropped the sideways one, landing the beam on the live position).
-        fp = { pp_pred.x - beam_dir.x * (beam_len * bias), pp_pred.y,
-               pp_pred.z - beam_dir.z * (beam_len * bias) };
-
-        // Near point must be reachable: clamp it to first_click from Viktor.
-        if (distance_2d(ppos, fp) > first_click)
-            fp = ppos + direction_2d(ppos, fp) * first_click;
-
-        // Beam extends beam_len from the near point; clamp the far end to reach.
-        cp = { fp.x + beam_dir.x * beam_len, fp.y, fp.z + beam_dir.z * beam_len };
-        if (distance_2d(ppos, cp) > e_reach)
-            cp = ppos + direction_2d(ppos, cp) * e_reach;
-
-        // Sanity: the predicted position must be roughly in front of Viktor
-        // (guards against a degenerate prediction pointing backward). This is
-        // based on the predicted spot, not FP, so legitimate sideways beams
-        // are not falsely rejected.
-        const auto to_tgt   = direction_2d(ppos, tpos);
-        const auto pred_dir = direction_2d(ppos, pp_pred);
-        const float facing_dot = to_tgt.x * pred_dir.x + to_tgt.z * pred_dir.z;
-        if (facing_dot < -0.2f)
+        // ---- Build the beam through the aim point --------------------------
+        // Aiming straight at the lead keeps its sideways component on the beam
+        // line, so a strafing target is led instead of hit on its live spot.
+        const math::vector3 beam_dir = direction_2d(ppos, aim);
+        if ((beam_dir.x * beam_dir.x + beam_dir.z * beam_dir.z) < 0.01f)
         {
-            log_e("[E] reject: predicted behind player (dot=%.2f) tgt=%s",
-                  facing_dot, target->get_char_name().c_str());
+            log_e("[E] reject: zero aim dir tgt=%s", target->get_char_name().c_str());
             return false;
         }
 
-        if (menu::log_e_casts)
-        {
-            log_e("[E] pred ok hc=%d fp=(%.0f,%.0f) cp=(%.0f,%.0f) pp=(%.0f,%.0f) tgt=%s",
-                  pred.hitchance, fp.x, fp.z, cp.x, cp.z,
-                  pred.predicted_position.x, pred.predicted_position.z,
-                  target->get_char_name().c_str());
-        }
+        const float aim_d   = distance_2d(ppos, aim);
+        const float fp_dist = std::clamp(aim_d - beam_len * bias, 0.f, first_click);
+        const math::vector3 fp = ppos + beam_dir * fp_dist;
+        math::vector3 cp = fp + beam_dir * beam_len;
+        if (distance_2d(ppos, cp) > e_reach)
+            cp = ppos + beam_dir * e_reach;
 
-        // Use fire() so the arming/log path is shared with other branches.
-        // beam_bias is irrelevant here because fp/cp came from the SDK; we just
-        // need fire's bookkeeping. We reproduce the cast inline to keep the
-        // exact SDK fp/cp without remapping through fire's geometry rebuild.
         player->cast_spell(SLOT_E, fp, cp);
         last_cast_e            = now_e;
         m_last_spell_cast_time = now_e;
 
         if (menu::log_e_casts)
         {
-            const float beam_time = beam_len / spell_data::e_speed;
+            const float beam_time = beam_len / speed;
             m_e_log.armed             = true;
             m_e_log.target_net_id     = target->get_network_id();
             m_e_log.target_name       = target->get_char_name();
             m_e_log.fp                = fp;
             m_e_log.cp                = cp;
-            m_e_log.eval_time         = now_e + spell_data::e_delay + beam_time;
+            m_e_log.eval_time         = now_e + windup + beam_time;
             m_e_log.tgt_dist_at_cast  = tgt_d;
-            m_e_log.tgt_speed_at_cast = std::sqrt(spd_sq);
-            m_e_log.branch            = "sdk-vector";
+            m_e_log.tgt_speed_at_cast = tgt_spd;
+            m_e_log.branch            = branch;
 
-            log_e("[E] CAST tgt=%s d=%.0f vel=%.0f branch=sdk-vector",
-                  m_e_log.target_name.c_str(), tgt_d, m_e_log.tgt_speed_at_cast);
+            log_e("[E] CAST tgt=%s d=%.0f vel=%.0f branch=%s fp_d=%.0f cp_d=%.0f",
+                  m_e_log.target_name.c_str(), tgt_d, tgt_spd,
+                  branch, fp_dist, fp_dist + beam_len);
         }
         return true;
     }

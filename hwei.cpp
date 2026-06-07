@@ -84,12 +84,6 @@ namespace hwei
         constexpr float EW_ROOT_FOLLOWUP_DELAY = 0.75f;
         // Max time the teamfight combo stalls QE/QW while waiting for R to land.
         constexpr float TEAMFIGHT_R_WAIT = 2.0f;
-        // Floor lockout applied to a sub-spell after we observe it cast. Hwei's
-        // three sub-spells per subject each have their own cooldown, but the
-        // owning slot (Q/W/E) keeps reading "ready" while the other two are up.
-        // This guards against immediately re-queuing the sub-spell we just cast
-        // (which desyncs the subject selector into a bare HweiQ/W/E cast).
-        constexpr float SUBSPELL_MIN_LOCKOUT = 0.40f;
         static bool HWEI_DEBUG_LOGS = false;
 
         static menu_category* s_menu = nullptr;
@@ -109,9 +103,6 @@ namespace hwei
         static cast_engine_state s_cast_state = cast_engine_state::idle;
         static cast_intent s_intent{};
         static float s_subject_lockout_until[3] = {};
-        // [subject_index 0..2][followup slot 0..2(SLOT_Q/W/E)] -> game time the
-        // specific sub-spell becomes castable again.
-        static float s_subspell_ready_at[3][3] = {};
         static uint32_t s_infotab_combo_mode = 0;
         static uint32_t s_infotab_bind_qw   = 0;
         static uint32_t s_infotab_bind_we   = 0;
@@ -569,105 +560,6 @@ namespace hwei
             return std::strcmp(name, s_intent.expected_followup_name) == 0;
         }
 
-        // Maps a follow-up spell name (e.g. "HweiQE") back to its subject index
-        // (0/1/2) and the slot it is bound to (SLOT_Q/W/E == 0/1/2).
-        bool followup_indices(const char* name, int& subj_idx, int& slot)
-        {
-            if (!name)
-                return false;
-            struct entry { const char* name; int subj; int slot; };
-            static const entry maps[] = {
-                { "HweiQQ", 0, SLOT_Q }, { "HweiQW", 0, SLOT_W }, { "HweiQE", 0, SLOT_E },
-                { "HweiWQ", 1, SLOT_Q }, { "HweiWW", 1, SLOT_W }, { "HweiWE", 1, SLOT_E },
-                { "HweiEQ", 2, SLOT_Q }, { "HweiEW", 2, SLOT_W }, { "HweiEE", 2, SLOT_E },
-            };
-            for (const auto& m : maps)
-            {
-                if (std::strcmp(name, m.name) == 0)
-                {
-                    subj_idx = m.subj;
-                    slot = m.slot;
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        // Best-effort live cooldown of a specific sub-spell, derived from the
-        // child-spell static cooldown table adjusted by ability haste. Returns
-        // 0 when unavailable so callers can fall back to the floor lockout.
-        float compute_followup_cooldown(const char* followup_name, int subject_owner_slot)
-        {
-            auto* player = get_player();
-            if (!player || !followup_name)
-                return 0.f;
-
-            auto* entry = player->get_spell(subject_owner_slot);
-            if (!entry)
-                return 0.f;
-
-            int rank = entry->get_level();
-            if (rank < 1) rank = 1;
-            if (rank > 5) rank = 5;
-
-            auto children = player->get_child_spells(subject_owner_slot);
-            for (auto* child : children)
-            {
-                if (!child)
-                    continue;
-                const char* cn = child->get_name();
-                if (!cn || std::strcmp(cn, followup_name) != 0)
-                    continue;
-
-                float* cds = child->get_cooldown();
-                if (!cds)
-                    return 0.f;
-
-                float base = cds[rank - 1];
-                if (base <= 0.f)
-                    return 0.f;
-
-                const float ah = player->get_ability_haste_mod();
-                if (ah > 0.f)
-                    base /= (1.f + ah * 0.01f);
-                return base;
-            }
-            return 0.f;
-        }
-
-        // Called when we observe a sub-spell actually cast (combo or manual) so
-        // the cast engine respects its individual cooldown instead of the
-        // owning slot's shared "ready" state.
-        void register_subspell_cooldown(const char* followup_name)
-        {
-            int subj_idx = -1, slot = -1;
-            if (!followup_indices(followup_name, subj_idx, slot))
-                return;
-            if (subj_idx < 0 || subj_idx > 2 || slot < 0 || slot > 2)
-                return;
-
-            const int owner_slot = (subj_idx == 0) ? SLOT_Q : (subj_idx == 1) ? SLOT_W : SLOT_E;
-            const float cd = compute_followup_cooldown(followup_name, owner_slot);
-            const float lock = std::max(cd, SUBSPELL_MIN_LOCKOUT);
-            s_subspell_ready_at[subj_idx][slot] = now() + lock;
-
-            if (HWEI_DEBUG_LOGS && g_sdk)
-            {
-                g_sdk->log_console("[MeowAIO] subspell cd name=%s cd=%.2f lock=%.2f",
-                    followup_name, cd, lock);
-            }
-        }
-
-        bool is_subspell_on_local_cd(const ability_info& info)
-        {
-            const int subj_idx = subject_index(info.mood);
-            if (subj_idx < 0 || subj_idx > 2)
-                return false;
-            if (info.slot < 0 || info.slot > 2)
-                return false;
-            return now() < s_subspell_ready_at[subj_idx][info.slot];
-        }
-
         const char* cast_type_name(ability_cast type)
         {
             switch (type)
@@ -920,9 +812,6 @@ namespace hwei
             if (idx >= 0 && now() < s_subject_lockout_until[idx])
                 return false;
 
-            if (is_subspell_on_local_cd(info))
-                return false;
-
             if (!is_spell_ready(ready_slot))
                 return false;
 
@@ -967,6 +856,12 @@ namespace hwei
             s_intent.followup_sent = false;
             s_intent.followup_sent_at = 0.f;
             s_intent.expected_followup_name = expected_followup_name(info);
+            // Explicitly clear per-cast modifiers so they never leak in from a
+            // previous intent, independent of reset_cast_engine zeroing s_intent.
+            s_intent.repredict = false;
+            s_intent.repredict_spell = {};
+            s_intent.repredict_hitchance = 0;
+            s_intent.lasthit_guard = false;
             s_last_observed_cast_name.clear();
             s_cast_state = cast_engine_state::selecting_subject;
 
@@ -2134,6 +2029,15 @@ namespace hwei
             if (queue_cast_intent(ABILITY_QQ, best_cast_pos, best_target, range))
             {
                 s_intent.lasthit_guard = true;
+                // Refresh the aim point at fire time so a minion that drifts during
+                // the subject-select delay is still led correctly (and minion-blocked
+                // shots are rejected). hitchance 0 = accept any valid minion prediction.
+                if (!s_intent.followup_sent)
+                {
+                    s_intent.repredict = true;
+                    s_intent.repredict_spell = s_pred_qq;
+                    s_intent.repredict_hitchance = 0;
+                }
                 execute_cast_engine();
                 return true;
             }
@@ -2720,9 +2624,6 @@ namespace hwei
         s_subject_lockout_until[0] = 0.f;
         s_subject_lockout_until[1] = 0.f;
         s_subject_lockout_until[2] = 0.f;
-        for (auto& row : s_subspell_ready_at)
-            for (auto& v : row)
-                v = 0.f;
         s_cached_subject = subject::none;
         s_subject_cache_authoritative = false;
         s_r_wait_started_at = 0.f;
@@ -2921,7 +2822,6 @@ namespace hwei
                 return;
 
             cache_selected_subject(subject::none, cast_name ? cast_name : "followup-process-cast");
-            register_subspell_cooldown(cast_name);
 
             if (cast_name && std::strcmp(cast_name, "HweiEE") == 0)
                 s_ee_qq_followup_until = now() + EE_QQ_FOLLOWUP_WINDOW;
