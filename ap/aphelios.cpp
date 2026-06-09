@@ -29,14 +29,22 @@ static constexpr uint32_t weapon_color( db::weapon w ) noexcept
     }
 }
 
-static constexpr float    HUD_TEXT_SIZE = 16.f;
 static constexpr float    HUD_TEXT_SMALL = 14.f;
 static constexpr float    HUD_LINE_H   = 20.f;
-static constexpr float    HUD_PAD_X    = 8.f;
-static constexpr float    HUD_PAD_Y    = 4.f;
-static constexpr uint32_t HUD_BG_COLOR = 0xAA1A1A2Eu;
 static constexpr uint32_t HUD_LABEL_COLOR = 0xFFAAAAAAu;
 static constexpr size_t   HUD_BUF_SIZE = 128u;
+
+static void draw_world_circle( const math::vector3& pos, float radius, uint32_t color_value )
+{
+    if ( sdk::shaders != nullptr )
+    {
+        sdk::shaders->draw_world_circle( pos, radius, 2.f, color( color_value ) );
+    }
+    else if ( g_sdk != nullptr && g_sdk->renderer != nullptr )
+    {
+        g_sdk->renderer->add_circle_3d( pos, radius, 2.f, color_value );
+    }
+}
 
 static constexpr const char* slot_label( int slot ) noexcept
 {
@@ -194,6 +202,7 @@ void aphelios::setup_combo_menu( menu_category* parent )
 void aphelios::on_init()
 {
     setup_spell( db::SLOT_Q, pred_sdk::spell_type::linear, pred_sdk::targetting_type::edge_to_edge );
+    setup_spell( db::SLOT_W, pred_sdk::spell_type::targetted, pred_sdk::targetting_type::center );
     apply_weapon_spell_params( db::weapon::calibrum );
 
     setup_spell( db::SLOT_R, pred_sdk::spell_type::circular, pred_sdk::targetting_type::edge_to_edge );
@@ -212,6 +221,10 @@ void aphelios::on_init()
     {
         draw_cat->add_checkbox( "draw_queue", "Draw Weapon Queue",
             draw_queue_, [this]( bool v ) { draw_queue_ = v; } );
+        draw_cat->add_checkbox( "draw_q_range", "Draw Calibrum Q Range",
+            draw_q_range_, [this]( bool v ) { draw_q_range_ = v; } );
+        draw_cat->add_checkbox( "draw_inf_q_range", "Draw Infernum Q Range",
+            draw_inf_q_range_, [this]( bool v ) { draw_inf_q_range_ = v; } );
     }
 
     auto* debug_cat = menu_->add_sub_category( "debug", "Debug" );
@@ -728,8 +741,7 @@ void aphelios::update_weapon_state()
 
     // First detection — init queue.
     if ( !queue_initialized_
-      && main_weapon_ != db::weapon::none
-      && offhand_weapon_ != db::weapon::none )
+      && main_weapon_ != db::weapon::none )
     {
         init_weapon_queue();
         if ( trace_weapon_queue_ )
@@ -953,58 +965,62 @@ db::weapon aphelios::next_weapon() const
 void aphelios::on_draw()
 {
     if ( player_ == nullptr || player_->is_dead() ) return;
-    if ( g_sdk->renderer == nullptr )               return;
-    if ( !draw_queue_ )                             return;
-    if ( !queue_initialized_ )                      return;
+    if ( sdk::shaders == nullptr && g_sdk->renderer == nullptr ) return;
 
     auto* r = g_sdk->renderer;
 
-    // Position: bottom-left of screen, above minimap.
-    const float screen_w = static_cast< float >( r->get_window_width() );
-    const float screen_h = static_cast< float >( r->get_window_height() );
-
-    const float box_w  = 200.f;
-    const float box_h  = HUD_PAD_Y + HUD_LINE_H * 3.f + HUD_PAD_Y;
-    const float box_x  = 10.f;
-    const float box_y  = screen_h - box_h - 200.f; // above minimap area
-
-    // Background.
-    r->add_rectangle_filled(
-        math::rect{ box_y, box_x, box_y + box_h, box_x + box_w },
-        HUD_BG_COLOR );
-
-    float y = box_y + HUD_PAD_Y;
-    const float x = box_x + HUD_PAD_X;
-
-    // Line 1: Main [ammo] | Off
+    if ( draw_q_range_ && main_weapon_ == db::weapon::calibrum )
     {
-        char buf[ HUD_BUF_SIZE ];
-        std::snprintf( buf, sizeof( buf ), "%s [%d]",
-                       db::weapon_label( main_weapon_ ), main_ammo_ );
-        r->add_text( buf, HUD_TEXT_SIZE, { x, y }, 0, weapon_color( main_weapon_ ) );
-
-        std::snprintf( buf, sizeof( buf ), "| %s [%d]",
-                       db::weapon_label( offhand_weapon_ ), offhand_ammo_ );
-        r->add_text( buf, HUD_TEXT_SIZE, { x + 100.f, y }, 0, weapon_color( offhand_weapon_ ) );
+        draw_world_circle( pos_, db::CALIBRUM_Q_RANGE, 0xFF22CCFFu );
     }
-    y += HUD_LINE_H;
 
-    // Line 2: Next -> weapon_queue_[0]
+    if ( draw_inf_q_range_ && main_weapon_ == db::weapon::infernum )
     {
-        r->add_text( "Next:", HUD_TEXT_SMALL, { x, y }, 0, HUD_LABEL_COLOR );
-        r->add_text( db::weapon_label( weapon_queue_[ 0 ] ),
-                     HUD_TEXT_SIZE, { x + 45.f, y }, 0, weapon_color( weapon_queue_[ 0 ] ) );
+        draw_world_circle( pos_, db::INFERNUM_Q_RANGE, 0xFFFF8800u );
     }
-    y += HUD_LINE_H;
 
-    // Line 3: Queue [1] -> [2]
+    if ( r != nullptr && draw_queue_ )
     {
-        char buf[ HUD_BUF_SIZE ];
-        std::snprintf( buf, sizeof( buf ), "%s > %s",
-                       db::weapon_label( weapon_queue_[ 1 ] ),
-                       db::weapon_label( weapon_queue_[ 2 ] ) );
-        r->add_text( buf, HUD_TEXT_SMALL, { x + 45.f, y }, 0, HUD_LABEL_COLOR );
-        r->add_text( "Then:", HUD_TEXT_SMALL, { x, y }, 0, HUD_LABEL_COLOR );
+        const auto screen = r->world_to_screen( pos_ );
+        float y = screen.y + 42.f;
+        const float x = screen.x - 70.f;
+
+        // Line 1: Main [ammo] | Off [ammo]
+        {
+            char buf[ HUD_BUF_SIZE ];
+            std::snprintf( buf, sizeof( buf ), "%s [%d] | %s [%d]",
+                           db::weapon_label( main_weapon_ ), main_ammo_,
+                           db::weapon_label( offhand_weapon_ ), offhand_ammo_ );
+            r->add_text( buf, HUD_TEXT_SMALL, { x, y }, 0, weapon_color( main_weapon_ ) );
+        }
+        y += HUD_LINE_H;
+
+        // Line 2: Next weapon.
+        {
+            char buf[ HUD_BUF_SIZE ];
+            const db::weapon next = queue_initialized_ ? weapon_queue_[ 0 ] : db::weapon::none;
+            std::snprintf( buf, sizeof( buf ), "Next: %s",
+                           queue_initialized_ ? db::weapon_label( next ) : "Detecting" );
+            r->add_text( buf, HUD_TEXT_SMALL, { x, y }, 0,
+                         queue_initialized_ ? weapon_color( next ) : HUD_LABEL_COLOR );
+        }
+        y += HUD_LINE_H;
+
+        // Line 3: Queue [1] -> [2].
+        {
+            char buf[ HUD_BUF_SIZE ];
+            if ( queue_initialized_ )
+            {
+                std::snprintf( buf, sizeof( buf ), "%s > %s",
+                               db::weapon_label( weapon_queue_[ 1 ] ),
+                               db::weapon_label( weapon_queue_[ 2 ] ) );
+            }
+            else
+            {
+                std::snprintf( buf, sizeof( buf ), "%s", "Waiting..." );
+            }
+            r->add_text( buf, HUD_TEXT_SMALL, { x, y }, 0, HUD_LABEL_COLOR );
+        }
     }
 }
 

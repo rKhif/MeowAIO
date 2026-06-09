@@ -265,6 +265,46 @@ namespace ahri
     }
 
     // ============================================================================
+    // REACHABILITY GATE (physics-based, independent of the SDK hitchance)
+    // ============================================================================
+    // Q decelerates 2500 -> 400 over its flight, so the raw projectile_speed
+    // badly underestimates travel time at range. Use an effective average for
+    // the reach math instead.
+    static constexpr float Q_REACH_SPEED = 1600.f;
+
+    // Estimates whether `target` can physically walk out of the spell's effective
+    // radius before it arrives, using:
+    //   travel_time = windup delay + (distance from us to the cast point / speed)
+    //   escape      = target move speed * total flight time   (how far it can relocate)
+    //   catch       = spell radius + target hitbox             (effective hit width)
+    // The shot is reliable when the catch radius covers at least `min_cover` of the
+    // escape distance. Immobile (CC'd) targets can't dodge, so they always pass.
+    static bool passes_reach_check(game_object* target,
+                                   const math::vector3& cast_pos,
+                                   float radius, float delay, float speed,
+                                   float min_cover)
+    {
+        if (!target) return false;
+        auto p = g_sdk->object_manager->get_local_player();
+        if (!p) return false;
+
+        // Stunned / charmed / rooted targets cannot move out of the radius.
+        if (immobile_duration(target) > 0.05f) return true;
+
+        const auto  src         = p->get_position();
+        const float travel_dist = src.distance(cast_pos);
+        const float travel_time = (speed > 0.f && speed < FLT_MAX)
+                                ? (travel_dist / speed) : 0.f;
+        const float total_time  = delay + travel_time;
+
+        const float escape  = std::max(0.f, target->get_move_speed()) * total_time;
+        const float catch_r = radius + target->get_bounding_radius();
+
+        if (escape <= 1.f) return true; // effectively can't relocate in the window
+        return catch_r >= escape * min_cover;
+    }
+
+    // ============================================================================
     // SPELL CASTS
     // ============================================================================
     static bool try_q(game_object* target, int hitchance)
@@ -279,6 +319,14 @@ namespace ahri
 
         auto pred = predict_q(target, hitchance);
         if (!pred.is_valid || pred.hitchance < hitchance) return false;
+
+        // Physics gate: tie the required radius coverage to the requested
+        // hitchance (higher hitchance setting -> demand the target be less able
+        // to walk out of the orb before it reaches the predicted point).
+        const float q_cover = std::min(0.95f, static_cast<float>(hitchance) / 100.f);
+        if (!passes_reach_check(target, pred.cast_position, spell_data::q_radius,
+                                spell_data::q_delay, Q_REACH_SPEED, q_cover))
+            return false;
 
         bool ok = sdk::common->cast_spell(SLOT_Q, pred.cast_position);
         if (ok) {
@@ -326,6 +374,13 @@ namespace ahri
 
         auto pred = predict_e(target, hitchance);
         if (!pred.is_valid || pred.hitchance < hitchance) return false;
+
+        // Physics gate: charm is a thin, slow missile, so verify the target
+        // can't simply outrun its effective radius before it lands.
+        const float e_cover = std::min(0.95f, static_cast<float>(hitchance) / 100.f);
+        if (!passes_reach_check(target, pred.cast_position, spell_data::e_radius,
+                                spell_data::e_delay, spell_data::e_speed, e_cover))
+            return false;
 
         if (target->is_hero() && e_blocked_by_minion(pred.cast_position))
             return false;

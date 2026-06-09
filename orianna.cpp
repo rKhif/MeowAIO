@@ -511,25 +511,33 @@ namespace orianna
         spell.targetting_type    = pred_sdk::targetting_type::center_to_edge;
         spell.spell_slot         = SLOT_Q;
         spell.range              = spell_data::q_range;
-        spell.radius             = spell_data::q_radius;
         spell.expected_hitchance = hitchance;
 
-        // Total time before the AOE detonates =
-        //   cast time + (ball-to-cast-point travel at ball_q_missile_speed)
-        // When the ball is on the player, pred handles the second term itself
-        // via projectile_speed (caster → cast point). When the ball is on the
-        // ground / on an ally, the missile flies from the ball — not the
-        // player — so we bake the ball→target distance into `delay` and tell
-        // pred the rest is instant.
+        // Effective hit radius = full detonation AOE + target's bounding radius.
+        // Using the conservative q_radius (87.5) under-reported reachable edge
+        // targets; q_effect_radius (175) is the actual hit circle radius.
+        const float bounding = target ? target->get_bounding_radius() : 0.f;
+        spell.radius = spell_data::q_effect_radius + bounding;
+
+        // Total time before the AOE detonates:
+        //   windup delay (0.25s) + ball travel time (ball_pos → cast point at 1400 u/s)
+        // On-self: SDK derives travel time from player→cast_point / speed.
+        // Off-self: ball launches from a non-player origin so we bake total
+        //   flight time into delay (FLT_MAX speed = instantaneous from SDK's view).
+        //   One refinement pass corrects for enemy movement during the windup +
+        //   rough travel window — crude estimate → predict enemy pos → recalculate.
         constexpr float Q_CAST_TIME = 0.25f;
         if (g_ball_state == ball_state::on_self) {
             spell.delay            = Q_CAST_TIME;
             spell.projectile_speed = spell_data::ball_q_missile_speed;
         } else if (target) {
-            const auto bp = get_ball_position();
-            const float ball_to_target = bp.distance(target->get_position());
-            spell.delay            = Q_CAST_TIME
-                                   + ball_to_target / spell_data::ball_q_missile_speed;
+            const auto  bp           = get_ball_position();
+            const float rough_travel = bp.distance(target->get_position())
+                                     / spell_data::ball_q_missile_speed;
+            const auto  refined_pos  = predict_position(target, Q_CAST_TIME + rough_travel);
+            const float final_travel = bp.distance(refined_pos)
+                                     / spell_data::ball_q_missile_speed;
+            spell.delay            = Q_CAST_TIME + final_travel;
             spell.projectile_speed = FLT_MAX;
         } else {
             spell.delay            = Q_CAST_TIME;

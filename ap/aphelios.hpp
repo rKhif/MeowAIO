@@ -254,6 +254,8 @@ namespace sora::champions
         uint32_t      gra_inf_target_id_       { 0u };
 
         bool  draw_queue_         { true };
+        bool  draw_q_range_       { true };
+        bool  draw_inf_q_range_   { true };
 
         bool  trace_manual_       { false };
         bool  trace_weapon_queue_ { false };

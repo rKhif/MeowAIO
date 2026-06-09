@@ -76,9 +76,12 @@ namespace hwei
         constexpr ability_info ABILITY_EE{ subject::torment,  SLOT_E, ability_cast::position };
         constexpr ability_info ABILITY_R { subject::none,      SLOT_R, ability_cast::position };
 
-        constexpr float MIN_CAST_INTERVAL = 0.08f;
+        constexpr float MIN_CAST_INTERVAL = 0.05f;
         constexpr float REQUEST_TIMEOUT = 1.25f;
         constexpr float SUBJECT_CONFIRM_DELAY = 0.30f;
+        // Delay after the game *confirms* the selector via process_cast — much shorter
+        // because the game has already registered the subject at that point.
+        constexpr float SUBJECT_CONFIRM_FAST_DELAY = 0.05f;
         constexpr float SUBJECT_RETRY_LOCKOUT = 0.55f;
         constexpr float EE_QQ_FOLLOWUP_WINDOW = 1.25f;
         constexpr float EW_ROOT_FOLLOWUP_DELAY = 0.75f;
@@ -398,7 +401,10 @@ namespace hwei
 
             s_pred_ew = {};
             s_pred_ew.spell_slot = SLOT_W;
-            s_pred_ew.spell_type = pred_sdk::spell_type::linear;
+            // Gaze of the Abyss is a ground-target zone (radius 350) thrown to a
+            // location, not a directional line. Model it as a circular AoE so the
+            // predicted cast point is the spot to drop the eye on, not a line endpoint.
+            s_pred_ew.spell_type = pred_sdk::spell_type::circular;
             s_pred_ew.targetting_type = pred_sdk::targetting_type::center;
             s_pred_ew.range = spell_data::ew_range;
             s_pred_ew.radius = spell_data::ew_radius;
@@ -2805,7 +2811,9 @@ namespace hwei
                     && s_intent.info.mood == selected_subject)
                 {
                     s_intent.selector_sent = true;
-                    s_intent.selector_sent_at = now();
+                    // Game confirmed the selector — fast-forward so follow-up fires
+                    // after SUBJECT_CONFIRM_FAST_DELAY instead of the full SUBJECT_CONFIRM_DELAY.
+                    s_intent.selector_sent_at = now() - (SUBJECT_CONFIRM_DELAY - SUBJECT_CONFIRM_FAST_DELAY);
                     s_cast_state = cast_engine_state::await_followup_window;
                 }
                 else if (s_intent.active && HWEI_DEBUG_LOGS && g_sdk)

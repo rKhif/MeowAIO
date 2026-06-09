@@ -222,6 +222,71 @@ namespace ryze
                 || pred.state == pred_sdk::prediction_state::awaiting_netvar_update;
         }
 
+        // Geometric post-validation of a Q prediction result.
+        //
+        // Checks four things from first principles:
+        //   1. Perpendicular distance from the missile line to the target's predicted
+        //      center must fit within the effective hit radius (Q_RADIUS + target hitbox).
+        //   2. Edge-to-edge range: target center must be within Q_RANGE + target_radius.
+        //   3. Precise total time: Q windup delay + flight time until the missile edge
+        //      first contacts the target edge.
+        //   4. Reachability: the distance the target would need to travel from its
+        //      current position to the predicted position must not exceed what it can
+        //      cover at its current move-speed within that total time (+ 15% buffer).
+        static bool verify_q_geometry(game_object* target, const pred_sdk::pred_data& pred)
+        {
+            auto* p = player();
+            if (!p || !target || !pred.is_valid) return false;
+
+            const float target_radius = target->get_bounding_radius();
+            const float eff_radius    = sc::Q_RADIUS + target_radius;
+
+            const auto player_pos = p->get_position();
+            const auto cast_pos   = pred.cast_position;
+            const auto pred_pos   = pred.predicted_position;
+
+            // Cast direction unit vector (x/z plane, matching distance())
+            const float dir_x  = cast_pos.x - player_pos.x;
+            const float dir_z  = cast_pos.z - player_pos.z;
+            const float dir_len = std::sqrt(dir_x * dir_x + dir_z * dir_z);
+            if (dir_len < 1.f) return false;
+
+            const float nx = dir_x / dir_len;
+            const float nz = dir_z / dir_len;
+
+            // Scalar projection of predicted target center onto missile direction
+            const float dpx  = pred_pos.x - player_pos.x;
+            const float dpz  = pred_pos.z - player_pos.z;
+            const float proj = dpx * nx + dpz * nz;
+            if (proj <= 0.f) return false;
+
+            // Perpendicular distance from predicted center to missile line
+            const float perp_x    = dpx - proj * nx;
+            const float perp_z    = dpz - proj * nz;
+            const float perp_dist = std::sqrt(perp_x * perp_x + perp_z * perp_z);
+            if (perp_dist > eff_radius) return false;
+
+            // Edge-to-edge range check
+            const float dist_center = player_pos.distance(pred_pos);
+            if (dist_center > sc::Q_RANGE + target_radius) return false;
+
+            // Precise forward distance at first missile-edge / target-edge contact:
+            //   proj - sqrt(eff_radius^2 - perp_dist^2)
+            const float inside_sq  = (std::max)(0.f, eff_radius * eff_radius - perp_dist * perp_dist);
+            const float hit_proj   = (std::max)(0.f, proj - std::sqrt(inside_sq));
+
+            // Total time = windup delay + flight
+            const float flight_time = hit_proj / sc::Q_SPEED;
+            const float total_time  = sc::Q_DELAY + flight_time;
+
+            // Reachability: target must be able to reach pred_pos within total_time
+            const float dist_to_pred = target->get_position().distance(pred_pos);
+            const float max_travel   = target->get_move_speed() * total_time * 1.15f;
+            if (dist_to_pred > max_travel) return false;
+
+            return true;
+        }
+
         static pred_sdk::pred_data predict_q(game_object* target, int hitchance)
         {
             pred_sdk::spell_data spell{};
@@ -253,6 +318,7 @@ namespace ryze
             const auto pred = predict_q(target, effective_hc);
             if (!pred.is_valid || pred.hitchance < effective_hc) return false;
             if (is_unstable_q_prediction(target, pred)) return false;
+            if (!verify_q_geometry(target, pred)) return false;
 
             const bool ok = sdk::common->cast_spell(SLOT_Q, pred.cast_position);
             if (ok) s_last_spell_cast_time = game_time();

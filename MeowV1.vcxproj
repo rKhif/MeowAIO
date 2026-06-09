@@ -152,10 +152,13 @@
     <ClInclude Include="..\sm_sdk.hpp" />
     <ClInclude Include="..\ts_sdk.hpp" />
     <ClInclude Include="aphelios.h" />
+    <ClInclude Include="champs\aurora.hpp" />
+    <ClInclude Include="champs\milio\data.h" />
     <ClInclude Include="mel.h" />
     <ClInclude Include="mel_spell_db.hpp" />
     <ClInclude Include="annie.h" />
     <ClInclude Include="taliyah.h" />
+    <ClInclude Include="milio.h" />
     <ClInclude Include="ahri.h" />
     <ClInclude Include="hwei.h" />
     <ClInclude Include="jax.h" />
@@ -171,9 +174,12 @@
   <ItemGroup>
     <ClCompile Include="..\main.cpp" />
     <ClCompile Include="aphelios.cpp" />
+    <ClCompile Include="champs\aurora.cpp" />
+    <ClCompile Include="champs\milio\data.cpp" />
     <ClCompile Include="mel.cpp" />
     <ClCompile Include="annie.cpp" />
     <ClCompile Include="taliyah.cpp" />
+    <ClCompile Include="milio.cpp" />
     <ClCompile Include="ahri.cpp" />
     <ClCompile Include="hwei.cpp" />
     <ClCompile Include="jax.cpp" />

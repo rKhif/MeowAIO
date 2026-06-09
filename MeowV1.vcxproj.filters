@@ -102,6 +102,9 @@
     <ClInclude Include="taliyah.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="milio.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="ahri.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -112,6 +115,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="jax.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="champs\aurora.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="champs\milio\data.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
@@ -149,6 +158,9 @@
     <ClCompile Include="taliyah.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="milio.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="ahri.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -159,6 +171,12 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="jax.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="champs\aurora.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="champs\milio\data.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

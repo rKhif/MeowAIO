@@ -25,9 +25,9 @@ namespace hwei
         constexpr float qw_radius = 225.f;
 
         constexpr float qe_range  = 1250.f;
-        constexpr float qe_delay  = 0.35f;
+        constexpr float qe_delay  = 0.70f; // path erupts 0.7s after cast (0.35 windup is only the lock animation)
         constexpr float qe_radius = 110.f;
-        constexpr float qe_speed  = 1500.f;
+        constexpr float qe_speed  = 1500.f; // shockwaves march outward from the cast point
 
         // W-subject (Serenity)
         constexpr float wq_range  = 1200.f;
@@ -45,7 +45,7 @@ namespace hwei
         constexpr float eq_speed  = 1300.f;
 
         constexpr float ew_range  = 900.f;
-        constexpr float ew_delay  = 0.95f; // 0.3s cast + 0.65s maw erupt delay
+        constexpr float ew_delay  = 0.95f; // 0.25s cast + 0.7s until the eye locks on and launches
         constexpr float ew_radius = 350.f;
         constexpr float ew_speed  = 1700.f;
 

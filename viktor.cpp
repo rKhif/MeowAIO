@@ -370,10 +370,37 @@ namespace viktor
         if (!player || obj != player) return;
         const int slot = cast->get_spell_slot();
         if (slot != SLOT_R) return;
-        // Skip recast/move commands — those reuse the R slot but should leave
-        // the original cast position untouched.
+
+        // The R slot fires two different spells: "ViktorR" is the genuine cast
+        // that spawns the storm, while "ViktorRGuide" is the manual redirect
+        // (recast) used to move an already-active storm. A redirect must NOT
+        // reset the storm start time / timer — it only retargets it.
+        const char* sname = nullptr;
+        if (auto* sd = cast->get_spell_data())
+            if (auto* ssd = sd->get_static_data())
+                sname = ssd->get_name();
+        const std::string nm = sname ? sname : "";
+        const bool is_redirect = nm.find("Guide") != std::string::npos
+                              || nm.find("guide") != std::string::npos;
+
         const float now = g_sdk->clock_facade->get_game_time();
-        r_storm_active = true;
+        const auto  cp  = cast->get_end_pos();
+        const bool  cp_ok = (cp.x != 0.f || cp.y != 0.f || cp.z != 0.f);
+
+        if (is_redirect)
+        {
+            // Manual move command: keep the original start time / countdown,
+            // only track the new destination so position estimates follow it.
+            if (r_storm_active && cp_ok)
+            {
+                r_cast_pos       = cp;
+                r_cast_pos_valid = true;
+            }
+            return;
+        }
+
+        // Genuine R cast — start a fresh storm.
+        r_storm_active  = true;
         r_storm_start_t = now;
 
         // Fresh storm cast should not inherit hysteresis from a previous storm.
@@ -381,8 +408,7 @@ namespace viktor
         last_r_move_pos = {};
         last_r_move_score = 0.f;
 
-        const auto cp = cast->get_end_pos();
-        if (cp.x != 0.f || cp.y != 0.f || cp.z != 0.f)
+        if (cp_ok)
         {
             r_cast_pos       = cp;
             r_cast_pos_valid = true;
@@ -1528,13 +1554,26 @@ namespace viktor
                               : r_cast_pos_valid ? r_cast_pos
                                                  : player->get_position();
 
-        // Forced TS overrides multi-target scoring.
+        // Manual target selection overrides multi-target scoring: when the
+        // player has locked a target (forced) or is actively selecting one via
+        // the target selector (click/hover manual mode), steer the storm to
+        // chase that specific target instead of the cluster centroid.
         if (sdk::target_selector)
         {
-            game_object* forced = sdk::target_selector->get_forced_target();
-            if (forced && is_valid_target(forced))
+            game_object* sel = sdk::target_selector->get_forced_target();
+
+            if ((!sel || !is_valid_target(sel))
+                && menu::auto_r_follow_selected
+                && sdk::target_selector->get_manual_target_mode() != 0)
             {
-                move_r_to_target(forced);
+                game_object* clicked = sdk::target_selector->get_hero_target();
+                if (clicked && is_valid_target(clicked))
+                    sel = clicked;
+            }
+
+            if (sel && is_valid_target(sel))
+            {
+                move_r_to_target(sel);
                 return;
             }
         }
@@ -2431,6 +2470,7 @@ namespace viktor
         if (target->is_monster() && !target->is_visible()) return false;
         if (is_in_stasis(target)) return false;
         if (is_damage_immune(target)) return false;
+        if (target->has_buff_of_type(buff_type::spell_shield)) return false;
 
         if (!g_sdk->clock_facade) return false;
         const float now_e = g_sdk->clock_facade->get_game_time();
@@ -2517,14 +2557,23 @@ namespace viktor
         }
         else
         {
-            // Moving target: fixed-point intercept. Lead by velocity over the
-            // current time-to-hit, recompute the time at that spot, repeat.
-            // Champion speed << laser speed, so this settles in 2-3 passes.
+            // Moving target: fixed-point intercept. Lead by the target's full
+            // path graph via predict_on_path (handles corner turns / waypoints
+            // correctly). Falls back to linear extrapolation if the SDK is
+            // unavailable. Converges in 2-3 passes since champion speed << laser speed.
             for (int i = 0; i < 4; ++i)
             {
                 const float t = time_to_reach(distance_2d(ppos, aim));
-                const math::vector3 next = { tpos.x + vel.x * t, tpos.y,
-                                             tpos.z + vel.z * t };
+                math::vector3 next{};
+                if (sdk::prediction)
+                {
+                    try { next = sdk::prediction->predict_on_path(target, t); }
+                    catch (...) { next = { tpos.x + vel.x * t, tpos.y, tpos.z + vel.z * t }; }
+                }
+                else
+                {
+                    next = { tpos.x + vel.x * t, tpos.y, tpos.z + vel.z * t };
+                }
                 const bool converged = distance_2d(next, aim) < 5.f;
                 aim = next;
                 if (converged) break;
@@ -2973,6 +3022,7 @@ namespace viktor
         r_menu->add_checkbox("only_kill", "Only if Killable", menu::r_only_killable, [](bool v) { menu::r_only_killable = v; });
         r_menu->add_slider_int("min_enemies", "Min Enemies", 1, 5, 1, menu::min_enemies_for_r, [](int v) { menu::min_enemies_for_r = v; });
         r_menu->add_checkbox("auto_move", "Auto Move", menu::auto_r_movement, [](bool v) { menu::auto_r_movement = v; });
+        r_menu->add_checkbox("auto_move_selected", "Auto Move: Follow Selected Target", menu::auto_r_follow_selected, [](bool v) { menu::auto_r_follow_selected = v; });
         r_menu->add_checkbox("draw_range", "Draw Range", menu::draw_r_range, [](bool v) { menu::draw_r_range = v; });
         r_menu->add_hotkey("semi_r", "Semi-Manual R", 'Y', false, false,
             [](std::string* key, bool val)
