@@ -35,34 +35,24 @@ namespace hwei
             ability_cast cast_type;
         };
 
-        enum class cast_engine_state : uint8_t
-        {
-            idle,
-            selecting_subject,
-            await_followup_window,
-            casting_followup,
-        };
-
-        struct cast_intent
+        struct pending_cast
         {
             bool active = false;
             ability_info info{};
             math::vector3 cast_pos{};
             game_object* target = nullptr;
-            float max_cast_range = FLT_MAX;
-            float timeout_at = 0.f;
-            bool selector_sent = false;
-            float selector_sent_at = 0.f;
-            bool followup_sent = false;
-            float followup_sent_at = 0.f;
-            const char* expected_followup_name = nullptr;
+            float max_range = FLT_MAX;
+            float fire_at = 0.f;    // earliest time the follow-up may be sent
+            float expire_at = 0.f;  // abort if still pending at this time
             bool repredict = false;
             pred_sdk::spell_data repredict_spell{};
             int repredict_hitchance = 0;
-            // When set, the engine keeps re-validating the (minion) target right
-            // up to the moment the shot fires and aborts if it has died or is no
-            // longer last-hittable. Prevents wasting QQ on an already-dead minion.
+            // Keeps re-validating the (minion) target right up to the moment the
+            // shot fires and aborts if it has died or is no longer last-hittable.
             bool lasthit_guard = false;
+            // Set after fire_followup succeeds; cleared by on_process_cast confirmation.
+            // Keeps consume_cast_engine_busy returning true until the game confirms the cast.
+            bool followup_fired = false;
         };
 
         constexpr ability_info ABILITY_QQ{ subject::disaster, SLOT_Q, ability_cast::position };
@@ -84,6 +74,7 @@ namespace hwei
         constexpr float SUBJECT_CONFIRM_FAST_DELAY = 0.05f;
         constexpr float SUBJECT_RETRY_LOCKOUT = 0.55f;
         constexpr float EE_QQ_FOLLOWUP_WINDOW = 1.25f;
+        constexpr float EW_QW_FOLLOWUP_WINDOW = 1.25f;
         constexpr float EW_ROOT_FOLLOWUP_DELAY = 0.75f;
         // Max time the teamfight combo stalls QE/QW while waiting for R to land.
         constexpr float TEAMFIGHT_R_WAIT = 2.0f;
@@ -103,8 +94,7 @@ namespace hwei
         static float s_ee_qq_followup_until = 0.f;
         static float s_ew_qw_followup_ready_at = 0.f;
         static float s_ew_qw_followup_until = 0.f;
-        static cast_engine_state s_cast_state = cast_engine_state::idle;
-        static cast_intent s_intent{};
+        static pending_cast s_pending{};
         static float s_subject_lockout_until[3] = {};
         static uint32_t s_infotab_combo_mode = 0;
         static uint32_t s_infotab_bind_qw   = 0;
@@ -118,7 +108,7 @@ namespace hwei
         static subject s_cached_subject = subject::none;
         static bool s_subject_cache_authoritative = false;
 
-        bool execute_cast_engine();
+        bool tick_pending();
         float get_qq_damage(game_object* target);
 
         inline float now()
@@ -561,9 +551,10 @@ namespace hwei
 
         bool is_expected_followup_name(const char* name)
         {
-            if (!name || !s_intent.active || !s_intent.expected_followup_name)
+            if (!name || !s_pending.active)
                 return false;
-            return std::strcmp(name, s_intent.expected_followup_name) == 0;
+            const char* expected = expected_followup_name(s_pending.info);
+            return expected && std::strcmp(name, expected) == 0;
         }
 
         const char* cast_type_name(ability_cast type)
@@ -633,28 +624,11 @@ namespace hwei
                 prediction.collided_units.size());
         }
 
-        const char* cast_state_name(cast_engine_state state)
+        std::string pending_target_name()
         {
-            switch (state)
-            {
-            case cast_engine_state::idle:
-                return "idle";
-            case cast_engine_state::selecting_subject:
-                return "selecting_subject";
-            case cast_engine_state::await_followup_window:
-                return "await_followup_window";
-            case cast_engine_state::casting_followup:
-                return "casting_followup";
-            default:
-                return "unknown";
-            }
-        }
-
-        std::string intent_target_name()
-        {
-            if (!s_intent.active || !s_intent.target)
+            if (!s_pending.active || !s_pending.target)
                 return "none";
-            return s_intent.target->get_name();
+            return s_pending.target->get_name();
         }
 
         void apply_subject_lockout(subject mood)
@@ -683,9 +657,9 @@ namespace hwei
         {
             if (is_casting())
                 return true;
-            if (s_intent.active)
+            if (s_pending.active)
             {
-                execute_cast_engine();
+                tick_pending();
                 return true;
             }
             return is_subject_lockout_active();
@@ -693,42 +667,40 @@ namespace hwei
 
         bool cast_or_busy(bool attempted)
         {
-            return attempted || s_intent.active;
+            return attempted || s_pending.active;
         }
 
-        bool cast_hwei_spell(game_object* player, const cast_intent& request)
+        bool fire_followup(game_object* player, const pending_cast& req)
         {
-            if (!player || !request.active)
+            if (!player || !req.active)
                 return false;
 
-            const int subject_spell_slot = subject_slot(request.info.mood);
-            const int followup_slot = request.info.slot;
+            const int followup_slot = req.info.slot;
 
             if (HWEI_DEBUG_LOGS && g_sdk)
             {
-                g_sdk->log_console("[MeowAIO] followup send expected=%s subject_slot=%d followup_slot=%d type=%s backend=exposed-sdk",
-                    request.expected_followup_name ? request.expected_followup_name : "unknown",
-                    subject_spell_slot,
+                g_sdk->log_console("[MeowAIO] followup send expected=%s followup_slot=%d type=%s",
+                    expected_followup_name(req.info) ? expected_followup_name(req.info) : "unknown",
                     followup_slot,
-                    cast_type_name(request.info.cast_type));
+                    cast_type_name(req.info.cast_type));
             }
 
-            switch (request.info.cast_type)
+            switch (req.info.cast_type)
             {
             case ability_cast::position:
-                if (request.max_cast_range < FLT_MAX
-                    && player->get_position().distance(request.cast_pos) > request.max_cast_range)
+                if (req.max_range < FLT_MAX
+                    && player->get_position().distance(req.cast_pos) > req.max_range)
                     return false;
-                if (sdk::common && sdk::common->cast_spell(followup_slot, request.cast_pos))
+                if (sdk::common && sdk::common->cast_spell(followup_slot, req.cast_pos))
                     return true;
-                player->cast_spell(followup_slot, request.cast_pos);
+                player->cast_spell(followup_slot, req.cast_pos);
                 return true;
             case ability_cast::target:
-                if (!request.target)
+                if (!req.target)
                     return false;
-                if (sdk::common && sdk::common->cast_spell(followup_slot, request.target))
+                if (sdk::common && sdk::common->cast_spell(followup_slot, req.target))
                     return true;
-                player->cast_spell(followup_slot, request.target);
+                player->cast_spell(followup_slot, req.target);
                 return true;
             case ability_cast::self:
                 if (sdk::common && sdk::common->cast_spell(followup_slot))
@@ -765,39 +737,28 @@ namespace hwei
             return true;
         }
 
-        void reset_cast_engine(bool apply_lockout = false, const char* reason = nullptr)
+        void clear_pending(bool apply_lockout = false, const char* reason = nullptr)
         {
-            if (apply_lockout && s_intent.active)
+            if (apply_lockout && s_pending.active)
             {
                 if (HWEI_DEBUG_LOGS && g_sdk)
                 {
-                    const std::string target_name = intent_target_name();
-                    g_sdk->log_console("[MeowAIO] reset reason=%s state=%s expected=%s observed=%s subject=%d followup=%d target=%s lockout=%.2fs",
+                    const std::string target_name = pending_target_name();
+                    g_sdk->log_console("[MeowAIO] clear reason=%s expected=%s observed=%s subject=%d followup=%d target=%s lockout=%.2fs",
                         reason ? reason : "timeout",
-                        cast_state_name(s_cast_state),
-                        s_intent.expected_followup_name ? s_intent.expected_followup_name : "unknown",
+                        expected_followup_name(s_pending.info) ? expected_followup_name(s_pending.info) : "unknown",
                         s_last_observed_cast_name.empty() ? "none" : s_last_observed_cast_name.c_str(),
-                        static_cast<int>(s_intent.info.mood),
-                        s_intent.info.slot,
+                        static_cast<int>(s_pending.info.mood),
+                        s_pending.info.slot,
                         target_name.c_str(),
                         SUBJECT_RETRY_LOCKOUT);
                 }
-                apply_subject_lockout(s_intent.info.mood);
+                apply_subject_lockout(s_pending.info.mood);
             }
-            if (s_intent.active && (apply_lockout || (reason && std::strcmp(reason, "confirmed-followup") == 0)))
+            if (s_pending.active && (apply_lockout || (reason && std::strcmp(reason, "confirmed-followup") == 0)))
                 cache_selected_subject(subject::none, reason ? reason : "reset");
-            s_cast_state = cast_engine_state::idle;
-            s_intent = {};
+            s_pending = {};
             s_last_observed_cast_name.clear();
-        }
-
-        void forget_subject_if_needed()
-        {
-            if (!s_intent.active)
-                return;
-            if (now() <= s_intent.timeout_at)
-                return;
-            reset_cast_engine(true, "timeout");
         }
 
         bool can_queue_subject_cast(const ability_info& info)
@@ -824,94 +785,109 @@ namespace hwei
             return true;
         }
 
-        bool queue_cast_intent(const ability_info& info, const math::vector3& cast_pos, game_object* target, float max_cast_range = FLT_MAX, float timeout = REQUEST_TIMEOUT)
+        bool start_cast(const ability_info& info, const math::vector3& cast_pos, game_object* target, float max_range = FLT_MAX, float timeout = REQUEST_TIMEOUT)
         {
             auto* player = get_player();
             if (!player) return false;
 
-            if (info.cast_type == ability_cast::position && max_cast_range < FLT_MAX)
+            if (info.cast_type == ability_cast::position && max_range < FLT_MAX)
             {
-                if (player->get_position().distance(cast_pos) > max_cast_range)
+                if (player->get_position().distance(cast_pos) > max_range)
                     return false;
             }
 
             if (!can_queue_subject_cast(info))
                 return false;
 
-            if (s_intent.active)
+            if (s_pending.active)
             {
-                if (s_intent.info.mood != info.mood || s_intent.info.slot != info.slot)
+                if (s_pending.info.mood != info.mood || s_pending.info.slot != info.slot)
                     return false;
-                if (!s_intent.followup_sent)
-                {
-                    s_intent.cast_pos = cast_pos;
-                    s_intent.target = target;
-                    s_intent.max_cast_range = max_cast_range;
-                }
+                if (s_pending.followup_fired)
+                    return true; // already in-flight, don't overwrite
+                // Same spell still waiting to fire — update aim point so the follow-up
+                // stays accurate if the target has moved since the first queue.
+                s_pending.cast_pos = cast_pos;
+                s_pending.target   = target;
+                s_pending.max_range = max_range;
                 return true;
             }
 
-            s_intent.active = true;
-            s_intent.info = info;
-            s_intent.cast_pos = cast_pos;
-            s_intent.target = target;
-            s_intent.max_cast_range = max_cast_range;
-            s_intent.timeout_at = now() + timeout;
-            s_intent.selector_sent = false;
-            s_intent.selector_sent_at = 0.f;
-            s_intent.followup_sent = false;
-            s_intent.followup_sent_at = 0.f;
-            s_intent.expected_followup_name = expected_followup_name(info);
-            // Explicitly clear per-cast modifiers so they never leak in from a
-            // previous intent, independent of reset_cast_engine zeroing s_intent.
-            s_intent.repredict = false;
-            s_intent.repredict_spell = {};
-            s_intent.repredict_hitchance = 0;
-            s_intent.lasthit_guard = false;
             s_last_observed_cast_name.clear();
-            s_cast_state = cast_engine_state::selecting_subject;
+
+            float fire_at;
+            if (info.mood == subject::none)
+            {
+                fire_at = now(); // R: no selector step, fire immediately
+            }
+            else if (get_game_subject() == info.mood)
+            {
+                fire_at = now() + 0.02f; // subject already active — minimal settle time
+            }
+            else
+            {
+                send_hwei_selector(player, info.mood);
+                fire_at = now() + SUBJECT_CONFIRM_DELAY;
+            }
+
+            s_pending.active   = true;
+            s_pending.info     = info;
+            s_pending.cast_pos = cast_pos;
+            s_pending.target   = target;
+            s_pending.max_range = max_range;
+            s_pending.fire_at  = fire_at;
+            s_pending.expire_at = now() + timeout;
+            s_pending.repredict = false;
+            s_pending.repredict_spell = {};
+            s_pending.repredict_hitchance = 0;
+            s_pending.lasthit_guard = false;
 
             if (HWEI_DEBUG_LOGS && g_sdk)
             {
-                g_sdk->log_console("[MeowAIO] queue expected=%s subject=%d subject_slot=%d followup=%d type=%s",
-                    s_intent.expected_followup_name ? s_intent.expected_followup_name : "unknown",
+                g_sdk->log_console("[MeowAIO] start expected=%s subject=%d followup=%d type=%s fire_in=%.2fs",
+                    expected_followup_name(info) ? expected_followup_name(info) : "unknown",
                     static_cast<int>(info.mood),
-                    subject_slot(info.mood),
                     info.slot,
-                    cast_type_name(info.cast_type));
+                    cast_type_name(info.cast_type),
+                    fire_at - now());
             }
             return true;
         }
 
-        bool execute_cast_engine()
+        bool tick_pending()
         {
-            if (!s_intent.active)
+            if (!s_pending.active)
                 return false;
 
             auto* player = get_player();
             if (!player)
             {
-                reset_cast_engine(true, "invalid-player");
+                clear_pending(true, "invalid-player");
                 return false;
             }
 
             const float t = now();
-            if (t > s_intent.timeout_at)
+
+            if (t > s_pending.expire_at)
             {
-                reset_cast_engine(true, "timeout");
+                clear_pending(true, "timeout");
                 return false;
             }
+
+            // Follow-up was already sent; stay busy until on_process_cast confirms it.
+            if (s_pending.followup_fired)
+                return true;
 
             if (t - s_last_cast_time < MIN_CAST_INTERVAL)
                 return false;
 
-            // Last-hit safety: keep re-checking the minion up to the moment we
-            // fire. The subject-select + cast delay is long enough for the minion
-            // to die (our auto, allied minions) or to no longer be killable, in
-            // which case firing QQ just wastes the cast.
-            if (s_intent.lasthit_guard && !s_intent.followup_sent)
+            if (t < s_pending.fire_at)
+                return false;
+
+            // Lasthit guard: abort if the minion target is no longer killable.
+            if (s_pending.lasthit_guard)
             {
-                auto* tgt = s_intent.target;
+                auto* tgt = s_pending.target;
                 bool abort = (!tgt || !tgt->is_valid() || tgt->is_dead() || !tgt->is_targetable());
                 if (!abort)
                 {
@@ -920,155 +896,75 @@ namespace hwei
                     float hp = tgt->get_hp();
                     if (sdk::health_prediction)
                     {
-                        const float pred_hp = sdk::health_prediction->get_predicted_health(tgt, now() + hit_time);
+                        const float pred_hp = sdk::health_prediction->get_predicted_health(tgt, t + hit_time);
                         if (pred_hp >= 0.f)
                             hp = pred_hp;
                     }
-                    const float dmg = get_qq_damage(tgt);
-                    // Already dying to other damage, or no longer lethal -> skip.
-                    if (hp <= 0.f || hp > dmg)
+                    if (hp <= 0.f || hp > get_qq_damage(tgt))
                         abort = true;
                 }
                 if (abort)
                 {
-                    reset_cast_engine(false, "lasthit-target-gone");
+                    clear_pending(false, "lasthit-target-gone");
                     return false;
                 }
             }
 
-            if (s_intent.info.mood == subject::none)
+            // Repredict: refresh aim point at fire time so a drifting target is
+            // still led correctly and out-of-range predictions are rejected.
+            if (s_pending.repredict
+                && s_pending.target
+                && s_pending.info.cast_type == ability_cast::position
+                && sdk::prediction
+                && is_valid_target(s_pending.target, FLT_MAX))
+            {
+                s_pending.repredict_spell.source = player;
+                s_pending.repredict_spell.source_position = player->get_position();
+                s_pending.repredict_spell.expected_hitchance = s_pending.repredict_hitchance;
+
+                auto fresh = sdk::prediction->predict(s_pending.target, s_pending.repredict_spell);
+                if (fresh.is_valid && fresh.hitchance >= s_pending.repredict_hitchance)
+                {
+                    const float fresh_dist = player->get_position().distance(fresh.cast_position);
+                    const bool in_range = s_pending.max_range >= FLT_MAX
+                        || fresh_dist <= s_pending.max_range;
+                    const bool blocked = s_pending.info.mood == subject::disaster
+                        && s_pending.info.slot == SLOT_Q
+                        && line_blocked_by_enemy_minion(fresh.cast_position, s_pending.repredict_spell.radius, s_pending.target);
+                    if (in_range && !blocked)
+                        s_pending.cast_pos = fresh.cast_position;
+                }
+            }
+
+            // R (subject::none) fires via common/cast_spell directly, no selector.
+            if (s_pending.info.mood == subject::none)
             {
                 bool casted = false;
-                switch (s_intent.info.cast_type)
+                if (s_pending.max_range < FLT_MAX
+                    && player->get_position().distance(s_pending.cast_pos) > s_pending.max_range)
+                    return false;
+                if (sdk::common)
+                    casted = sdk::common->cast_spell(s_pending.info.slot, s_pending.cast_pos);
+                else
                 {
-                case ability_cast::position:
-                    if (s_intent.max_cast_range < FLT_MAX
-                        && player->get_position().distance(s_intent.cast_pos) > s_intent.max_cast_range)
-                        return false;
-                    if (sdk::common)
-                        casted = sdk::common->cast_spell(s_intent.info.slot, s_intent.cast_pos);
-                    else
-                    {
-                        player->cast_spell(s_intent.info.slot, s_intent.cast_pos);
-                        casted = true;
-                    }
-                    break;
-                case ability_cast::target:
-                    if (s_intent.target)
-                    {
-                        if (sdk::common)
-                            casted = sdk::common->cast_spell(s_intent.info.slot, s_intent.target);
-                        else
-                        {
-                            player->cast_spell(s_intent.info.slot, s_intent.target);
-                            casted = true;
-                        }
-                    }
-                    break;
-                case ability_cast::self:
-                    if (sdk::common)
-                        casted = sdk::common->cast_spell(s_intent.info.slot);
-                    else
-                    {
-                        player->cast_spell(s_intent.info.slot);
-                        casted = true;
-                    }
-                    break;
+                    player->cast_spell(s_pending.info.slot, s_pending.cast_pos);
+                    casted = true;
                 }
                 if (casted)
                 {
                     s_last_cast_time = t;
-                    reset_cast_engine(false, "subjectless-cast-sent");
+                    clear_pending(false, "subjectless-cast-sent");
                     return true;
                 }
                 return false;
             }
 
-            const subject live_subject = get_game_subject();
-
-            if (s_cast_state == cast_engine_state::selecting_subject)
+            const bool fired = fire_followup(player, s_pending);
+            if (fired)
             {
-                if (live_subject == s_intent.info.mood)
-                {
-                    s_cast_state = cast_engine_state::await_followup_window;
-                    if (s_intent.selector_sent_at <= 0.f)
-                        s_intent.selector_sent_at = t;
-                }
-                else if (!s_intent.selector_sent)
-                {
-                    if (!send_hwei_selector(player, s_intent.info.mood))
-                    {
-                        reset_cast_engine(true, "selector-send-failed");
-                        return false;
-                    }
-                    s_intent.selector_sent = true;
-                    s_intent.selector_sent_at = t;
-                    s_cast_state = cast_engine_state::await_followup_window;
-                    if (HWEI_DEBUG_LOGS && g_sdk)
-                    {
-                        g_sdk->log_console("[MeowAIO] selector sent expected=%s subject=%d subject_slot=%d",
-                            s_intent.expected_followup_name ? s_intent.expected_followup_name : "unknown",
-                            static_cast<int>(s_intent.info.mood),
-                            subject_slot(s_intent.info.mood));
-                    }
-                    return false;
-                }
-                else
-                {
-                    s_cast_state = cast_engine_state::await_followup_window;
-                }
-            }
-
-            if (s_cast_state == cast_engine_state::await_followup_window)
-            {
-                if (t - s_intent.selector_sent_at < SUBJECT_CONFIRM_DELAY)
-                    return false;
-
-                if (s_intent.followup_sent)
-                {
-                    s_cast_state = cast_engine_state::casting_followup;
-                    return false;
-                }
-
-                // Re-predict the aim point at the moment the followup actually fires.
-                // The subject-select step plus the spell's own cast delay let the target
-                // drift far from the position computed at queue time, which both misses
-                // moving targets and can push the frozen point out of range (spinning until
-                // timeout). Refreshing here keeps the cast accurate and in range.
-                if (s_intent.repredict
-                    && s_intent.target
-                    && s_intent.info.cast_type == ability_cast::position
-                    && sdk::prediction
-                    && is_valid_target(s_intent.target, FLT_MAX))
-                {
-                    s_intent.repredict_spell.source = player;
-                    s_intent.repredict_spell.source_position = player->get_position();
-                    s_intent.repredict_spell.expected_hitchance = s_intent.repredict_hitchance;
-
-                    auto fresh = sdk::prediction->predict(s_intent.target, s_intent.repredict_spell);
-                    if (fresh.is_valid && fresh.hitchance >= s_intent.repredict_hitchance)
-                    {
-                        const float fresh_dist = player->get_position().distance(fresh.cast_position);
-                        const bool in_range = s_intent.max_cast_range >= FLT_MAX
-                            || fresh_dist <= s_intent.max_cast_range;
-                        const bool blocked = s_intent.info.mood == subject::disaster
-                            && s_intent.info.slot == SLOT_Q
-                            && line_blocked_by_enemy_minion(fresh.cast_position, s_intent.repredict_spell.radius, s_intent.target);
-                        if (in_range && !blocked)
-                            s_intent.cast_pos = fresh.cast_position;
-                    }
-                }
-
-                const bool casted = cast_hwei_spell(player, s_intent);
-
-                if (casted)
-                {
-                    s_last_cast_time = t;
-                    s_intent.followup_sent = true;
-                    s_intent.followup_sent_at = t;
-                    s_cast_state = cast_engine_state::casting_followup;
-                    return false;
-                }
+                s_last_cast_time = t;
+                s_pending.followup_fired = true; // stay busy until on_process_cast confirms
+                return true;
             }
 
             return false;
@@ -1115,15 +1011,15 @@ namespace hwei
             if (std::strcmp(pred_result, "collision") == 0)
                 return false;
 
-            if (!queue_cast_intent(info, prediction.cast_position, target, base_spell.range))
+            if (!start_cast(info, prediction.cast_position, target, base_spell.range))
                 return false;
-            if (!s_intent.followup_sent)
+            if (!s_pending.repredict)
             {
-                s_intent.repredict = true;
-                s_intent.repredict_spell = base_spell;
-                s_intent.repredict_hitchance = hitchance;
+                s_pending.repredict = true;
+                s_pending.repredict_spell = base_spell;
+                s_pending.repredict_hitchance = hitchance;
             }
-            return execute_cast_engine();
+            return tick_pending();
         }
 
         bool try_cast_circular(const ability_info& info, pred_sdk::spell_data base_spell, int hitchance)
@@ -1160,15 +1056,15 @@ namespace hwei
             if (cast_dist > base_spell.range)
                 return false;
 
-            if (!queue_cast_intent(info, prediction.cast_position, target, base_spell.range))
+            if (!start_cast(info, prediction.cast_position, target, base_spell.range))
                 return false;
-            if (!s_intent.followup_sent)
+            if (!s_pending.repredict)
             {
-                s_intent.repredict = true;
-                s_intent.repredict_spell = base_spell;
-                s_intent.repredict_hitchance = hitchance;
+                s_pending.repredict = true;
+                s_pending.repredict_spell = base_spell;
+                s_pending.repredict_hitchance = hitchance;
             }
-            return execute_cast_engine();
+            return tick_pending();
         }
 
         bool try_cast_qq(int hitchance)
@@ -1202,9 +1098,9 @@ namespace hwei
             if (line_blocked_by_enemy_minion(cast_pos, s_pred_qq.radius, target))
                 return false;
 
-            if (!queue_cast_intent(ABILITY_QQ, cast_pos, target, s_pred_qq.range))
+            if (!start_cast(ABILITY_QQ, cast_pos, target, s_pred_qq.range))
                 return false;
-            return execute_cast_engine();
+            return tick_pending();
         }
 
         bool try_cast_qw(int hitchance)
@@ -1244,10 +1140,10 @@ namespace hwei
             if (cast_dist > spell.range)
                 return false;
 
-            if (!queue_cast_intent(ABILITY_QW, prediction.cast_position, target, spell.range))
+            if (!start_cast(ABILITY_QW, prediction.cast_position, target, spell.range))
                 return false;
 
-            return execute_cast_engine();
+            return tick_pending();
         }
 
         bool try_cast_qe(int hitchance)
@@ -1257,9 +1153,9 @@ namespace hwei
 
         bool try_cast_we()
         {
-            if (!queue_cast_intent(ABILITY_WE, {}, nullptr))
+            if (!start_cast(ABILITY_WE, {}, nullptr))
                 return false;
-            return execute_cast_engine();
+            return tick_pending();
         }
 
         // WW (Stirring Lights): self-centered heal that prioritises the most
@@ -1316,9 +1212,9 @@ namespace hwei
             if (!should_heal)
                 return false;
 
-            if (!queue_cast_intent(ABILITY_WW, {}, nullptr))
+            if (!start_cast(ABILITY_WW, {}, nullptr))
                 return false;
-            return execute_cast_engine();
+            return tick_pending();
         }
 
         bool try_cast_eq(int hitchance)
@@ -1364,16 +1260,16 @@ namespace hwei
                     prediction.cast_position.z, target->get_name().c_str());
             }
 
-            if (!queue_cast_intent(ABILITY_EW, prediction.cast_position, target, s_pred_ew.range))
+            if (!start_cast(ABILITY_EW, prediction.cast_position, target, s_pred_ew.range))
                 return false;
-            if (!s_intent.followup_sent)
+            if (!s_pending.repredict)
             {
-                s_intent.repredict = true;
-                s_intent.repredict_spell = spell;
-                s_intent.repredict_hitchance = 0; // root setup is lenient: refresh whenever prediction is valid
+                s_pending.repredict = true;
+                s_pending.repredict_spell = spell;
+                s_pending.repredict_hitchance = 0; // root setup is lenient: refresh whenever prediction is valid
             }
 
-            return execute_cast_engine();
+            return tick_pending();
         }
 
         bool try_cast_ee(int hitchance)
@@ -1558,7 +1454,7 @@ namespace hwei
         {
             const float current_time = now();
             s_ew_qw_followup_ready_at = current_time + ready_delay;
-            s_ew_qw_followup_until = current_time + EE_QQ_FOLLOWUP_WINDOW;
+            s_ew_qw_followup_until = current_time + EW_QW_FOLLOWUP_WINDOW;
 
             if (HWEI_DEBUG_LOGS && g_sdk)
             {
@@ -1586,7 +1482,7 @@ namespace hwei
                 return true;
             }
 
-            return s_intent.active;
+            return s_pending.active;
         }
 
         bool handle_ew_qw_followup(bool cast_r_first)
@@ -1691,9 +1587,9 @@ namespace hwei
             }
 
             cast_pos = cast_pos.extended(cursor_pos, s_pred_wq.range, true);
-            if (!queue_cast_intent(ABILITY_WQ, cast_pos, nullptr, s_pred_wq.range))
+            if (!start_cast(ABILITY_WQ, cast_pos, nullptr, s_pred_wq.range))
                 return false;
-            return execute_cast_engine();
+            return tick_pending();
         }
 
         float get_r_damage(game_object* target)
@@ -2032,19 +1928,19 @@ namespace hwei
 
             if (!best_target) return false;
 
-            if (queue_cast_intent(ABILITY_QQ, best_cast_pos, best_target, range))
+            if (start_cast(ABILITY_QQ, best_cast_pos, best_target, range))
             {
-                s_intent.lasthit_guard = true;
+                s_pending.lasthit_guard = true;
                 // Refresh the aim point at fire time so a minion that drifts during
                 // the subject-select delay is still led correctly (and minion-blocked
                 // shots are rejected). hitchance 0 = accept any valid minion prediction.
-                if (!s_intent.followup_sent)
+                if (!s_pending.repredict)
                 {
-                    s_intent.repredict = true;
-                    s_intent.repredict_spell = s_pred_qq;
-                    s_intent.repredict_hitchance = 0;
+                    s_pending.repredict = true;
+                    s_pending.repredict_spell = s_pred_qq;
+                    s_pending.repredict_hitchance = 0;
                 }
-                execute_cast_engine();
+                tick_pending();
                 return true;
             }
             return false;
@@ -2138,8 +2034,8 @@ namespace hwei
 
             if (best_hits >= menu::lane_qe_min_minions)
             {
-                if (queue_cast_intent(ABILITY_QE, best_pos, nullptr, s_pred_qe.range))
-                    execute_cast_engine();
+                if (start_cast(ABILITY_QE, best_pos, nullptr, s_pred_qe.range))
+                    tick_pending();
             }
         }
 
@@ -2634,15 +2530,14 @@ namespace hwei
         s_subject_cache_authoritative = false;
         s_r_wait_started_at = 0.f;
         clear_all_mode_binds();
-        reset_cast_engine();
+        clear_pending();
 
         g_sdk->log_console("[-] Hwei module unloaded");
     }
 
     void __fastcall on_update()
     {
-        forget_subject_if_needed();
-        execute_cast_engine();
+        tick_pending();
 
         auto* player = get_player();
         if (!player || player->is_dead())
@@ -2806,21 +2701,18 @@ namespace hwei
             {
                 cache_selected_subject(selected_subject, "selector-process-cast");
 
-                if (s_intent.active
-                    && s_cast_state != cast_engine_state::casting_followup
-                    && s_intent.info.mood == selected_subject)
+                if (s_pending.active && s_pending.info.mood == selected_subject)
                 {
-                    s_intent.selector_sent = true;
                     // Game confirmed the selector — fast-forward so follow-up fires
                     // after SUBJECT_CONFIRM_FAST_DELAY instead of the full SUBJECT_CONFIRM_DELAY.
-                    s_intent.selector_sent_at = now() - (SUBJECT_CONFIRM_DELAY - SUBJECT_CONFIRM_FAST_DELAY);
-                    s_cast_state = cast_engine_state::await_followup_window;
+                    const float new_fire = now() + SUBJECT_CONFIRM_FAST_DELAY;
+                    if (new_fire < s_pending.fire_at)
+                        s_pending.fire_at = new_fire;
                 }
-                else if (s_intent.active && HWEI_DEBUG_LOGS && g_sdk)
+                else if (s_pending.active && HWEI_DEBUG_LOGS && g_sdk)
                 {
-                    g_sdk->log_console("[MeowAIO] selector observed during %s expected=%s got=%s",
-                        s_cast_state == cast_engine_state::casting_followup ? "followup-wait" : "request",
-                        s_intent.expected_followup_name ? s_intent.expected_followup_name : "unknown",
+                    g_sdk->log_console("[MeowAIO] selector observed but mood mismatch expected=%s got=%s",
+                        expected_followup_name(s_pending.info) ? expected_followup_name(s_pending.info) : "unknown",
                         cast_name ? cast_name : "unknown");
                 }
                 return;
@@ -2845,21 +2737,21 @@ namespace hwei
                 s_ew_qw_followup_until = 0.f;
             }
 
-            if (!s_intent.active || is_expected_followup_name(cast_name))
+            if (!s_pending.active || is_expected_followup_name(cast_name))
             {
                 if (HWEI_DEBUG_LOGS && g_sdk)
                 {
                     g_sdk->log_console("[MeowAIO] confirm expected=%s got=%s",
-                        s_intent.active && s_intent.expected_followup_name ? s_intent.expected_followup_name : "none",
+                        s_pending.active ? (expected_followup_name(s_pending.info) ? expected_followup_name(s_pending.info) : "unknown") : "none",
                         cast_name ? cast_name : "unknown");
                 }
                 s_last_cast_time = now();
-                reset_cast_engine(false, "confirmed-followup");
+                clear_pending(false, "confirmed-followup");
             }
             else if (HWEI_DEBUG_LOGS && g_sdk)
             {
                 g_sdk->log_console("[MeowAIO] nonmatching followup expected=%s got=%s",
-                    s_intent.expected_followup_name ? s_intent.expected_followup_name : "unknown",
+                    expected_followup_name(s_pending.info) ? expected_followup_name(s_pending.info) : "unknown",
                     cast_name ? cast_name : "unknown");
             }
         }
