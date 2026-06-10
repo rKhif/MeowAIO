@@ -109,7 +109,15 @@ namespace hwei
         static bool s_subject_cache_authoritative = false;
 
         bool tick_pending();
+        int  effective_combo_mode();
         float get_qq_damage(game_object* target);
+        float get_qe_damage(game_object* target);
+        float get_qw_damage(game_object* target);
+        float get_eq_damage(game_object* target);
+        float get_ee_damage(game_object* target);
+        float get_ew_damage(game_object* target);
+        float get_r_damage(game_object* target);
+        float get_combo_damage(game_object* target);
 
         inline float now()
         {
@@ -367,9 +375,8 @@ namespace hwei
             s_pred_qe.radius = spell_data::qe_radius;
             s_pred_qe.delay = spell_data::qe_delay;
             s_pred_qe.projectile_speed = spell_data::qe_speed;
+            // QE erupts the ground — no unit or champion collision, only wind walls.
             s_pred_qe.forbidden_collisions = {
-                pred_sdk::collision_type::unit,
-                pred_sdk::collision_type::hero,
                 pred_sdk::collision_type::yasuo_wall,
                 pred_sdk::collision_type::braum_wall
             };
@@ -970,14 +977,14 @@ namespace hwei
             return false;
         }
 
-        bool try_cast_linear(const ability_info& info, pred_sdk::spell_data base_spell, int hitchance)
+        bool try_cast_linear(const ability_info& info, pred_sdk::spell_data base_spell, int hitchance, game_object* forced_target = nullptr)
         {
             if (!sdk::prediction) return false;
 
             auto* player = get_player();
             if (!player) return false;
 
-            auto* target = pick_target(base_spell.range);
+            auto* target = forced_target ? forced_target : pick_target(base_spell.range);
             if (!is_valid_target(target, base_spell.range))
                 return false;
 
@@ -1177,11 +1184,14 @@ namespace hwei
 
             bool should_heal = false;
 
-            const float self_max = player->get_max_hp();
-            if (self_max > 0.f
-                && (player->get_hp() / self_max) * 100.f <= static_cast<float>(menu::ww_self_hp_pct))
+            if (menu::use_ww_self)
             {
-                should_heal = true;
+                const float self_max = player->get_max_hp();
+                if (self_max > 0.f
+                    && (player->get_hp() / self_max) * 100.f <= static_cast<float>(menu::ww_self_hp_pct))
+                {
+                    should_heal = true;
+                }
             }
 
             if (!should_heal)
@@ -1664,6 +1674,88 @@ namespace hwei
             return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw);
         }
 
+        float get_qe_damage(game_object* target)
+        {
+            auto* player = get_player();
+            if (!player || !target || !sdk::damage) return 0.f;
+
+            // QE (Molten Fissure) initial hit (per Data.cpp HweiQE):
+            //   base 20/40/60/80/100 + 0.30 AP, ranks with Q slot
+            auto* q_spell = player->get_spell(SLOT_Q);
+            if (!q_spell || q_spell->get_level() <= 0) return 0.f;
+
+            const int idx = std::clamp(q_spell->get_level(), 1, 5) - 1;
+            constexpr float BASE[] = { 20.f, 40.f, 60.f, 80.f, 100.f };
+            constexpr float AP_RATIO = 0.30f;
+
+            const float raw = BASE[idx] + AP_RATIO * player->get_ability_power();
+            return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw);
+        }
+
+        float get_eq_damage(game_object* target)
+        {
+            auto* player = get_player();
+            if (!player || !target || !sdk::damage) return 0.f;
+
+            // EQ (Grim Visage) (per Data.cpp HweiEQ):
+            //   base 70/110/150/190/230 + 0.60 AP, ranks with E slot
+            auto* e_spell = player->get_spell(SLOT_E);
+            if (!e_spell || e_spell->get_level() <= 0) return 0.f;
+
+            const int idx = std::clamp(e_spell->get_level(), 1, 5) - 1;
+            constexpr float BASE[] = { 70.f, 110.f, 150.f, 190.f, 230.f };
+            constexpr float AP_RATIO = 0.60f;
+
+            const float raw = BASE[idx] + AP_RATIO * player->get_ability_power();
+            return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw);
+        }
+
+        // EE (Crushing Maw) and EW (Gaze of the Abyss) share the same formula as EQ
+        // (per Data.cpp HweiEE / HweiEW): 70/110/150/190/230 + 0.60 AP, E slot.
+        float get_ee_damage(game_object* target) { return get_eq_damage(target); }
+        float get_ew_damage(game_object* target) { return get_eq_damage(target); }
+
+        float get_combo_damage(game_object* target)
+        {
+            if (!target) return 0.f;
+            const bool q_ready = is_spell_ready(SLOT_Q) && has_mana_for(SLOT_Q);
+            const bool e_ready = is_spell_ready(SLOT_E) && has_mana_for(SLOT_E);
+            const bool r_ready = is_spell_ready(SLOT_R) && has_mana_for(SLOT_R);
+            float total = 0.f;
+            switch (static_cast<combo_mode>(effective_combo_mode()))
+            {
+            case combo_mode::basic:
+                if (e_ready) total += get_ee_damage(target);
+                if (q_ready) total += get_qq_damage(target);
+                break;
+            case combo_mode::qe_qw:
+                if (q_ready) total += get_qe_damage(target) + get_qw_damage(target);
+                break;
+            case combo_mode::ew_qw:
+                if (e_ready) total += get_ew_damage(target);
+                if (q_ready) total += get_qw_damage(target);
+                break;
+            case combo_mode::ew_r_qw:
+                if (e_ready) total += get_ew_damage(target);
+                if (r_ready) total += get_r_damage(target);
+                if (q_ready) total += get_qw_damage(target);
+                break;
+            case combo_mode::all_in_burst:
+                if (e_ready) total += get_ee_damage(target);
+                if (r_ready) total += get_r_damage(target);
+                if (q_ready) total += get_qq_damage(target) + get_qw_damage(target);
+                break;
+            case combo_mode::teamfight_all_in:
+                if (e_ready) total += get_ee_damage(target);
+                if (r_ready) total += get_r_damage(target);
+                if (q_ready) total += get_qe_damage(target) + get_qw_damage(target);
+                break;
+            default:
+                break;
+            }
+            return total;
+        }
+
         float get_magic_effective_hp(game_object* target, float delay)
         {
             if (!target)
@@ -1740,6 +1832,96 @@ namespace hwei
                 }
 
                 if (try_cast_r_on_target(hero, menu::combo_r_hitchance))
+                    return true;
+            }
+
+            return false;
+        }
+
+        bool killsteal_qq()
+        {
+            if (!menu::killsteal_qq || !g_sdk || !g_sdk->object_manager)
+                return false;
+            if (consume_cast_engine_busy() || has_combo_followup_window())
+                return false;
+            if (!is_spell_ready(SLOT_Q) || !has_mana_for(SLOT_Q))
+                return false;
+
+            for (auto* hero : g_sdk->object_manager->get_heroes())
+            {
+                if (!is_valid_target(hero, s_pred_qq.range))
+                    continue;
+
+                const float hp = get_magic_effective_hp(hero, spell_data::qq_delay + 0.05f);
+                const float damage = get_qq_damage(hero);
+                if (hp <= 0.f || hp > damage)
+                    continue;
+
+                if (HWEI_DEBUG_LOGS && g_sdk)
+                    g_sdk->log_console("[MeowAIO] QQ killsteal target=%s hp=%.0f dmg=%.0f",
+                        hero->get_name().c_str(), hp, damage);
+
+                if (cast_or_busy(try_cast_linear(ABILITY_QQ, s_pred_qq, menu::combo_qq_hitchance, hero)))
+                    return true;
+            }
+
+            return false;
+        }
+
+        bool killsteal_qe()
+        {
+            if (!menu::killsteal_qe || !g_sdk || !g_sdk->object_manager)
+                return false;
+            if (consume_cast_engine_busy() || has_combo_followup_window())
+                return false;
+            if (!is_spell_ready(SLOT_Q) || !has_mana_for(SLOT_Q))
+                return false;
+
+            for (auto* hero : g_sdk->object_manager->get_heroes())
+            {
+                if (!is_valid_target(hero, s_pred_qe.range))
+                    continue;
+
+                const float hp = get_magic_effective_hp(hero, spell_data::qe_delay + 0.05f);
+                const float damage = get_qe_damage(hero);
+                if (hp <= 0.f || hp > damage)
+                    continue;
+
+                if (HWEI_DEBUG_LOGS && g_sdk)
+                    g_sdk->log_console("[MeowAIO] QE killsteal target=%s hp=%.0f dmg=%.0f",
+                        hero->get_name().c_str(), hp, damage);
+
+                if (cast_or_busy(try_cast_linear(ABILITY_QE, s_pred_qe, menu::combo_qe_hitchance, hero)))
+                    return true;
+            }
+
+            return false;
+        }
+
+        bool killsteal_eq()
+        {
+            if (!menu::killsteal_eq || !g_sdk || !g_sdk->object_manager)
+                return false;
+            if (consume_cast_engine_busy() || has_combo_followup_window())
+                return false;
+            if (!is_spell_ready(SLOT_E) || !has_mana_for(SLOT_E))
+                return false;
+
+            for (auto* hero : g_sdk->object_manager->get_heroes())
+            {
+                if (!is_valid_target(hero, s_pred_eq.range))
+                    continue;
+
+                const float hp = get_magic_effective_hp(hero, spell_data::eq_delay + 0.05f);
+                const float damage = get_eq_damage(hero);
+                if (hp <= 0.f || hp > damage)
+                    continue;
+
+                if (HWEI_DEBUG_LOGS && g_sdk)
+                    g_sdk->log_console("[MeowAIO] EQ killsteal target=%s hp=%.0f dmg=%.0f",
+                        hero->get_name().c_str(), hp, damage);
+
+                if (cast_or_busy(try_cast_linear(ABILITY_EQ, s_pred_eq, menu::combo_eq_hitchance, hero)))
                     return true;
             }
 
@@ -2291,6 +2473,10 @@ namespace hwei
             q_menu->add_checkbox("harass_qe", "Use in Harass QE", menu::harass_use_qe,
                 [](bool v) { menu::harass_use_qe = v; });
             q_menu->add_separator();
+            q_menu->add_checkbox("ks_qq", "Killsteal QQ", menu::killsteal_qq,
+                [](bool v) { menu::killsteal_qq = v; });
+            q_menu->add_checkbox("ks_qe", "Killsteal QE", menu::killsteal_qe,
+                [](bool v) { menu::killsteal_qe = v; });
             q_menu->add_checkbox("ks_qw", "Killsteal QW", menu::killsteal_qw,
                 [](bool v) { menu::killsteal_qw = v; });
             q_menu->add_separator();
@@ -2332,6 +2518,8 @@ namespace hwei
             w_menu->add_separator();
             w_menu->add_checkbox("use_ww", "Use WW", menu::use_ww,
                 [](bool v) { menu::use_ww = v; });
+            w_menu->add_checkbox("use_ww_self", "Use on Self", menu::use_ww_self,
+                [](bool v) { menu::use_ww_self = v; });
             w_menu->add_slider_int("ww_self_hp", "  WW Self HP %", 0, 100, 5, menu::ww_self_hp_pct,
                 [](int v) { menu::ww_self_hp_pct = v; });
             w_menu->add_slider_int("ww_ally_hp", "  WW Ally HP %", 0, 100, 5, menu::ww_ally_hp_pct,
@@ -2366,6 +2554,9 @@ namespace hwei
                 [](int v) { menu::combo_eq_hitchance = v; });
             e_menu->add_slider_int("hc_ee", "  EE Hitchance", 0, 100, 5, menu::combo_ee_hitchance,
                 [](int v) { menu::combo_ee_hitchance = v; });
+            e_menu->add_separator();
+            e_menu->add_checkbox("ks_eq", "Killsteal EQ", menu::killsteal_eq,
+                [](bool v) { menu::killsteal_eq = v; });
             e_menu->add_separator();
             e_menu->add_checkbox("harass_eq", "Use in Harass EQ", menu::harass_use_eq,
                 [](bool v) { menu::harass_use_eq = v; });
@@ -2418,11 +2609,13 @@ namespace hwei
                 [](bool v) { menu::draw_only_mode_ranges = v; });
             draw_menu->add_checkbox("draw_r_damage", "Draw R Damage Indicator", menu::draw_r_damage_indicator,
                 [](bool v) { menu::draw_r_damage_indicator = v; });
-            draw_menu->add_checkbox("debug_logs", "Debug Logs", menu::debug_logs,
-                [](bool v) {
-                    menu::debug_logs = v;
-                    HWEI_DEBUG_LOGS = v;
-                });
+            draw_menu->add_checkbox("draw_combo_damage", "Draw Combo Damage Indicator", menu::draw_combo_damage_indicator,
+                [](bool v) { menu::draw_combo_damage_indicator = v; });
+            //draw_menu->add_checkbox("debug_logs", "Debug Logs", menu::debug_logs,
+                //[](bool v) {
+                    //menu::debug_logs = v;
+                   // HWEI_DEBUG_LOGS = v;
+               // });
             draw_menu->add_separator();
             draw_menu->add_colorpicker("color_qq", "  QQ Color", menu::color_qq,
                 [](uint32_t c) { menu::color_qq = c; });
@@ -2549,6 +2742,15 @@ namespace hwei
         if (killsteal_qw())
             return;
 
+        if (killsteal_qq())
+            return;
+
+        if (killsteal_eq())
+            return;
+
+        if (killsteal_qe())
+            return;
+
         if (killsteal_r())
             return;
 
@@ -2630,18 +2832,29 @@ namespace hwei
                 s_pred_qw.range, 1.f, menu::color_qw);
         }
 
-        if (!menu::draw_r_damage_indicator)
-            return;
+        const bool show_r_dmg = menu::draw_r_damage_indicator
+            && [&]{ auto* s = player->get_spell(SLOT_R); return s && s->get_level() > 0; }();
+        const bool show_combo_dmg = menu::draw_combo_damage_indicator;
 
-        auto* r_spell = player->get_spell(SLOT_R);
-        if (!r_spell || r_spell->get_level() == 0)
+        if (!show_r_dmg && !show_combo_dmg)
             return;
 
         const float scale = static_cast<float>(g_sdk->renderer->get_window_height()) / 1080.f;
         const float ox = -45.6f * scale;
-        const float oy = 15.5f * scale;
+        const float oy =  15.5f * scale;
         const float bw = 106.4f * scale;
-        const float bh = 11.5f * scale;
+        const float bh =  11.5f * scale;
+
+        // Per-mode colors (match the mode name indicator in on_draw), semi-transparent.
+        static constexpr uint32_t combo_dmg_colors[] = {
+            0xCC00FF80u,  // basic
+            0xCC40D0FFu,  // qe_qw
+            0xCCE87C9Eu,  // ew_qw
+            0xCCFF5050u,  // ew_r_qw
+            0xCCFFA040u,  // all_in_burst
+            0xCCA080FFu,  // teamfight_all_in
+        };
+        const uint32_t combo_color = combo_dmg_colors[std::clamp(effective_combo_mode(), 0, 5)];
 
         for (auto* hero : g_sdk->object_manager->get_heroes())
         {
@@ -2652,31 +2865,54 @@ namespace hwei
             if (!hero->is_visible())
                 continue;
 
-            const float dmg = get_r_damage(hero);
-            if (dmg <= 0.f)
-                continue;
-
-            const float hp = hero->get_hp();
+            const float hp_raw = hero->get_hp();
             const float max_hp = hero->get_max_hp();
-            if (hp <= 0.f || max_hp <= 0.f)
+            if (hp_raw <= 0.f || max_hp <= 0.f)
                 continue;
 
             const auto hbar = hero->get_health_bar_position();
             if (hbar.x < 1.f && hbar.y < 1.f)
                 continue;
 
-            const float r0 = hp / max_hp;
-            const float r1 = std::max(0.f, hp - dmg) / max_hp;
-            if (r0 <= r1)
-                continue;
+            const float effective_hp = hp_raw + hero->get_all_shield() + hero->get_magical_shield();
+            const float hp_frac = hp_raw / max_hp;
 
-            math::rect rc;
-            rc.left   = hbar.x + ox + r1 * bw;
-            rc.top    = hbar.y + oy;
-            rc.right  = hbar.x + ox + r0 * bw;
-            rc.bottom = hbar.y + oy + bh;
+            // Combo damage drawn first (base layer), R drawn on top — both on the health bar.
+            if (show_combo_dmg)
+            {
+                const float dmg = get_combo_damage(hero);
+                if (dmg > 0.f)
+                {
+                    const float r1 = std::max(0.f, effective_hp - dmg) / max_hp;
+                    if (hp_frac > r1)
+                    {
+                        math::rect rc;
+                        rc.left   = hbar.x + ox + r1 * bw;
+                        rc.top    = hbar.y + oy;
+                        rc.right  = hbar.x + ox + hp_frac * bw;
+                        rc.bottom = hbar.y + oy + bh;
+                        g_sdk->renderer->add_rectangle_filled(rc, combo_color);
+                    }
+                }
+            }
 
-            g_sdk->renderer->add_rectangle_filled(rc, menu::color_r_dmg);
+            if (show_r_dmg)
+            {
+                const float dmg = get_r_damage(hero);
+                if (dmg > 0.f)
+                {
+                    const float r1 = std::max(0.f, effective_hp - dmg) / max_hp;
+                    if (hp_frac > r1)
+                    {
+                        math::rect rc;
+                        rc.left   = hbar.x + ox + r1 * bw;
+                        rc.top    = hbar.y + oy;
+                        rc.right  = hbar.x + ox + hp_frac * bw;
+                        rc.bottom = hbar.y + oy + bh;
+                        g_sdk->renderer->add_rectangle_filled(rc, menu::color_r_dmg);
+                    }
+                }
+            }
         }
     }
 
@@ -2774,7 +3010,8 @@ namespace hwei
         if (name != "HweiEWRoot")
             return;
 
-        open_ew_qw_followup_window(EW_ROOT_FOLLOWUP_DELAY, "root-buff");
+        // Root is already active — open the window immediately (ready_delay = 0).
+        open_ew_qw_followup_window(0.0f, "root-buff");
 
         if (HWEI_DEBUG_LOGS && g_sdk)
             g_sdk->log_console("[MeowAIO] EW root confirmed, QW followup window opened");

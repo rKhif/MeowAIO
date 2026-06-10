@@ -93,7 +93,10 @@ namespace hwei
         inline int combo_r_hitchance  = pred_sdk::hitchance::high;
 
         // Killsteal
+        inline bool killsteal_qq = false;
+        inline bool killsteal_qe = false;
         inline bool killsteal_qw = true;
+        inline bool killsteal_eq = false;
         inline bool killsteal_r  = false;
 
         // Debug
@@ -112,6 +115,7 @@ namespace hwei
 
         // WW heal (Stirring Lights)
         inline bool use_ww         = true;
+        inline bool use_ww_self    = true;
         inline int  ww_self_hp_pct = 45;
         inline int  ww_ally_hp_pct = 40;
 
@@ -140,7 +144,8 @@ namespace hwei
         inline bool draw_only_ready = false;
         inline bool draw_only_active_spell = false;
         inline bool draw_only_mode_ranges = false;
-        inline bool draw_r_damage_indicator = true;
+        inline bool draw_r_damage_indicator     = true;
+        inline bool draw_combo_damage_indicator = true;
 
         // Colors (ARGB)
         inline uint32_t color_qq = 0xFFA080FFu;
