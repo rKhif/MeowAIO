@@ -158,6 +158,23 @@ namespace viktor
         catch (...) { return 0.f; }
     }
 
+    // Path-aware position prediction: traces the target's waypoint path t
+    // seconds ahead (handles corner turns / queued move orders), falling back
+    // to linear velocity extrapolation when the SDK is unavailable.
+    static math::vector3 predict_position(game_object* o, float t)
+    {
+        if (!o) return {};
+        const auto p = o->get_position();
+        if (t <= 0.f) return p;
+        if (sdk::prediction)
+        {
+            try { return sdk::prediction->predict_on_path(o, t); }
+            catch (...) {}
+        }
+        const auto v = o->get_velocity();
+        return { p.x + v.x * t, p.y, p.z + v.z * t };
+    }
+
     static float distance_2d(const math::vector3& a, const math::vector3& b)
     {
         const float dx = b.x - a.x;
@@ -529,7 +546,7 @@ namespace viktor
                         const float ez = p.z - (a.z + t * dz);
                         seg_dist = std::sqrt(ex * ex + ez * ez);
                     }
-                    const float hit_r = spell_data::e_radius + tgt->get_bounding_radius();
+                    const float hit_r = spell_data::e_radius + venplus::unit_gameplay_radius(tgt);
                     const float drift_from_cast = p.distance({
                         m_e_log.fp.x + dx * 0.5f, p.y, m_e_log.fp.z + dz * 0.5f
                     });
@@ -1475,9 +1492,17 @@ namespace viktor
 
             if (menu::ks_e)
             {
+                // Predict at the actual laser connect time (windup + beam
+                // travel) — at max range that's ~3x the bare windup, and
+                // predicting too early returns a higher HP that skips kills.
+                const float d     = distance_2d(player->get_position(), hero->get_position());
+                const float fp_d  = std::clamp(d - spell_data::e_beam_len * 0.5f, 0.f, spell_data::e_first_click);
+                const float hit_t = spell_data::e_delay
+                                  + std::max(0.f, d - fp_d) / spell_data::e_speed;
+
                 float hp = base_hp;
                 {
-                    const float p = predict_health(hero, now + spell_data::e_delay);
+                    const float p = predict_health(hero, now + hit_t);
                     if (p > 0.f && p <= hero->get_max_hp())
                         hp = p + magic_shield_bonus(hero);
                 }
@@ -1652,11 +1677,10 @@ namespace viktor
         {
             if (pred_n >= preds.size()) break;
             const auto p   = h->get_position();
-            const auto v   = h->get_velocity();
             const bool cc  = is_hard_cc(h);
-            math::vector3 pp = cc
-                ? p
-                : math::vector3{ p.x + v.x * lead_time, p.y, p.z + v.z * lead_time };
+            // Path-aware lead — linear extrapolation walks phantom positions
+            // through walls when enemies round jungle corners.
+            const math::vector3 pp = cc ? p : predict_position(h, lead_time);
 
             // 1.0 base + 0.6 CC (eats all ticks) + 0.3 low-HP (KS).
             float w = 1.f;
@@ -2100,7 +2124,6 @@ namespace viktor
         const auto  tpos = target->get_position();
         const auto  tvel = target->get_velocity();
         const float speed_sq = tvel.x * tvel.x + tvel.z * tvel.z;
-        const bool  is_moving = speed_sq > (50.f * 50.f);
         const bool  is_dash = target->is_dashing();
 
         math::vector3 cast_pos = tpos;
@@ -2130,83 +2153,60 @@ namespace viktor
             {
                 cast_pos = pred.cast_position;
             }
-            else if (is_moving || is_dash)
+            else if (is_hard_cc(target))
             {
-                // Manual lead — SDK rejected the prediction but the target's
-                // moving, so we lead in their velocity direction.
-                const float speed = std::sqrt(speed_sq);
-                if (speed > 0.01f)
+                // Pinned — live position is guaranteed regardless of the gate.
+                cast_pos = tpos;
+            }
+            else if (is_dash)
+            {
+                // Dash destination is engine-locked, so trapping the landing
+                // spot stays reliable even when the gate rejects.
+                const float lead_time = spell_data::w_activation_delay + 0.2f;
+                math::vector3 predicted;
+
+                auto path = target->get_path();
+                if (!path.empty())
                 {
-                    const float lead_time = spell_data::w_activation_delay + 0.2f;
-                    math::vector3 predicted;
+                    predicted = path.back();
+                    const float dash_dist = tpos.distance(predicted);
+                    if (dash_dist > 0.01f)
+                    {
+                        const float dash_speed = target->get_dash_speed();
+                        const float dash_time = dash_speed > 0.01f ? (dash_dist / dash_speed) : lead_time;
 
-                    if (is_dash)
-                    {
-                        auto path = target->get_path();
-                        if (!path.empty())
+                        // Dash lands before W activates — predict post-dash drift too.
+                        if (dash_time < lead_time)
                         {
-                            predicted = path.back();
-                            const float dash_dist = tpos.distance(predicted);
-                            if (dash_dist > 0.01f)
-                            {
-                                const float dash_speed = target->get_dash_speed();
-                                const float dash_time = dash_speed > 0.01f ? (dash_dist / dash_speed) : lead_time;
-
-                                // Dash lands before W activates — predict post-dash drift too.
-                                if (dash_time < lead_time)
-                                {
-                                    const auto dash_dir = (predicted - tpos).to_direction();
-                                    const float remaining_time = lead_time - dash_time;
-                                    const float post_dash_speed = speed > 0.01f ? speed : 300.f;
-                                    predicted = predicted + dash_dir * (post_dash_speed * remaining_time);
-                                }
-                            }
+                            const auto dash_dir = (predicted - tpos).to_direction();
+                            const float remaining_time = lead_time - dash_time;
+                            const float speed = std::sqrt(speed_sq);
+                            const float post_dash_speed = speed > 0.01f ? speed : 300.f;
+                            predicted = predicted + dash_dir * (post_dash_speed * remaining_time);
                         }
-                        else
-                        {
-                            predicted = {
-                                tpos.x + tvel.x * lead_time,
-                                tpos.y,
-                                tpos.z + tvel.z * lead_time
-                            };
-                        }
-                    }
-                    else
-                    {
-                        predicted = {
-                            tpos.x + tvel.x * lead_time,
-                            tpos.y,
-                            tpos.z + tvel.z * lead_time
-                        };
-                    }
-
-                    const auto ppos = player->get_position();
-                    const float pred_dist = ppos.distance(predicted);
-                    if (pred_dist <= spell_data::w_range)
-                    {
-                        // Slow targets — half-lead so the W doesn't overshoot
-                        // when their velocity barely indicates direction.
-                        const float current_dist = ppos.distance(tpos);
-                        if (speed < 200.f && pred_dist > current_dist + 100.f)
-                        {
-                            const float blend = 0.5f;
-                            cast_pos = {
-                                tpos.x + (predicted.x - tpos.x) * blend,
-                                tpos.y,
-                                tpos.z + (predicted.z - tpos.z) * blend
-                            };
-                        }
-                        else
-                        {
-                            cast_pos = predicted;
-                        }
-                    }
-                    else
-                    {
-                        const auto dir_to_pred = (predicted - ppos).to_direction();
-                        cast_pos = ppos + dir_to_pred * spell_data::w_range;
                     }
                 }
+                else
+                {
+                    predicted = predict_position(target, lead_time);
+                }
+
+                const auto ppos = player->get_position();
+                if (ppos.distance(predicted) <= spell_data::w_range)
+                {
+                    cast_pos = predicted;
+                }
+                else
+                {
+                    const auto dir_to_pred = (predicted - ppos).to_direction();
+                    cast_pos = ppos + dir_to_pred * spell_data::w_range;
+                }
+            }
+            else
+            {
+                // Hitchance is a hard gate: a free-moving target the SDK says
+                // can walk out of the 0.75s arm time is not worth the mana.
+                return false;
             }
         }
 
@@ -2241,11 +2241,10 @@ namespace viktor
                     if (!is_valid_target(hero)) continue;
                     if (ppos.distance(hero->get_position()) > spell_data::w_range) continue;
 
-                    const auto hvel = hero->get_velocity();
-                    const float pt = spell_data::w_activation_delay;
-                    cluster_center.x += hero->get_position().x + hvel.x * pt;
+                    const auto hp = predict_position(hero, spell_data::w_activation_delay);
+                    cluster_center.x += hp.x;
                     cluster_center.y += hero->get_position().y;
-                    cluster_center.z += hero->get_position().z + hvel.z * pt;
+                    cluster_center.z += hp.z;
                     ++cluster_n;
                 }
 
@@ -2305,21 +2304,23 @@ namespace viktor
         auto& in_range = scratch::e_in_range();
         in_range.reserve(5);
 
-        constexpr float PRED_HORIZON = 0.5f;
-
         for (auto hero : g_sdk->object_manager->get_heroes())
         {
             if (!is_valid_target(hero, e_reach)) continue;
             if (is_in_stasis(hero)) continue;
             if (is_damage_immune(hero)) continue;
 
-            const auto  hpos = hero->get_position();
-            const auto  hvel = hero->get_velocity();
-            math::vector3 pred{
-                hpos.x + hvel.x * PRED_HORIZON,
-                hpos.y,
-                hpos.z + hvel.z * PRED_HORIZON
-            };
+            // Horizon = the laser's actual time-to-hit at this hero's range
+            // (windup + travel), path-aware — mirrors cast_e's intercept so
+            // the hit counts here match what cast_e will actually shoot.
+            const auto  hpos  = hero->get_position();
+            const float d     = distance_2d(ppos, hpos);
+            const float fp_d  = std::clamp(d - beam_len * 0.5f, 0.f, first_click);
+            const float hit_t = spell_data::e_delay
+                              + std::max(0.f, d - fp_d) / spell_data::e_speed;
+
+            math::vector3 pred = is_hard_cc(hero) ? hpos
+                                                  : predict_position(hero, hit_t);
 
             if (distance_2d(ppos, pred) > e_reach)
                 pred = ppos + direction_2d(ppos, pred) * e_reach;
@@ -2347,8 +2348,13 @@ namespace viktor
                 const float aim_d = distance_2d(ppos, aim_target);
                 if (aim_d < 10.f) return 0;
 
+                // Same range-scaled bias as cast_e so candidate beams here
+                // match the geometry cast_e will actually fire.
+                const float range_frac = std::clamp(aim_d / e_reach, 0.f, 1.f);
+                const float bias = std::clamp(0.5f + (range_frac - 0.5f) * 0.5f, 0.2f, 0.9f);
+
                 const auto  d = direction_2d(ppos, aim_target);
-                const float ideal_fp = aim_d - beam_len * 0.5f;
+                const float ideal_fp = aim_d - beam_len * bias;
                 const float fpd = std::clamp(ideal_fp, 0.f, first_click);
                 const auto  fp = ppos + d * fpd;
                 const auto  cp = fp + d * beam_len;
@@ -2502,8 +2508,9 @@ namespace viktor
         const float windup  = spell_data::e_delay;    // cast windup before the laser travels
         const float tgt_spd = std::sqrt(spd_sq);
         // Beam half-width plus the target's body: the laser only has to reach
-        // the hitbox edge to connect, not the center.
-        const float hit_radius = spell_data::e_radius + target->get_bounding_radius();
+        // the hitbox edge to connect, not the center. unit_gameplay_radius
+        // matches the engine hitbox and the farm/multi-hit counters.
+        const float hit_radius = spell_data::e_radius + venplus::unit_gameplay_radius(target);
 
         // Bias = where along the 700-unit beam the aim point should sit
         // (0 = near end, 1 = far end). Push toward the far end for distant or
@@ -2564,16 +2571,7 @@ namespace viktor
             for (int i = 0; i < 4; ++i)
             {
                 const float t = time_to_reach(distance_2d(ppos, aim));
-                math::vector3 next{};
-                if (sdk::prediction)
-                {
-                    try { next = sdk::prediction->predict_on_path(target, t); }
-                    catch (...) { next = { tpos.x + vel.x * t, tpos.y, tpos.z + vel.z * t }; }
-                }
-                else
-                {
-                    next = { tpos.x + vel.x * t, tpos.y, tpos.z + vel.z * t };
-                }
+                const math::vector3 next = predict_position(target, t);
                 const bool converged = distance_2d(next, aim) < 5.f;
                 aim = next;
                 if (converged) break;
@@ -2785,10 +2783,8 @@ namespace viktor
         if (!r_obj) return;
         if (!is_spell_learned(SLOT_R)) return;
 
-        const auto ppos = player->get_position();
         const auto spos = r_obj->get_position();
         const auto tpos = target->get_position();
-        const auto tvel = target->get_velocity();
 
         // CC'd → no lead; otherwise server lag + storm travel time.
         float lead = 0.f;
@@ -2799,7 +2795,7 @@ namespace viktor
         }
 
         // Don't lead a dasher past their landing spot.
-        math::vector3 pred = { tpos.x + tvel.x * lead, tpos.y, tpos.z + tvel.z * lead };
+        math::vector3 pred = predict_position(target, lead);
         if (target->is_dashing())
         {
             auto path = target->get_path();

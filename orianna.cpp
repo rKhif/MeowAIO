@@ -25,6 +25,16 @@ namespace orianna
     static constexpr float MIN_SPELL_DELAY = 0.05f;
     static float           last_spell_cast_time = 0.f;
 
+    // Anti-double-cast gate, latency-aware: flat floor plus half RTT so the
+    // server has time to acknowledge the previous cast before we send another.
+    static float min_spell_delay()
+    {
+        float ping_s = 0.f;
+        if (g_sdk && g_sdk->net_client)
+            ping_s = static_cast<float>(g_sdk->net_client->get_ping()) / 1000.f;
+        return MIN_SPELL_DELAY + ping_s * 0.5f;
+    }
+
     // E-specific cooldown — prevents respamming E while the previous shield
     // is still active (E shield duration is ~2.5s in the live db).
     static constexpr float E_RECAST_COOLDOWN = 2.5f;
@@ -328,15 +338,20 @@ namespace orianna
     // ============================================================================
     // MOVEMENT PREDICTION (lightweight, path-based)
     // ============================================================================
-    // Walks the target's path waypoints from its current path index, summing
-    // segment distances until `dt * move_speed` units have been consumed, and
-    // returns the interpolated world position. Used to estimate where an
-    // enemy will be after R's wind-up so we don't burn ult on a stale snapshot.
+    // Estimates where an enemy will be after `dt` seconds. Used for R's
+    // wind-up so we don't burn ult on a stale snapshot. Prefers the
+    // prediction SDK's path walker; falls back to a manual waypoint walk
+    // (sum segment distances until `dt * move_speed` units are consumed).
     static math::vector3 predict_position(game_object* h, float dt)
     {
         if (!h) return {};
         const auto cur_pos = h->get_position();
         if (dt <= 0.f) return cur_pos;
+
+        if (sdk::prediction) {
+            try { return sdk::prediction->predict_on_path(h, dt); }
+            catch (...) {}  // fall through to the manual walk
+        }
 
         auto path = h->get_path();
         if (path.empty()) return cur_pos;
@@ -454,13 +469,44 @@ namespace orianna
         return has_token("marksman") || has_token("mage") || has_token("assassin");
     }
 
+    // R has a ~0.5s wind-up. Use predicted positions when checking who'll
+    // actually be inside the AOE when it lands, otherwise we burn ult on
+    // enemies who walked out during the cast.
+    static constexpr float R_CAST_DELAY = 0.5f;
+
+    // Effective HP at spell-impact time. Health prediction folds in damage
+    // already in flight (autos, missiles), so we stop burning Q/R on targets
+    // that are dead anyway — and don't undershoot on targets being healed.
+    // Returns <= 0 when the target is expected to die before impact.
+    static float predicted_effective_hp(game_object* target, float impact_time)
+    {
+        float hp = target->get_hp();
+        if (sdk::health_prediction) {
+            try { hp = sdk::health_prediction->get_predicted_health(target, impact_time); }
+            catch (...) { hp = target->get_hp(); }
+        }
+        return hp + target->get_all_shield();
+    }
+
+    // Time from cast until Q's AOE detonates on the target: cast time plus
+    // ball travel from its current position.
+    static float q_impact_time(game_object* target)
+    {
+        constexpr float Q_CAST_TIME = 0.25f;
+        if (!target) return Q_CAST_TIME;
+        const float dist = get_ball_position().distance(target->get_position());
+        return Q_CAST_TIME + dist / spell_data::ball_q_missile_speed;
+    }
+
     static bool is_r_killable(game_object* target)
     {
         if (!target || !sdk::damage) return false;
         auto p = g_sdk->object_manager->get_local_player();
         if (!p || !is_spell_learned(SLOT_R)) return false;
+        const float ehp = predicted_effective_hp(target, R_CAST_DELAY);
+        if (ehp <= 0.f) return false;  // dying to in-flight damage — save R
         const float dmg = sdk::damage->get_spell_damage(p, target, SLOT_R);
-        return dmg >= target->get_hp() + target->get_all_shield();
+        return dmg >= ehp;
     }
 
     static bool is_q_killable(game_object* target)
@@ -468,14 +514,11 @@ namespace orianna
         if (!target || !sdk::damage) return false;
         auto p = g_sdk->object_manager->get_local_player();
         if (!p || !is_spell_learned(SLOT_Q)) return false;
+        const float ehp = predicted_effective_hp(target, q_impact_time(target));
+        if (ehp <= 0.f) return false;  // dying to in-flight damage — save Q
         const float dmg = sdk::damage->get_spell_damage(p, target, SLOT_Q);
-        return dmg >= target->get_hp() + target->get_all_shield();
+        return dmg >= ehp;
     }
-
-    // R has a ~0.5s wind-up. Use predicted positions when checking who'll
-    // actually be inside the AOE when it lands, otherwise we burn ult on
-    // enemies who walked out during the cast.
-    static constexpr float R_CAST_DELAY = 0.5f;
 
     static int score_r_cast()
     {
@@ -643,7 +686,7 @@ namespace orianna
         if (is_casting()) return false;
 
         const float now = g_sdk->clock_facade->get_game_time();
-        if (now - last_spell_cast_time < MIN_SPELL_DELAY) return false;
+        if (now - last_spell_cast_time < min_spell_delay()) return false;
 
         const int hits = count_enemies_near_ball(spell_data::r_effect_radius);
         if (hits < menu::semi_r_min_targets) return false;
@@ -662,7 +705,7 @@ namespace orianna
         if (is_casting()) return false;
 
         const float now = g_sdk->clock_facade->get_game_time();
-        if (now - last_spell_cast_time < MIN_SPELL_DELAY) return false;
+        if (now - last_spell_cast_time < min_spell_delay()) return false;
 
         if (count_enemies_near_ball(spell_data::r_effect_radius) < menu::auto_r_min_targets)
             return false;
@@ -682,7 +725,7 @@ namespace orianna
         if (is_ball_in_transit() || is_casting()) return false;
 
         const float now = g_sdk->clock_facade->get_game_time();
-        if (now - last_spell_cast_time < MIN_SPELL_DELAY) return false;
+        if (now - last_spell_cast_time < min_spell_delay()) return false;
 
         const auto bp = get_ball_position();
         const float r_sq = spell_data::r_effect_radius * spell_data::r_effect_radius;
@@ -711,7 +754,7 @@ namespace orianna
         if (is_casting()) return false;
 
         const float now = g_sdk->clock_facade->get_game_time();
-        if (now - last_spell_cast_time < MIN_SPELL_DELAY) return false;
+        if (now - last_spell_cast_time < min_spell_delay()) return false;
 
         for (auto* h : g_sdk->object_manager->get_heroes()) {
             if (!is_valid_target(h, spell_data::q_range)) continue;
@@ -736,7 +779,7 @@ namespace orianna
         if (is_casting()) return false;
 
         const float now = g_sdk->clock_facade->get_game_time();
-        if (now - last_spell_cast_time < MIN_SPELL_DELAY) return false;
+        if (now - last_spell_cast_time < min_spell_delay()) return false;
 
         // Don't auto Q while standing inside an enemy turret's aggro range — Q
         // would damage an enemy hero and pull tower aggro onto us. Manual scan
@@ -775,7 +818,7 @@ namespace orianna
         if (sdk::orbwalker && sdk::orbwalker->flee()) return false;
 
         const float now = g_sdk->clock_facade->get_game_time();
-        if (now - last_spell_cast_time < MIN_SPELL_DELAY) return false;
+        if (now - last_spell_cast_time < min_spell_delay()) return false;
 
         if (count_enemies_near_ball(spell_data::w_effect_radius) < 1)
             return false;
@@ -1115,7 +1158,7 @@ namespace orianna
         if (is_casting()) return;
 
         const float now = g_sdk->clock_facade->get_game_time();
-        if (now - last_spell_cast_time < MIN_SPELL_DELAY) return;
+        if (now - last_spell_cast_time < min_spell_delay()) return;
 
         // W first (AOE) so a single cast can secure multiple minions.
         if (try_lasthit_w()) return;
@@ -1133,7 +1176,7 @@ namespace orianna
         if (is_casting()) return;
 
         const float now = g_sdk->clock_facade->get_game_time();
-        if (now - last_spell_cast_time < MIN_SPELL_DELAY) return;
+        if (now - last_spell_cast_time < min_spell_delay()) return;
 
         if (menu::combo_use_r && !is_ball_in_transit() && try_r())
             return;
@@ -1193,7 +1236,7 @@ namespace orianna
         if (mana_pct() < (float)menu::harass_mana_pct) return;
 
         const float now = g_sdk->clock_facade->get_game_time();
-        if (now - last_spell_cast_time < MIN_SPELL_DELAY) return;
+        if (now - last_spell_cast_time < min_spell_delay()) return;
 
         auto* target = pick_hero_target(spell_data::q_range);
         if (menu::harass_use_q && target) {
@@ -1213,7 +1256,7 @@ namespace orianna
         if (is_casting()) return;
 
         const float now = g_sdk->clock_facade->get_game_time();
-        if (now - last_spell_cast_time < MIN_SPELL_DELAY) return;
+        if (now - last_spell_cast_time < min_spell_delay()) return;
 
         // Save mana for R if it's up — keep enough for R + at least one Q follow-up.
         if (menu::clear_save_for_r && is_spell_ready(SLOT_R)) {
@@ -1255,7 +1298,7 @@ namespace orianna
         if (is_casting()) return;
 
         const float now = g_sdk->clock_facade->get_game_time();
-        if (now - last_spell_cast_time < MIN_SPELL_DELAY) return;
+        if (now - last_spell_cast_time < min_spell_delay()) return;
 
         const int min_w = std::max(1, menu::clear_w_min - 1);
         if (menu::clear_use_w && is_spell_ready(SLOT_W) && has_enough_mana(SLOT_W)
@@ -1335,22 +1378,28 @@ namespace orianna
         if (try_killsteal_q()) return;
         if (try_killsteal_r()) return;
         if (try_auto_q()) return;
-        if (try_auto_w()) return;
 
         if (sdk::orbwalker && !sdk::orbwalker->combo()) {
             try_shield_ally();
         }
 
-        if (!sdk::orbwalker) return;
-        // Check lasthit BEFORE clear/fast_clear — VEN's clear() returns true
-        // whenever any farming mode is active (including lasthit), so it would
-        // otherwise swallow the lasthit case and lasthit_mode() never runs.
-        if      (sdk::orbwalker->combo())      combo();
-        else if (sdk::orbwalker->harass())     harass();
-        else if (sdk::orbwalker->lasthit())    lasthit_mode();
-        else if (sdk::orbwalker->fast_clear()) fast_clear();
-        else if (sdk::orbwalker->clear())      clear();
-        else if (sdk::orbwalker->flee())       flee();
+        if (sdk::orbwalker) {
+            // Check lasthit BEFORE clear/fast_clear — VEN's clear() returns true
+            // whenever any farming mode is active (including lasthit), so it would
+            // otherwise swallow the lasthit case and lasthit_mode() never runs.
+            if      (sdk::orbwalker->combo())      combo();
+            else if (sdk::orbwalker->harass())     harass();
+            else if (sdk::orbwalker->lasthit())    lasthit_mode();
+            else if (sdk::orbwalker->fast_clear()) fast_clear();
+            else if (sdk::orbwalker->clear())      clear();
+            else if (sdk::orbwalker->flee())       flee();
+        }
+
+        // Auto-W runs last so combo() gets first claim on R — it used to run
+        // before the dispatch and could end the tick before try_r() was
+        // reached. The min_spell_delay gate keeps it from double-casting in
+        // the same tick as a mode-function cast.
+        try_auto_w();
     }
 
     void __fastcall on_draw()

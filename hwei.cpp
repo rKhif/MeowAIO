@@ -4,6 +4,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -101,6 +102,7 @@ namespace hwei
         static uint32_t s_infotab_bind_we   = 0;
         static uint32_t s_infotab_bind_ee   = 0;
         static uint32_t s_infotab_bind_eq   = 0;
+        static uint32_t s_infotab_bind_ew   = 0;
         static uint32_t s_infotab_bind_r    = 0;
         static bool s_combo_mode_was_pressed = false;
         static std::string s_last_observed_cast_name;
@@ -117,6 +119,7 @@ namespace hwei
         float get_ee_damage(game_object* target);
         float get_ew_damage(game_object* target);
         float get_r_damage(game_object* target);
+        float get_passive_mark_damage(game_object* target);
         float get_combo_damage(game_object* target);
 
         inline float now()
@@ -220,10 +223,14 @@ namespace hwei
             return nullptr;
         }
 
-        bool has_hard_cc(game_object* target)
+        // Longest remaining duration among active hard-CC buffs (0 if none).
+        float hard_cc_remaining(game_object* target)
         {
             if (!target)
-                return false;
+                return 0.f;
+
+            const float t = now();
+            float remaining = 0.f;
 
             for (auto* buff : target->get_buffs())
             {
@@ -242,13 +249,19 @@ namespace hwei
                 case buff_type::flee:
                 case buff_type::fear:
                 case buff_type::charm:
-                    return true;
+                    remaining = std::max(remaining, buff->get_end_time() - t);
+                    break;
                 default:
                     break;
                 }
             }
 
-            return false;
+            return std::max(remaining, 0.f);
+        }
+
+        bool has_hard_cc(game_object* target)
+        {
+            return hard_cc_remaining(target) > 0.f;
         }
 
         bool is_isolated_for_qw(game_object* target)
@@ -943,6 +956,20 @@ namespace hwei
                 }
             }
 
+            // If the aim point is out of range, retrying just blocks the engine
+            // until the full REQUEST_TIMEOUT. Give the repredict a short grace to
+            // pull the point back into range, then abandon the cast so other
+            // spells aren't held hostage. (The palette stays open, so the next
+            // attempt with the same subject fires almost immediately.)
+            if (s_pending.info.cast_type == ability_cast::position
+                && s_pending.max_range < FLT_MAX
+                && player->get_position().distance(s_pending.cast_pos) > s_pending.max_range
+                && t > s_pending.fire_at + 0.30f)
+            {
+                clear_pending(false, "followup-out-of-range");
+                return false;
+            }
+
             // R (subject::none) fires via common/cast_spell directly, no selector.
             if (s_pending.info.mood == subject::none)
             {
@@ -1029,14 +1056,14 @@ namespace hwei
             return tick_pending();
         }
 
-        bool try_cast_circular(const ability_info& info, pred_sdk::spell_data base_spell, int hitchance)
+        bool try_cast_circular(const ability_info& info, pred_sdk::spell_data base_spell, int hitchance, game_object* forced_target = nullptr)
         {
             if (!sdk::prediction) return false;
 
             auto* player = get_player();
             if (!player) return false;
 
-            auto* target = pick_target(base_spell.range);
+            auto* target = forced_target ? forced_target : pick_target(base_spell.range);
             if (!is_valid_target(target, base_spell.range))
                 return false;
 
@@ -1107,6 +1134,14 @@ namespace hwei
 
             if (!start_cast(ABILITY_QQ, cast_pos, target, s_pred_qq.range))
                 return false;
+            // Refresh the aim point at fire time; hitchance 0 = accept any valid
+            // prediction so the fallback stays lenient but isn't frozen in time.
+            if (!s_pending.repredict)
+            {
+                s_pending.repredict = true;
+                s_pending.repredict_spell = s_pred_qq;
+                s_pending.repredict_hitchance = 0;
+            }
             return tick_pending();
         }
 
@@ -1149,6 +1184,14 @@ namespace hwei
 
             if (!start_cast(ABILITY_QW, prediction.cast_position, target, spell.range))
                 return false;
+            // QW has ~0.3s subject confirm + 1.0s strike delay; without a refresh the
+            // killsteal aims at a position predicted at queue time and whiffs on movers.
+            if (!s_pending.repredict)
+            {
+                s_pending.repredict = true;
+                s_pending.repredict_spell = spell;
+                s_pending.repredict_hitchance = hitchance;
+            }
 
             return tick_pending();
         }
@@ -1611,13 +1654,47 @@ namespace hwei
             if (!r_spell || r_spell->get_level() <= 0) return 0.f;
 
             const int level = std::clamp(r_spell->get_level(), 1, 3);
-            // Spiraling Despair (per Data.cpp HweiR): 230/360/490 + 0.95 AP
-            constexpr float BASE[] = { 0.f, 230.f, 360.f, 490.f };
+            // Spiraling Despair max total over the full 3s duration (live patch):
+            // ticks 30/60/90 (+15% AP) + explosion 200/325/450 (+80% AP)
+            // = 230/385/540 + 0.95 AP
+            constexpr float BASE[] = { 0.f, 230.f, 385.f, 540.f };
             constexpr float AP_RATIO = 0.95f;
 
             const float ap = player->get_ability_power();
             const float raw = BASE[level] + AP_RATIO * ap;
 
+            return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw);
+        }
+
+        // Signature of the Visionary: if the target carries our mark, the next
+        // damaging ability detonates it for 40-313.8 (by level) + 35% AP bonus
+        // magic damage. Folding this into killsteal/indicator math matters — it
+        // is often the difference between "secured" and "walked away at 50 HP".
+        float get_passive_mark_damage(game_object* target)
+        {
+            auto* player = get_player();
+            if (!player || !target || !sdk::damage)
+                return 0.f;
+
+            bool marked = false;
+            for (auto* buff : target->get_buffs())
+            {
+                if (!buff || !buff->is_active())
+                    continue;
+                if (buff->get_name() != "HweiSignature")
+                    continue;
+                auto* caster = buff->get_caster();
+                if (caster && caster->get_network_id() != player->get_network_id())
+                    continue;
+                marked = true;
+                break;
+            }
+            if (!marked)
+                return 0.f;
+
+            const int lvl = std::clamp(player->get_level(), 1, 18);
+            const float base = 40.f + (313.82f - 40.f) * static_cast<float>(lvl - 1) / 17.f;
+            const float raw = base + 0.35f * player->get_ability_power();
             return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw);
         }
 
@@ -1635,7 +1712,9 @@ namespace hwei
 
             const int level = std::clamp(q_spell->get_level(), 1, 5);
             constexpr float BASE[] = { 0.f, 60.f, 85.f, 110.f, 135.f, 160.f };
-            constexpr float MAX_MISSING_HP_MULT[] = { 0.f, 2.00f, 2.375f, 2.75f, 3.125f, 3.50f };
+            // "Deals 200/237.5/275/312.5/350% increased damage based on missing
+            // health" => total = base * (1 + INC * missing%), up to 4.5x at rank 5.
+            constexpr float MAX_MISSING_HP_INC[] = { 0.f, 2.00f, 2.375f, 2.75f, 3.125f, 3.50f };
 
             float raw = BASE[level] + 0.25f * player->get_ability_power();
 
@@ -1645,8 +1724,7 @@ namespace hwei
                 if (max_hp > 0.f)
                 {
                     const float missing_pct = std::clamp((max_hp - target->get_hp()) / max_hp, 0.f, 1.f);
-                    const float mult = 1.f + (MAX_MISSING_HP_MULT[level] - 1.f) * missing_pct;
-                    raw *= mult;
+                    raw *= 1.f + MAX_MISSING_HP_INC[level] * missing_pct;
                 }
             }
 
@@ -1662,11 +1740,11 @@ namespace hwei
             if (!q_spell || q_spell->get_level() <= 0) return 0.f;
 
             const int idx = std::clamp(q_spell->get_level(), 1, 5) - 1;
-            // Devastating Fire [Fireball] direct hit (per Data.cpp HweiQQ):
-            //   base 60/90/120/150/180 + (3/4/5/6/7)% target max HP + 0.75 AP
-            constexpr float BASE[]   = { 60.f, 90.f, 120.f, 150.f, 180.f };
+            // Devastating Fire [Fireball] direct hit (live patch):
+            //   base 50/80/110/140/170 + (3/4/5/6/7)% target max HP + 0.70 AP
+            constexpr float BASE[]   = { 50.f, 80.f, 110.f, 140.f, 170.f };
             constexpr float HP_PCT[] = { 3.f,  4.f,  5.f,   6.f,   7.f   };
-            constexpr float AP_RATIO = 0.75f;
+            constexpr float AP_RATIO = 0.70f;
 
             const float raw = BASE[idx]
                 + HP_PCT[idx] * target->get_max_hp() / 100.f
@@ -1679,13 +1757,13 @@ namespace hwei
             auto* player = get_player();
             if (!player || !target || !sdk::damage) return 0.f;
 
-            // QE (Molten Fissure) initial hit (per Data.cpp HweiQE):
-            //   base 20/40/60/80/100 + 0.30 AP, ranks with Q slot
+            // QE (Molten Fissure) per-explosion hit (live patch):
+            //   base 20/35/50/65/80 + 0.30 AP, ranks with Q slot
             auto* q_spell = player->get_spell(SLOT_Q);
             if (!q_spell || q_spell->get_level() <= 0) return 0.f;
 
             const int idx = std::clamp(q_spell->get_level(), 1, 5) - 1;
-            constexpr float BASE[] = { 20.f, 40.f, 60.f, 80.f, 100.f };
+            constexpr float BASE[] = { 20.f, 35.f, 50.f, 65.f, 80.f };
             constexpr float AP_RATIO = 0.30f;
 
             const float raw = BASE[idx] + AP_RATIO * player->get_ability_power();
@@ -1697,21 +1775,21 @@ namespace hwei
             auto* player = get_player();
             if (!player || !target || !sdk::damage) return 0.f;
 
-            // EQ (Grim Visage) (per Data.cpp HweiEQ):
-            //   base 70/110/150/190/230 + 0.60 AP, ranks with E slot
+            // EQ (Grim Visage) (live patch):
+            //   base 70/110/150/190/230 + 0.65 AP, ranks with E slot
             auto* e_spell = player->get_spell(SLOT_E);
             if (!e_spell || e_spell->get_level() <= 0) return 0.f;
 
             const int idx = std::clamp(e_spell->get_level(), 1, 5) - 1;
             constexpr float BASE[] = { 70.f, 110.f, 150.f, 190.f, 230.f };
-            constexpr float AP_RATIO = 0.60f;
+            constexpr float AP_RATIO = 0.65f;
 
             const float raw = BASE[idx] + AP_RATIO * player->get_ability_power();
             return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw);
         }
 
         // EE (Crushing Maw) and EW (Gaze of the Abyss) share the same formula as EQ
-        // (per Data.cpp HweiEE / HweiEW): 70/110/150/190/230 + 0.60 AP, E slot.
+        // (live patch): 70/110/150/190/230 + 0.65 AP, E slot.
         float get_ee_damage(game_object* target) { return get_eq_damage(target); }
         float get_ew_damage(game_object* target) { return get_eq_damage(target); }
 
@@ -1753,6 +1831,9 @@ namespace hwei
             default:
                 break;
             }
+            // Multi-hit combos always detonate an existing Signature mark.
+            if (total > 0.f)
+                total += get_passive_mark_damage(target);
             return total;
         }
 
@@ -1772,13 +1853,91 @@ namespace hwei
             return hp + target->get_all_shield() + target->get_magical_shield();
         }
 
-        bool killsteal_qw()
+        // Generic killsteal pass: scan enemies in range whose predicted effective
+        // HP (incl. shields and a detonatable Signature mark) is below the spell's
+        // damage, then hand the kill target to the supplied cast function.
+        bool killsteal_scan(bool enabled, int ready_slot, float range, float hit_delay,
+            float (*damage_fn)(game_object*), bool blocked_by_followup_window, const char* tag,
+            const std::function<bool(game_object*)>& cast_fn)
         {
-            if (!menu::killsteal_qw || !g_sdk || !g_sdk->object_manager)
+            if (!enabled || !g_sdk || !g_sdk->object_manager)
+                return false;
+            if (consume_cast_engine_busy())
+                return false;
+            if (blocked_by_followup_window && has_combo_followup_window())
+                return false;
+            if (!is_spell_ready(ready_slot) || !has_mana_for(ready_slot))
+                return false;
+
+            for (auto* hero : g_sdk->object_manager->get_heroes())
+            {
+                if (!is_valid_target(hero, range))
+                    continue;
+
+                const float hp = get_magic_effective_hp(hero, hit_delay + 0.05f);
+                const float damage = damage_fn(hero) + get_passive_mark_damage(hero);
+                if (hp <= 0.f || hp > damage)
+                    continue;
+
+                if (HWEI_DEBUG_LOGS && g_sdk)
+                {
+                    g_sdk->log_console("[MeowAIO] %s killsteal target=%s hp=%.0f dmg=%.0f",
+                        tag, hero->get_name().c_str(), hp, damage);
+                }
+
+                if (cast_fn(hero))
+                    return true;
+            }
+
+            return false;
+        }
+
+        bool run_killsteals()
+        {
+            // QW first (largest execute), then the cheap pokes, R last.
+            if (killsteal_scan(menu::killsteal_qw, SLOT_Q, s_pred_qw.range, spell_data::qw_delay,
+                get_qw_damage, true, "QW",
+                [](game_object* h) { return cast_or_busy(try_cast_qw_on_target(h, menu::combo_qw_hitchance)); }))
+                return true;
+
+            if (killsteal_scan(menu::killsteal_qq, SLOT_Q, s_pred_qq.range, spell_data::qq_delay,
+                get_qq_damage, true, "QQ",
+                [](game_object* h) { return cast_or_busy(try_cast_linear(ABILITY_QQ, s_pred_qq, menu::combo_qq_hitchance, h)); }))
+                return true;
+
+            if (killsteal_scan(menu::killsteal_eq, SLOT_E, s_pred_eq.range, spell_data::eq_delay,
+                get_eq_damage, true, "EQ",
+                [](game_object* h) { return cast_or_busy(try_cast_linear(ABILITY_EQ, s_pred_eq, menu::combo_eq_hitchance, h)); }))
+                return true;
+
+            if (killsteal_scan(menu::killsteal_qe, SLOT_Q, s_pred_qe.range, spell_data::qe_delay,
+                get_qe_damage, true, "QE",
+                [](game_object* h) { return cast_or_busy(try_cast_linear(ABILITY_QE, s_pred_qe, menu::combo_qe_hitchance, h)); }))
+                return true;
+
+            // R is a standalone ultimate (no subject selector), so it may fire during
+            // a combo follow-up window to secure a kill.
+            if (killsteal_scan(menu::killsteal_r, SLOT_R, s_pred_r.range, spell_data::r_delay,
+                get_r_damage, false, "R",
+                [](game_object* h) { return try_cast_r_on_target(h, menu::combo_r_hitchance); }))
+                return true;
+
+            return false;
+        }
+
+        // Convert allied hard CC into damage: QW gains up to 4.5x on immobilized
+        // targets, and R is trivially landed while the target cannot move.
+        bool auto_cast_on_cc()
+        {
+            if (!menu::auto_qw_on_cc && !menu::auto_r_on_cc)
+                return false;
+            if (!g_sdk || !g_sdk->object_manager)
                 return false;
             if (consume_cast_engine_busy() || has_combo_followup_window())
                 return false;
-            if (!is_spell_ready(SLOT_Q) || !has_mana_for(SLOT_Q))
+
+            auto* player = get_player();
+            if (!player)
                 return false;
 
             for (auto* hero : g_sdk->object_manager->get_heroes())
@@ -1786,125 +1945,84 @@ namespace hwei
                 if (!is_valid_target(hero, s_pred_qw.range))
                     continue;
 
-                const float hp = get_magic_effective_hp(hero, spell_data::qw_delay + 0.05f);
-                const float damage = get_qw_damage(hero);
-                if (hp <= 0.f || hp > damage)
+                const float cc_left = hard_cc_remaining(hero);
+                if (cc_left <= 0.f)
                     continue;
 
-                if (HWEI_DEBUG_LOGS && g_sdk)
+                if (menu::auto_qw_on_cc
+                    && is_spell_ready(SLOT_Q) && has_mana_for(SLOT_Q))
                 {
-                    g_sdk->log_console("[MeowAIO] QW killsteal target=%s hp=%.0f dmg=%.0f",
-                        hero->get_name().c_str(), hp, damage);
+                    const float max_hp = hero->get_max_hp();
+                    const float missing_pct = max_hp > 0.f
+                        ? (max_hp - hero->get_hp()) / max_hp * 100.f : 0.f;
+                    // The bolt must land while the CC still holds, or the
+                    // missing-HP bonus (and the guaranteed hit) is gone.
+                    const float confirm = get_game_subject() == subject::disaster
+                        ? 0.05f : SUBJECT_CONFIRM_DELAY;
+                    if (missing_pct >= static_cast<float>(menu::auto_qw_cc_min_missing)
+                        && cc_left > confirm + spell_data::qw_delay
+                        && cast_or_busy(try_cast_qw_on_target(hero, pred_sdk::hitchance::any)))
+                        return true;
                 }
 
-                if (cast_or_busy(try_cast_qw_on_target(hero, menu::combo_qw_hitchance)))
-                    return true;
+                if (menu::auto_r_on_cc
+                    && is_spell_ready(SLOT_R) && has_mana_for(SLOT_R)
+                    && is_valid_target(hero, s_pred_r.range))
+                {
+                    const float dist = player->get_position().distance(hero->get_position());
+                    if (cc_left > spell_data::r_delay + dist / spell_data::r_speed
+                        && try_cast_r_on_target(hero, pred_sdk::hitchance::medium))
+                        return true;
+                }
             }
 
             return false;
         }
 
-        bool killsteal_r()
+        // Remaining time on an interruptible channel (0 if the hero is not
+        // channeling something we can break). Uses the spell's own static flags
+        // instead of a hardcoded champion list.
+        float interruptible_channel_remaining(game_object* hero)
         {
-            if (!menu::killsteal_r || !g_sdk || !g_sdk->object_manager)
+            if (!hero)
+                return 0.f;
+
+            auto* ac = hero->get_active_spell_cast();
+            if (!ac)
+                return 0.f;
+
+            auto* cast = ac->get_spell_cast();
+            if (!cast || cast->is_basic_attack() || cast->is_special_attack())
+                return 0.f;
+
+            auto* data = cast->get_spell_data();
+            auto* static_data = data ? data->get_static_data() : nullptr;
+            if (!static_data || !static_data->channel_is_interrupted_by_disables())
+                return 0.f;
+
+            const float t = now();
+            const float chan_end = ac->get_cast_channeling_end_time();
+            // Require a real channel; sub-second "channels" are just cast animations
+            // that will finish before our CC arrives anyway.
+            if (chan_end - ac->get_cast_start_time() < 1.0f)
+                return 0.f;
+
+            return std::max(chan_end - t, 0.f);
+        }
+
+        bool interrupter()
+        {
+            if (!menu::interrupt_eq && !menu::interrupt_ee)
                 return false;
-            // R is a standalone ultimate (no subject selector), so it may fire during
-            // a combo follow-up window to secure a kill — only the active cast engine blocks it.
+            if (!g_sdk || !g_sdk->object_manager)
+                return false;
             if (consume_cast_engine_busy())
                 return false;
-            if (!is_spell_ready(SLOT_R) || !has_mana_for(SLOT_R))
+            if (!is_spell_learned(SLOT_E) || !is_spell_ready(SLOT_E) || !has_mana_for(SLOT_E))
                 return false;
 
-            for (auto* hero : g_sdk->object_manager->get_heroes())
-            {
-                if (!is_valid_target(hero, s_pred_r.range))
-                    continue;
-
-                const float hp = get_magic_effective_hp(hero, spell_data::r_delay + 0.05f);
-                const float damage = get_r_damage(hero);
-                if (hp <= 0.f || hp > damage)
-                    continue;
-
-                if (HWEI_DEBUG_LOGS && g_sdk)
-                {
-                    g_sdk->log_console("[MeowAIO] R killsteal target=%s hp=%.0f dmg=%.0f",
-                        hero->get_name().c_str(), hp, damage);
-                }
-
-                if (try_cast_r_on_target(hero, menu::combo_r_hitchance))
-                    return true;
-            }
-
-            return false;
-        }
-
-        bool killsteal_qq()
-        {
-            if (!menu::killsteal_qq || !g_sdk || !g_sdk->object_manager)
-                return false;
-            if (consume_cast_engine_busy() || has_combo_followup_window())
-                return false;
-            if (!is_spell_ready(SLOT_Q) || !has_mana_for(SLOT_Q))
-                return false;
-
-            for (auto* hero : g_sdk->object_manager->get_heroes())
-            {
-                if (!is_valid_target(hero, s_pred_qq.range))
-                    continue;
-
-                const float hp = get_magic_effective_hp(hero, spell_data::qq_delay + 0.05f);
-                const float damage = get_qq_damage(hero);
-                if (hp <= 0.f || hp > damage)
-                    continue;
-
-                if (HWEI_DEBUG_LOGS && g_sdk)
-                    g_sdk->log_console("[MeowAIO] QQ killsteal target=%s hp=%.0f dmg=%.0f",
-                        hero->get_name().c_str(), hp, damage);
-
-                if (cast_or_busy(try_cast_linear(ABILITY_QQ, s_pred_qq, menu::combo_qq_hitchance, hero)))
-                    return true;
-            }
-
-            return false;
-        }
-
-        bool killsteal_qe()
-        {
-            if (!menu::killsteal_qe || !g_sdk || !g_sdk->object_manager)
-                return false;
-            if (consume_cast_engine_busy() || has_combo_followup_window())
-                return false;
-            if (!is_spell_ready(SLOT_Q) || !has_mana_for(SLOT_Q))
-                return false;
-
-            for (auto* hero : g_sdk->object_manager->get_heroes())
-            {
-                if (!is_valid_target(hero, s_pred_qe.range))
-                    continue;
-
-                const float hp = get_magic_effective_hp(hero, spell_data::qe_delay + 0.05f);
-                const float damage = get_qe_damage(hero);
-                if (hp <= 0.f || hp > damage)
-                    continue;
-
-                if (HWEI_DEBUG_LOGS && g_sdk)
-                    g_sdk->log_console("[MeowAIO] QE killsteal target=%s hp=%.0f dmg=%.0f",
-                        hero->get_name().c_str(), hp, damage);
-
-                if (cast_or_busy(try_cast_linear(ABILITY_QE, s_pred_qe, menu::combo_qe_hitchance, hero)))
-                    return true;
-            }
-
-            return false;
-        }
-
-        bool killsteal_eq()
-        {
-            if (!menu::killsteal_eq || !g_sdk || !g_sdk->object_manager)
-                return false;
-            if (consume_cast_engine_busy() || has_combo_followup_window())
-                return false;
-            if (!is_spell_ready(SLOT_E) || !has_mana_for(SLOT_E))
+            auto* player = get_player();
+            if (!player)
                 return false;
 
             for (auto* hero : g_sdk->object_manager->get_heroes())
@@ -1912,16 +2030,28 @@ namespace hwei
                 if (!is_valid_target(hero, s_pred_eq.range))
                     continue;
 
-                const float hp = get_magic_effective_hp(hero, spell_data::eq_delay + 0.05f);
-                const float damage = get_eq_damage(hero);
-                if (hp <= 0.f || hp > damage)
+                const float remaining = interruptible_channel_remaining(hero);
+                if (remaining <= 0.f)
                     continue;
 
-                if (HWEI_DEBUG_LOGS && g_sdk)
-                    g_sdk->log_console("[MeowAIO] EQ killsteal target=%s hp=%.0f dmg=%.0f",
-                        hero->get_name().c_str(), hp, damage);
+                const float dist = player->get_position().distance(hero->get_position());
+                const float confirm = get_game_subject() == subject::torment
+                    ? 0.05f : SUBJECT_CONFIRM_DELAY;
 
-                if (cast_or_busy(try_cast_linear(ABILITY_EQ, s_pred_eq, menu::combo_eq_hitchance, hero)))
+                if (HWEI_DEBUG_LOGS && g_sdk)
+                    g_sdk->log_console("[MeowAIO] interrupt target=%s remaining=%.2f dist=%.0f",
+                        hero->get_name().c_str(), remaining, dist);
+
+                // EE knockup if the snap lands in time, otherwise EQ fear.
+                if (menu::interrupt_ee
+                    && dist <= s_pred_ee.range
+                    && confirm + spell_data::ee_delay < remaining
+                    && cast_or_busy(try_cast_circular(ABILITY_EE, s_pred_ee, pred_sdk::hitchance::any, hero)))
+                    return true;
+
+                if (menu::interrupt_eq
+                    && confirm + spell_data::eq_delay + dist / spell_data::eq_speed < remaining
+                    && cast_or_busy(try_cast_linear(ABILITY_EQ, s_pred_eq, pred_sdk::hitchance::any, hero)))
                     return true;
             }
 
@@ -1942,6 +2072,8 @@ namespace hwei
             if (menu::bind_ee_active && cast_or_busy(try_cast_ee(menu::combo_ee_hitchance)))
                 return true;
             if (menu::bind_eq_active && cast_or_busy(try_cast_eq(menu::combo_eq_hitchance)))
+                return true;
+            if (menu::bind_ew_active && cast_or_busy(try_cast_ew_root_setup()))
                 return true;
             return false;
         }
@@ -2139,6 +2271,150 @@ namespace hwei
             lane_qq_lasthit();
         }
 
+        float point_to_segment_dist(const math::vector3& p,
+            const math::vector3& a,
+            const math::vector3& b)
+        {
+            const float dx = b.x - a.x, dz = b.z - a.z;
+            const float len_sq = dx * dx + dz * dz;
+            if (len_sq <= 0.f) return p.distance(a);
+            const float t = std::clamp(((p.x - a.x) * dx + (p.z - a.z) * dz) / len_sq, 0.f, 1.f);
+            const float ex = p.x - (a.x + t * dx);
+            const float ez = p.z - (a.z + t * dz);
+            return std::sqrt(ex * ex + ez * ez);
+        }
+
+        // Best QE line through `units` from the player's position: anchor the line
+        // on each unit and count how many others it clips. Returns hit count.
+        int best_qe_line(const std::vector<game_object*>& units,
+            const math::vector3& ppos, math::vector3& out_pos)
+        {
+            int best_hits = 0;
+            for (auto* anchor : units)
+            {
+                const auto apos = anchor->get_position();
+                int hits = 0;
+                for (auto* u : units)
+                {
+                    const float hit_r = s_pred_qe.radius + u->get_bounding_radius();
+                    if (point_to_segment_dist(u->get_position(), ppos, apos) <= hit_r)
+                        ++hits;
+                }
+                if (hits > best_hits)
+                {
+                    best_hits = hits;
+                    out_pos = apos;
+                }
+            }
+            return best_hits;
+        }
+
+        bool lane_qe_clear()
+        {
+            if (!menu::lane_use_qe)
+                return false;
+
+            auto* player = get_player();
+            if (!player || !g_sdk || !g_sdk->object_manager)
+                return false;
+
+            const auto ppos = player->get_position();
+
+            std::vector<game_object*> minions;
+            for (auto* m : g_sdk->object_manager->get_minions())
+            {
+                if (!m || !m->is_valid() || m->is_dead() || !m->is_targetable())
+                    continue;
+                if (m->get_team_id() == player->get_team_id())
+                    continue;
+                if (!m->is_lane_minion())
+                    continue;
+                if (ppos.distance(m->get_position()) > s_pred_qe.range)
+                    continue;
+                minions.push_back(m);
+            }
+
+            if (minions.empty())
+                return false;
+
+            math::vector3 best_pos{};
+            const int best_hits = best_qe_line(minions, ppos, best_pos);
+
+            if (best_hits >= menu::lane_qe_min_minions)
+            {
+                if (start_cast(ABILITY_QE, best_pos, nullptr, s_pred_qe.range))
+                    return tick_pending() || s_pending.active;
+            }
+            return false;
+        }
+
+        bool jungle_clear()
+        {
+            if (!menu::jungle_use_qq && !menu::jungle_use_qe)
+                return false;
+            if (!is_spell_ready(SLOT_Q) || !has_mana_for(SLOT_Q))
+                return false;
+
+            auto* player = get_player();
+            if (!player || !g_sdk || !g_sdk->object_manager)
+                return false;
+
+            const auto ppos = player->get_position();
+
+            std::vector<game_object*> monsters;
+            for (auto* m : g_sdk->object_manager->get_monsters())
+            {
+                if (!m || !m->is_valid() || m->is_dead() || !m->is_targetable() || !m->is_visible())
+                    continue;
+                if (ppos.distance(m->get_position()) > s_pred_qe.range)
+                    continue;
+                monsters.push_back(m);
+            }
+
+            if (monsters.empty())
+                return false;
+
+            // QE through the camp when enough monsters line up.
+            if (menu::jungle_use_qe && monsters.size() >= static_cast<size_t>(menu::jungle_qe_min_monsters))
+            {
+                math::vector3 best_pos{};
+                const int best_hits = best_qe_line(monsters, ppos, best_pos);
+                if (best_hits >= menu::jungle_qe_min_monsters
+                    && start_cast(ABILITY_QE, best_pos, nullptr, s_pred_qe.range))
+                {
+                    tick_pending();
+                    return true;
+                }
+            }
+
+            // QQ the highest-HP monster in range (max-HP scaling makes it the
+            // best single-target camp spell; capped at 250 vs monsters).
+            if (menu::jungle_use_qq)
+            {
+                game_object* best = nullptr;
+                for (auto* m : monsters)
+                {
+                    if (ppos.distance(m->get_position()) > s_pred_qq.range)
+                        continue;
+                    if (!best || m->get_hp() > best->get_hp())
+                        best = m;
+                }
+                if (best && start_cast(ABILITY_QQ, best->get_position(), best, s_pred_qq.range))
+                {
+                    if (!s_pending.repredict)
+                    {
+                        s_pending.repredict = true;
+                        s_pending.repredict_spell = s_pred_qq;
+                        s_pending.repredict_hitchance = 0;
+                    }
+                    tick_pending();
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         void lane()
         {
             if (!sdk::orbwalker || !sdk::orbwalker->is_spell_farm_enabled())
@@ -2153,72 +2429,10 @@ namespace hwei
             if (lane_qq_lasthit())
                 return;
 
-            if (!menu::lane_use_qe)
+            if (lane_qe_clear())
                 return;
 
-            auto* player = get_player();
-            if (!player || !g_sdk || !g_sdk->object_manager)
-                return;
-
-            const auto ppos = player->get_position();
-            const float range = s_pred_qe.range;
-            const float radius = s_pred_qe.radius;
-
-            std::vector<game_object*> minions;
-            for (auto* m : g_sdk->object_manager->get_minions())
-            {
-                if (!m || !m->is_valid() || m->is_dead() || !m->is_targetable())
-                    continue;
-                if (m->get_team_id() == player->get_team_id())
-                    continue;
-                if (!m->is_lane_minion())
-                    continue;
-                if (ppos.distance(m->get_position()) > range)
-                    continue;
-                minions.push_back(m);
-            }
-
-            if (minions.empty())
-                return;
-
-            auto pt_seg_dist = [](const math::vector3& p,
-                const math::vector3& a,
-                const math::vector3& b) -> float
-            {
-                const float dx = b.x - a.x, dz = b.z - a.z;
-                const float len_sq = dx * dx + dz * dz;
-                if (len_sq <= 0.f) return p.distance(a);
-                const float t = std::clamp(((p.x - a.x) * dx + (p.z - a.z) * dz) / len_sq, 0.f, 1.f);
-                const float ex = p.x - (a.x + t * dx);
-                const float ez = p.z - (a.z + t * dz);
-                return std::sqrt(ex * ex + ez * ez);
-            };
-
-            int best_hits = 0;
-            math::vector3 best_pos{};
-
-            for (auto* anchor : minions)
-            {
-                const auto apos = anchor->get_position();
-                int hits = 0;
-                for (auto* m : minions)
-                {
-                    const float hit_r = radius + m->get_bounding_radius();
-                    if (pt_seg_dist(m->get_position(), ppos, apos) <= hit_r)
-                        ++hits;
-                }
-                if (hits > best_hits)
-                {
-                    best_hits = hits;
-                    best_pos = apos;
-                }
-            }
-
-            if (best_hits >= menu::lane_qe_min_minions)
-            {
-                if (start_cast(ABILITY_QE, best_pos, nullptr, s_pred_qe.range))
-                    tick_pending();
-            }
+            jungle_clear();
         }
 
         uint32_t draw_color(int slot, uint32_t base_color)
@@ -2480,12 +2694,23 @@ namespace hwei
             q_menu->add_checkbox("ks_qw", "Killsteal QW", menu::killsteal_qw,
                 [](bool v) { menu::killsteal_qw = v; });
             q_menu->add_separator();
+            q_menu->add_checkbox("auto_qw_cc", "Auto QW on CC", menu::auto_qw_on_cc,
+                [](bool v) { menu::auto_qw_on_cc = v; });
+            q_menu->add_slider_int("auto_qw_cc_hp", "  Min Missing HP %", 0, 100, 5, menu::auto_qw_cc_min_missing,
+                [](int v) { menu::auto_qw_cc_min_missing = v; });
+            q_menu->add_separator();
             q_menu->add_checkbox("lane_qq", "Use QQ to Lasthit", menu::lane_use_qq,
                 [](bool v) { menu::lane_use_qq = v; });
             q_menu->add_checkbox("lane_qe", "Lane Clear QE", menu::lane_use_qe,
                 [](bool v) { menu::lane_use_qe = v; });
-            q_menu->add_slider_int("lane_qe_min", "Lane Clear Min Minions", 1, 10, 1, menu::lane_qe_min_minions,
+            q_menu->add_slider_int("lane_qe_min", "Lane Clear Min %", 1, 10, 1, menu::lane_qe_min_minions,
                 [](int v) { menu::lane_qe_min_minions = v; });
+            q_menu->add_checkbox("jungle_qq", "Jungle Clear QQ", menu::jungle_use_qq,
+                [](bool v) { menu::jungle_use_qq = v; });
+            q_menu->add_checkbox("jungle_qe", "Jungle Clear QE", menu::jungle_use_qe,
+                [](bool v) { menu::jungle_use_qe = v; });
+            q_menu->add_slider_int("jungle_qe_min", "Jungle Clear Min %", 1, 6, 1, menu::jungle_qe_min_monsters,
+                [](int v) { menu::jungle_qe_min_monsters = v; });
             q_menu->add_separator();
             q_menu->add_checkbox("draw_qq", "Draw QQ", menu::draw_qq,
                 [](bool v) { menu::draw_qq = v; });
@@ -2550,10 +2775,26 @@ namespace hwei
                                          menu::bind_eq_active ? 0xFF00FF00u : 0xFFFF0000u };
                             });
                 });
+            e_menu->add_hotkey("bind_ew", "Semi-Manual EW", 'B', false, false,
+                [](std::string* key, bool pressed)
+                {
+                    menu::bind_ew_active = pressed;
+                    if (sdk::infotab && s_infotab_bind_ew == 0 && key)
+                        s_infotab_bind_ew = sdk::infotab->add_hotkey_text(key, { "EW" },
+                            []() -> infotab_sdk::text_entry {
+                                return { menu::bind_ew_active ? "ON" : "OFF",
+                                         menu::bind_ew_active ? 0xFF00FF00u : 0xFFFF0000u };
+                            });
+                });
             e_menu->add_slider_int("hc_eq", "  EQ Hitchance", 0, 100, 5, menu::combo_eq_hitchance,
                 [](int v) { menu::combo_eq_hitchance = v; });
             e_menu->add_slider_int("hc_ee", "  EE Hitchance", 0, 100, 5, menu::combo_ee_hitchance,
                 [](int v) { menu::combo_ee_hitchance = v; });
+            e_menu->add_separator();
+            e_menu->add_checkbox("int_eq", "Anti-Gap EQ", menu::interrupt_eq,
+                [](bool v) { menu::interrupt_eq = v; });
+            e_menu->add_checkbox("int_ee", "Anti-Gap EE", menu::interrupt_ee,
+                [](bool v) { menu::interrupt_ee = v; });
             e_menu->add_separator();
             e_menu->add_checkbox("ks_eq", "Killsteal EQ", menu::killsteal_eq,
                 [](bool v) { menu::killsteal_eq = v; });
@@ -2584,6 +2825,8 @@ namespace hwei
                 });
             r_menu->add_checkbox("ks_r", "Killsteal R", menu::killsteal_r,
                 [](bool v) { menu::killsteal_r = v; });
+            r_menu->add_checkbox("auto_r_cc", "Auto R CC", menu::auto_r_on_cc,
+                [](bool v) { menu::auto_r_on_cc = v; });
             r_menu->add_slider_int("hc_r", "  R Hitchance", 0, 100, 5, menu::combo_r_hitchance,
                 [](int v) { menu::combo_r_hitchance = v; });
             r_menu->add_checkbox("draw_r", "Draw R", menu::draw_r,
@@ -2613,8 +2856,8 @@ namespace hwei
                 [](bool v) { menu::draw_combo_damage_indicator = v; });
             //draw_menu->add_checkbox("debug_logs", "Debug Logs", menu::debug_logs,
                 //[](bool v) {
-                    //menu::debug_logs = v;
-                   // HWEI_DEBUG_LOGS = v;
+                   // menu::debug_logs = v;
+                 //   HWEI_DEBUG_LOGS = v;
                // });
             draw_menu->add_separator();
             draw_menu->add_colorpicker("color_qq", "  QQ Color", menu::color_qq,
@@ -2702,6 +2945,7 @@ namespace hwei
             if (s_infotab_bind_we)   sdk::infotab->remove_text(s_infotab_bind_we);
             if (s_infotab_bind_ee)   sdk::infotab->remove_text(s_infotab_bind_ee);
             if (s_infotab_bind_eq)   sdk::infotab->remove_text(s_infotab_bind_eq);
+            if (s_infotab_bind_ew)   sdk::infotab->remove_text(s_infotab_bind_ew);
             if (s_infotab_bind_r)    sdk::infotab->remove_text(s_infotab_bind_r);
         }
         s_infotab_combo_mode = 0;
@@ -2709,6 +2953,7 @@ namespace hwei
         s_infotab_bind_we    = 0;
         s_infotab_bind_ee    = 0;
         s_infotab_bind_eq    = 0;
+        s_infotab_bind_ew    = 0;
         s_infotab_bind_r     = 0;
 
         s_menu = nullptr;
@@ -2739,19 +2984,13 @@ namespace hwei
         if (handle_hotkeys())
             return;
 
-        if (killsteal_qw())
+        if (interrupter())
             return;
 
-        if (killsteal_qq())
+        if (run_killsteals())
             return;
 
-        if (killsteal_eq())
-            return;
-
-        if (killsteal_qe())
-            return;
-
-        if (killsteal_r())
+        if (auto_cast_on_cc())
             return;
 
         if (handle_ww())

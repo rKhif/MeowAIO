@@ -25,7 +25,7 @@ namespace hwei
         constexpr float qw_radius = 225.f;
 
         constexpr float qe_range  = 1250.f;
-        constexpr float qe_delay  = 0.70f; // path erupts 0.7s after cast (0.35 windup is only the lock animation)
+        constexpr float qe_delay  = 0.60f; // path erupts 0.6s after cast (0.35 windup is only the lock animation)
         constexpr float qe_radius = 110.f;
         constexpr float qe_speed  = 1500.f; // shockwaves march outward from the cast point
 
@@ -99,6 +99,15 @@ namespace hwei
         inline bool killsteal_eq = false;
         inline bool killsteal_r  = false;
 
+        // Auto-cast on hard CC
+        inline bool auto_qw_on_cc = false;
+        inline int  auto_qw_cc_min_missing = 30;
+        inline bool auto_r_on_cc  = false;
+
+        // Channel interrupter (Torment CC)
+        inline bool interrupt_eq = true;
+        inline bool interrupt_ee = false;
+
         // Debug
         inline bool debug_logs = false;
 
@@ -125,11 +134,17 @@ namespace hwei
         inline int  lane_qe_min_minions = 3;
         inline int  lane_mana_pct = 45;
 
+        // Jungle Clear
+        inline bool jungle_use_qq = true;
+        inline bool jungle_use_qe = true;
+        inline int  jungle_qe_min_monsters = 2;
+
         // Semi-manual keys
         inline bool bind_qw_active = false;
         inline bool bind_we_active = false;
         inline bool bind_ee_active = false;
         inline bool bind_eq_active = false;
+        inline bool bind_ew_active = false;
         inline bool bind_r_active  = false;
 
         // Drawing

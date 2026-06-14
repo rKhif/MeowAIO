@@ -70,7 +70,13 @@ namespace zeri
         // --- Main ---
         inline int  aa_mode           = AA_SMART;
 
+        // --- Q collision ---
+        inline bool q_minion_collision       = true;  // enable minion collision on Q
+        inline int  q_collision_remove_level = 0;     // 1-18: auto-disable at this level; 0 = never
+
         // --- Combo ---
+        inline bool combo_use_q       = true;
+        inline bool harass_use_q      = true;
         inline bool combo_use_w       = true;
         inline bool combo_use_e       = true;
         inline int  combo_e_max_near  = 2;
@@ -84,6 +90,8 @@ namespace zeri
         inline int  harass_mana_pct   = 30;
 
         // --- Lane / lasthit / jungle ---
+        inline bool lane_use_q_lh     = true;
+        inline bool lane_use_q_clear  = true;
         inline bool lane_use_w        = true;
         inline int  lane_mana_pct     = 30;
         inline bool lh_w_cannon       = false;
@@ -93,7 +101,11 @@ namespace zeri
         inline bool  flee_use_e              = true;
         // E in flee only fires when the player is within this distance of a
         // wall-jump spot's near endpoint.
-        inline float flee_wall_jump_max_dist = 250.f;
+        inline float flee_wall_jump_max_dist = 150.f;
+
+        // --- Wall Jump hotkey ---
+        inline bool        jump_key_active = false;
+        inline std::string jump_key_str;
 
         // --- Hitchance ---
         inline int  w_hitchance       = 70;
@@ -101,24 +113,19 @@ namespace zeri
         // --- Semi-W hotkey ---
         inline bool        semi_w_active = false;
         inline std::string semi_w_key_str;
-        inline uint32_t    infotab_aa_mode = 0;
 
         // --- R input blocker ---
         // Master toggle: when on, the in-game R keypress is suppressed unless
         // at least one enemy hero is inside R's radius.
         inline bool r_block_enabled    = true;
-        // Custom override: when on, use `r_block_custom_min` for the
-        // threshold instead of the default of 1.
-        inline bool r_block_use_custom = false;
-        inline int  r_block_custom_min = 3;
 
         // --- Drawings ---
         inline bool draw_q_range      = true;
         inline bool draw_w_range      = true;
         inline bool draw_e_range      = false;
+        inline bool draw_e_preview    = true;
         inline bool draw_r_range      = false;
         inline bool draw_status_text  = true;
-        inline bool draw_damage_bar   = true;
         inline bool draw_r_dmg_bar    = true;
         inline bool draw_only_ready   = false;
         inline bool draw_jump_spots   = false;
@@ -128,8 +135,8 @@ namespace zeri
         inline uint32_t color_q       = 0xFFB464C8u; // purple-ish
         inline uint32_t color_w       = 0xFFDCB43Cu; // gold
         inline uint32_t color_e       = 0xFFFFB400u; // amber
+        inline uint32_t color_e_preview = 0xFF00FFFFu; // cyan
         inline uint32_t color_r       = 0xFF50FF78u; // green
-        inline uint32_t color_r_dmg   = 0x9050FF78u; // green w/ alpha (R dmg bar)
         inline uint32_t color_jump    = 0xFFFFFFFFu; // white
     }
 
@@ -144,9 +151,6 @@ namespace zeri
     // ============================================================================
     void __fastcall on_update();
     void __fastcall on_draw();
-    void __fastcall on_process_cast(game_object* obj, spell_cast* cast);
-    void __fastcall on_buff_gain(game_object* obj, buff_instance* buff);
-    void __fastcall on_buff_loss(game_object* obj, buff_instance* buff);
     bool __fastcall on_cast_spell(game_object* obj, int spell_slot, math::vector3 position, game_object* target);
     bool __stdcall  on_before_attack(orb_sdk::event_data* data);
 

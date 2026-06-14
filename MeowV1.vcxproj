@@ -152,6 +152,7 @@
     <ClInclude Include="..\sm_sdk.hpp" />
     <ClInclude Include="..\ts_sdk.hpp" />
     <ClInclude Include="aphelios.h" />
+    <ClInclude Include="zeri.h" />
     <ClInclude Include="champs\aurora.hpp" />
     <ClInclude Include="champs\milio\data.h" />
     <ClInclude Include="mel.h" />
@@ -174,6 +175,7 @@
   <ItemGroup>
     <ClCompile Include="..\main.cpp" />
     <ClCompile Include="aphelios.cpp" />
+    <ClCompile Include="zeri.cpp" />
     <ClCompile Include="champs\aurora.cpp" />
     <ClCompile Include="champs\milio\data.cpp" />
     <ClCompile Include="mel.cpp" />

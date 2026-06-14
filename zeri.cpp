@@ -82,16 +82,99 @@ namespace zeri
     static bool  overcharged       = false;  // R active
     static bool  lightning_rounds  = false;  // E wall-jump empower
     static bool  passive_charged   = false;  // passive ready (next AA enhanced)
-    static int   hypercharged_stk  = 0;
+    static int   hypercharged_stk  = 0;      // R stacks (Hypercharged)
     static float attack_speed      = 0.658f;
     static float bonus_as          = 0.f;
     static float total_ad          = 56.f;
+
+    // --- Per-tick caches (refresh_state) ---
+    static float c_q_range     = spell_data::q_range;
+    static float c_q_speed     = spell_data::q_speed;
+    static float c_q_cast_time = spell_data::q_windup_pct / 0.658f;
+    static float c_w_cast_time = spell_data::w_cast_time_max;
+    static float c_aa_range    = spell_data::passive_aa_range;
+
+    // Hero snapshot — populated once per tick to avoid O(n) loops in every helper
+    struct hero_snapshot {
+        int           in_r        = 0;       // enemies inside R radius (+25 buffer)
+        int           in_1200     = 0;       // enemies within 1200u (E dive cap)
+        int           in_1500     = 0;       // enemies within 1500u (fight radius)
+        game_object*  closest     = nullptr; // closest enemy hero
+        float         closest_d   = FLT_MAX;
+    };
+    static hero_snapshot s_heroes{};
+
+    // --- Wall jump hotkey state ---
+    static math::vector3 s_jump_near = {};
+    static math::vector3 s_jump_far  = {};
+    static bool          s_jump_locked = false; // spot committed, walking to near pt
 
     // --- Cast pacing ---
     static float last_q_cast_time = 0.f;
     static float last_w_cast_time = 0.f;
     static float last_spell_cast_time = 0.f;
     static constexpr float MIN_SPELL_DELAY = 0.05f;
+
+    // ============================================================================
+    // WALL JUMP HOTKEY — walk-to + vault
+    // ============================================================================
+    // Called every tick from on_update. When jump_key_active:
+    //   1. Lock onto nearest spot, record near/far endpoints.
+    //   2. Issue move_to toward the near (entry) point each tick until within 25u.
+    //   3. Fire E directly at far_pt — the server clamps to 300u range but uses
+    //      the exact coordinate for wall-crossing, making spawn vaults reliable.
+    //   4. Cancel if the player redirects movement or presses the key again.
+    static void update_jump_spot()
+    {
+        if (!menu::jump_key_active) {
+            s_jump_locked = false;
+            return;
+        }
+
+        auto p = g_sdk->object_manager->get_local_player();
+        if (!p || p->is_dead() || !sdk::common) {
+            menu::jump_key_active = false;
+            s_jump_locked = false;
+            return;
+        }
+        const auto pos = p->get_position();
+
+        // Lock onto the nearest spot once per activation.
+        if (!s_jump_locked) {
+            auto* spot = find_nearest_wall_jump(pos, 500.f);
+            if (!spot) { menu::jump_key_active = false; return; }
+
+            const float d1 = pos.distance(spot->start);
+            const float d2 = pos.distance(spot->end);
+            if (d1 < d2) { s_jump_near = spot->start; s_jump_far = spot->end; }
+            else          { s_jump_near = spot->end;   s_jump_far = spot->start; }
+
+            s_jump_locked = true;
+            sdk::common->issue_order(game_object_order::move_to, s_jump_near, false);
+            return;
+        }
+
+        // Cancel if the player's path destination diverged from the near point
+        // (user clicked somewhere else).
+        auto path = p->get_path();
+        if (!path.empty() && path.back().distance(s_jump_near) > 80.f) {
+            menu::jump_key_active = false;
+            s_jump_locked = false;
+            return;
+        }
+
+        if (pos.distance(s_jump_near) <= 25.f) {
+            if (is_spell_ready(SLOT_E) && has_enough_mana(SLOT_E)) {
+                if (sdk::common->cast_spell(SLOT_E, s_jump_far)) {
+                    last_spell_cast_time = g_sdk->clock_facade->get_game_time();
+                    menu::jump_key_active = false;
+                    s_jump_locked = false;
+                }
+            }
+        } else {
+            sdk::common->issue_order(game_object_order::move_to, s_jump_near, false);
+        }
+    }
 
     // ============================================================================
     // SPELL VALIDATION HELPERS
@@ -167,7 +250,7 @@ namespace zeri
     }
 
     // ============================================================================
-    // STATE REFRESH
+    // STATE REFRESH — caches everything that's used more than once per tick
     // ============================================================================
     static void refresh_state()
     {
@@ -185,49 +268,67 @@ namespace zeri
             hypercharged_stk = (int)b->get_stacks();
         else
             hypercharged_stk = 0;
+
+        // Cached ranges / cast times
+        c_aa_range = p->get_attack_range();
+        const float aa_extra = std::max(0.f, c_aa_range - spell_data::passive_aa_range);
+        c_q_range  = spell_data::q_range + aa_extra;
+        c_q_speed  = overcharged ? spell_data::q_speed_overcharged : spell_data::q_speed;
+        float qct  = spell_data::q_windup_pct / std::min(attack_speed, spell_data::q_as_cap);
+        if (overcharged) qct *= spell_data::q_overcharged_windup_mult;
+        c_q_cast_time = qct;
+        c_w_cast_time = std::max(spell_data::w_cast_time_max - spell_data::w_cast_time_scale * bonus_as,
+                                 spell_data::w_cast_time_min);
+
+        // Hero snapshot — one O(n) loop per tick instead of one per helper
+        s_heroes = {};
+        const auto pos = p->get_position();
+        for (auto* h : g_sdk->object_manager->get_heroes()) {
+            if (!h || !h->is_valid() || h->is_dead() || !h->is_targetable()) continue;
+            if (!h->is_visible()) continue;
+            if (h->get_team_id() == p->get_team_id()) continue;
+            const float d = pos.distance(h->get_position());
+            if (d <= spell_data::r_radius + 25.f) ++s_heroes.in_r;
+            if (d <= 1200.f) ++s_heroes.in_1200;
+            if (d <= 1500.f) ++s_heroes.in_1500;
+            if (d < s_heroes.closest_d) { s_heroes.closest_d = d; s_heroes.closest = h; }
+        }
     }
 
-    // Effective Q range — extends with on-hit AA range bonuses
-    static float get_q_range()
+    static float get_q_range()      { return c_q_range; }
+    static float get_q_speed()      { return c_q_speed; }
+    static float get_q_cast_time()  { return c_q_cast_time; }
+    static float get_w_cast_time()  { return c_w_cast_time; }
+
+    // "Will Q kill this target?" — used for AA-replacement decisions and last-hit.
+    // Replaces the previous fictional `passive_execute_threshold` formula with a
+    // real damage check.
+    static bool q_will_kill(game_object* target)
     {
+        if (!target || !sdk::damage) return false;
         auto p = g_sdk->object_manager->get_local_player();
-        if (!p) return spell_data::q_range;
-        const float aa_extra = std::max(0.f, p->get_attack_range() - spell_data::passive_aa_range);
-        return spell_data::q_range + aa_extra;
-    }
-
-    static float get_q_speed()
-    {
-        return overcharged ? spell_data::q_speed_overcharged : spell_data::q_speed;
-    }
-
-    static float get_q_cast_time()
-    {
-        const float cap = spell_data::q_as_cap;
-        const float ct = spell_data::q_windup_pct / std::min(attack_speed, cap);
-        return overcharged ? ct * spell_data::q_overcharged_windup_mult : ct;
-    }
-
-    static float get_w_cast_time()
-    {
-        return std::max(spell_data::w_cast_time_max - spell_data::w_cast_time_scale * bonus_as,
-                        spell_data::w_cast_time_min);
-    }
-
-    static float get_passive_execute_threshold()
-    {
-        auto p = g_sdk->object_manager->get_local_player();
-        if (!p) return 0.f;
-        const int level = std::max(1, p->get_level());
-        const float ap = p->get_ability_power();
-        // 60..150 over levels 1-18
-        const float base = 60.f + (150.f - 60.f) / 17.f * (level - 1);
-        return base + 0.18f * ap;
+        if (!p) return false;
+        const float dmg = sdk::damage->get_spell_damage(p, target, SLOT_Q);
+        const float ehp = target->get_hp() + target->get_all_shield();
+        return dmg >= ehp;
     }
 
     // ============================================================================
     // PREDICTION (crash-safe)
     // ============================================================================
+    // Returns true when Q should ignore minion collision for this tick.
+    static bool q_collision_free()
+    {
+        // Always collision-free when overcharged or after wall-jump empower
+        if (overcharged || lightning_rounds) return true;
+        if (!menu::q_minion_collision) return true;
+        if (menu::q_collision_remove_level > 0) {
+            auto p = g_sdk->object_manager->get_local_player();
+            if (p && p->get_level() >= menu::q_collision_remove_level) return true;
+        }
+        return false;
+    }
+
     static pred_sdk::pred_data predict_q(game_object* target, int hitchance)
     {
         pred_sdk::spell_data spell{};
@@ -239,6 +340,8 @@ namespace zeri
         spell.delay              = get_q_cast_time();
         spell.projectile_speed   = get_q_speed();
         spell.expected_hitchance = hitchance;
+        if (!q_collision_free())
+            spell.forbidden_collisions = { pred_sdk::collision_type::unit };
 
         pred_sdk::pred_data pred{};
         try { pred = sdk::prediction->predict(target, spell); }
@@ -356,6 +459,35 @@ namespace zeri
         return false;
     }
 
+    // Traces the E dash direction through the navmesh to find the actual
+    // landing point, accounting for wall vaults.
+    static math::vector3 compute_e_landing(const math::vector3& start, const math::vector3& ideal)
+    {
+        auto* nav = g_sdk ? g_sdk->nav_mesh : nullptr;
+        if (!nav) return ideal;
+
+        const float dx = ideal.x - start.x;
+        const float dz = ideal.z - start.z;
+        const float len = std::sqrt(dx * dx + dz * dz);
+        if (len < 1.f) return ideal;
+        const float nx = dx / len, nz = dz / len;
+
+        math::vector3 last_good = start;
+        bool hit_wall = false;
+
+        for (float d = 18.f; d <= 4000.f; d += 18.f) {
+            math::vector3 p = { start.x + nx * d, start.y, start.z + nz * d };
+            if (nav->is_pathable(p)) {
+                last_good = p;
+                if (hit_wall) return p;      // first open cell after the wall = landing
+                if (d <= spell_data::e_range) last_good = p;
+            } else {
+                hit_wall = true;
+            }
+        }
+        return last_good;
+    }
+
     static bool try_e_gap_close(game_object* target)
     {
         if (!menu::combo_use_e || !target) return false;
@@ -365,13 +497,8 @@ namespace zeri
         const float dist = distance_to(target);
         if (dist <= get_q_range()) return false;
 
-        // Don't dash into too many enemies
-        int nearby = 0;
-        for (auto* h : g_sdk->object_manager->get_heroes()) {
-            if (!is_valid_target(h)) continue;
-            if (distance_to(h) <= 1200.f) ++nearby;
-        }
-        if (nearby > menu::combo_e_max_near) return false;
+        // Don't dash into too many enemies (cached snapshot)
+        if (s_heroes.in_1200 > menu::combo_e_max_near) return false;
 
         auto p = g_sdk->object_manager->get_local_player();
         if (!p) return false;
@@ -391,24 +518,27 @@ namespace zeri
         if (!p) return false;
         const auto pos = p->get_position();
 
-        // Pick the nearest wall-jump spot. The spot data already encodes
-        // exactly where to stand (near_pt) and where you'll land (far_pt),
-        // so once a spot is in range, the cast direction toward far_pt is
-        // all the engine needs to trigger the wall-vault.
         auto* spot = find_nearest_wall_jump(pos, menu::flee_wall_jump_max_dist);
         if (!spot) return false;
 
         const float d_start = pos.distance(spot->start);
         const float d_end   = pos.distance(spot->end);
-        const auto& far_pt  = (d_start < d_end) ? spot->end : spot->start;
+
+        // near_pt = whichever endpoint the player is closest to (the entry side).
+        // Only trigger the jump if the NEAR endpoint (wall entry) is within
+        // flee_wall_jump_max_dist, not the far landing point.
+        const bool near_is_start = d_start < d_end;
+        const float d_near = near_is_start ? d_start : d_end;
+        if (d_near > menu::flee_wall_jump_max_dist) return false;
+
+        const auto& far_pt = near_is_start ? spot->end : spot->start;
         if (!is_in_flee_direction(far_pt)) return false;
 
-        // Aim from the player's current position toward far_pt. If the
-        // player is slightly off the near marker, the angle self-corrects
-        // to still point at the landing point.
-        const auto dash_end = pos.extended(far_pt, spell_data::e_range, true);
-
-        bool ok = sdk::common->cast_spell(SLOT_E, dash_end);
+        // Cast directly at far_pt rather than pos+dir*300.
+        // The server clamps E to its 300u range, so the direction is identical,
+        // but using the actual landing coordinate avoids the floating-point drift
+        // that causes spawn vaults to fall short.
+        bool ok = sdk::common->cast_spell(SLOT_E, far_pt);
         if (ok) last_spell_cast_time = g_sdk->clock_facade->get_game_time();
         return ok;
     }
@@ -418,17 +548,7 @@ namespace zeri
         if (overcharged) return false;
         if (!is_spell_ready(SLOT_R) || !has_enough_mana(SLOT_R)) return false;
         if (!sdk::common) return false;
-
-        auto p = g_sdk->object_manager->get_local_player();
-        if (!p) return false;
-        const auto pos = p->get_position();
-        int n = 0;
-        for (auto* h : g_sdk->object_manager->get_heroes()) {
-            if (!is_valid_target(h)) continue;
-            if (pos.distance(h->get_position()) <= spell_data::r_radius + 25.f)
-                ++n;
-        }
-        if (n < min_enemies) return false;
+        if (s_heroes.in_r < min_enemies) return false;
 
         bool ok = sdk::common->cast_spell(SLOT_R);
         if (ok) last_spell_cast_time = g_sdk->clock_facade->get_game_time();
@@ -442,34 +562,24 @@ namespace zeri
 
         auto p = g_sdk->object_manager->get_local_player();
         if (!p) return false;
-        const auto pos = p->get_position();
 
-        int in_r = 0, in_fight = 0;
-        game_object* closest = nullptr;
-        float closest_d = FLT_MAX;
-        for (auto* h : g_sdk->object_manager->get_heroes()) {
-            if (!is_valid_target(h)) continue;
-            const float d = pos.distance(h->get_position());
-            if (d <= spell_data::r_radius + 25.f) ++in_r;
-            if (d <= 1500.f) ++in_fight;
-            if (d < closest_d) { closest_d = d; closest = h; }
-        }
-
-        if (in_r >= menu::combo_r_min && in_fight >= 2)
-            return try_r(in_r);
+        if (s_heroes.in_r >= menu::combo_r_min && s_heroes.in_1500 >= 2)
+            return try_r(s_heroes.in_r);
 
         // Execute fallback: 1 hero in R range + would die
-        if (in_r >= 1 && closest && sdk::damage) {
-            if (venplus::utility::has_anti_burst_buff(closest)) return false;
-            const float dmg = sdk::damage->get_spell_damage(p, closest, SLOT_R);
-            const float ehp = closest->get_hp() + closest->get_all_shield();
+        if (s_heroes.in_r >= 1 && s_heroes.closest && sdk::damage) {
+            auto* c = s_heroes.closest;
+            if (venplus::utility::has_anti_burst_buff(c)) return false;
+            const float dmg = sdk::damage->get_spell_damage(p, c, SLOT_R);
+            const float ehp = c->get_hp() + c->get_all_shield();
             if (dmg >= ehp) return try_r(1);
         }
         return false;
     }
 
     // ============================================================================
-    // KILLSTEAL
+    // KILLSTEAL — picks the lowest-EHP killable hero so we don't waste a cast
+    // on a 90% HP target while a 5% HP target was also in range.
     // ============================================================================
     static void killsteal_w()
     {
@@ -478,24 +588,29 @@ namespace zeri
         auto p = g_sdk->object_manager->get_local_player();
         if (!p || !sdk::damage) return;
 
+        game_object* best = nullptr;
+        float best_ehp = FLT_MAX;
         for (auto* h : g_sdk->object_manager->get_heroes()) {
             if (!is_valid_target(h)) continue;
             if (venplus::utility::has_anti_burst_buff(h)) continue;
             if (distance_to(h) > spell_data::w_range_pulse) continue;
-            const float dmg = sdk::damage->get_spell_damage(p, h, SLOT_W);
             const float ehp = h->get_hp() + h->get_all_shield();
-            if (dmg >= ehp && try_w(h, menu::w_hitchance)) return;
+            if (ehp >= best_ehp) continue;
+            const float dmg = sdk::damage->get_spell_damage(p, h, SLOT_W);
+            if (dmg >= ehp) { best_ehp = ehp; best = h; }
         }
+        if (best) try_w(best, menu::w_hitchance);
     }
 
     // ============================================================================
     // AA SUBSTITUTION (on_before_attack)
     // ============================================================================
+    // True when the basic-attack itself should be allowed to fire on a hero.
+    // Q is fired first by on_before_attack; this controls the remaining AA.
     static bool allow_normal_aa(game_object* target)
     {
         if (!target) return false;
-        const float ehp = target->get_hp() + target->get_all_shield();
-        const bool execute = ehp <= get_passive_execute_threshold();
+        const bool execute = q_will_kill(target);
 
         switch (menu::aa_mode) {
         case AA_OFF:        return false;
@@ -513,18 +628,20 @@ namespace zeri
         if (!data || !data->target || !sdk::orbwalker) return true;
 
         auto* target = data->target;
-        const bool q_ready = is_spell_learned(SLOT_Q) && is_spell_ready(SLOT_Q);
+        const bool in_combo = sdk::orbwalker->combo();
+        const bool q_allowed = is_spell_learned(SLOT_Q) && is_spell_ready(SLOT_Q)
+            && (!in_combo || menu::combo_use_q);
 
         // Try Q first if ready; if cast succeeded, suppress the AA
-        if (q_ready) {
+        if (q_allowed) {
             if (try_q(target, pred_sdk::hitchance::low) == q_result::casted)
                 return false;
         }
 
         // Decide whether the AA itself should fire
         if (target->is_minion()) {
-            const float ehp = target->get_hp() + target->get_all_shield();
-            return ehp <= get_passive_execute_threshold();
+            // Last-hit: take the AA when Q-equivalent damage will kill the minion.
+            return q_will_kill(target);
         }
         if (target->is_turret() || target->is_inhibitor() || target->is_nexus()) {
             return !passive_charged;  // save charged AA for heroes
@@ -551,7 +668,9 @@ namespace zeri
         auto* target = pick_hero_target(w_max_range);
         if (!target) return;
 
-        const float dist = distance_to(target);
+        const float dist     = distance_to(target);
+        const float q_range  = get_q_range();
+        const float aa_range = c_aa_range;
 
         // R inside its radius
         if (menu::combo_use_r && !overcharged && dist <= spell_data::r_radius + 125.f) {
@@ -560,8 +679,8 @@ namespace zeri
         }
 
         // E gap close just outside Q range
-        if (menu::combo_use_e && dist > get_q_range()
-            && dist <= get_q_range() + spell_data::e_range + 100.f) {
+        if (menu::combo_use_e && dist > q_range
+            && dist <= q_range + spell_data::e_range + 100.f) {
             try_e_gap_close(target);
         }
 
@@ -570,18 +689,19 @@ namespace zeri
             try_w(target, menu::w_hitchance);
         }
 
-        // Q — fire directly when target is in Q range. Q is also fired via
-        // on_before_attack (AA replacement), but that path only triggers when
-        // the orbwalker is attempting an AA. Q range extends past AA range, so
-        // we need this manual path for poke at the edge of Q range.
-        if (dist <= get_q_range() && is_spell_ready(SLOT_Q)) {
+        // Q manual path — only beyond AA range. Inside AA range the orbwalker
+        // already routes the AA through on_before_attack which fires Q for us;
+        // firing here too would waste a prediction call and risk cancelling the
+        // pending AA windup.
+        const bool would_cancel = sdk::orbwalker && sdk::orbwalker->would_cancel_attack();
+        if (menu::combo_use_q && dist > aa_range && dist <= q_range
+            && is_spell_ready(SLOT_Q) && !would_cancel) {
             try_q(target, pred_sdk::hitchance::low);
         }
     }
 
     void harass()
     {
-        if (!sdk::target_selector) return;
         auto p = g_sdk->object_manager->get_local_player();
         if (!p || p->is_dead()) return;
         if (mana_pct() < (float)menu::harass_mana_pct) return;
@@ -589,27 +709,86 @@ namespace zeri
         const float now = g_sdk->clock_facade->get_game_time();
         if (now - last_spell_cast_time < MIN_SPELL_DELAY) return;
 
+        const float q_range     = get_q_range();
+        const float aa_range    = c_aa_range;
         const float w_max_range = spell_data::w_range_pulse + 100.f;
-        auto* target = pick_hero_target(w_max_range);
-        if (!target) return;
+        const bool  would_cancel = sdk::orbwalker && sdk::orbwalker->would_cancel_attack();
 
-        const float dist = distance_to(target);
+        auto* hero = sdk::target_selector ? pick_hero_target(w_max_range) : nullptr;
 
-        // Q first if target is in Q range (extends past AA range)
-        if (dist <= get_q_range() && is_spell_ready(SLOT_Q)) {
-            if (try_q(target, pred_sdk::hitchance::low) == q_result::casted) return;
+        // Q hero — manual cast only when target is beyond AA range (otherwise
+        // on_before_attack handles it cleanly through the orbwalker).
+        if (menu::harass_use_q && hero && is_spell_ready(SLOT_Q) && !would_cancel) {
+            const float dh = distance_to(hero);
+            if (dh > aa_range && dh <= q_range) {
+                if (try_q(hero, pred_sdk::hitchance::low) == q_result::casted) return;
+            }
         }
 
-        if (menu::harass_use_w && is_spell_ready(SLOT_W) && has_enough_mana(SLOT_W)) {
+        // W hero if in W range
+        if (hero && menu::harass_use_w && is_spell_ready(SLOT_W) && has_enough_mana(SLOT_W)) {
             const int hc = std::max((int)pred_sdk::hitchance::very_high, menu::w_hitchance);
-            try_w(target, hc);
+            if (try_w(hero, hc)) return;
         }
+
+        // Q farm fallback: last-hit the lowest-HP killable minion in Q range
+        if (menu::harass_use_q && is_spell_ready(SLOT_Q) && sdk::damage && !would_cancel) {
+            game_object* best = nullptr;
+            float best_hp = FLT_MAX;
+            for (auto* m : g_sdk->object_manager->get_minions()) {
+                if (!m || !m->is_valid() || m->is_dead() || !m->is_targetable()) continue;
+                if (!m->is_visible() || m->get_team_id() == p->get_team_id()) continue;
+                if (distance_to(m) > q_range) continue;
+                const float mhp = m->get_hp();
+                if (sdk::damage->get_spell_damage(p, m, SLOT_Q) >= mhp && mhp < best_hp) {
+                    best_hp = mhp;
+                    best    = m;
+                }
+            }
+            if (best) try_q(best, pred_sdk::hitchance::low);
+        }
+    }
+
+    // Q last-hit pass for farm modes: fires Q on killable minions in the band
+    // between AA range and Q range. The orbwalker covers inside AA range via
+    // on_before_attack; this covers the extra reach Q has over AAs.
+    static void try_q_lasthit_farm()
+    {
+        if (!is_spell_ready(SLOT_Q)) return;
+        if (!sdk::damage || !sdk::orbwalker) return;
+        if (sdk::orbwalker->would_cancel_attack()) return;
+
+        auto p = g_sdk->object_manager->get_local_player();
+        if (!p) return;
+
+        const float q_range  = get_q_range();
+        const float aa_range = c_aa_range;
+
+        game_object* best    = nullptr;
+        float        best_hp = FLT_MAX;
+
+        for (auto* m : g_sdk->object_manager->get_minions()) {
+            if (!m || !m->is_valid() || m->is_dead() || !m->is_targetable()) continue;
+            if (!m->is_visible() || m->get_team_id() == p->get_team_id()) continue;
+            const float d = distance_to(m);
+            if (d <= aa_range || d > q_range) continue;   // AA path handles inside AA range
+            const float mhp = m->get_hp();
+            if (sdk::damage->get_spell_damage(p, m, SLOT_Q) >= mhp && mhp < best_hp) {
+                best_hp = mhp;
+                best    = m;
+            }
+        }
+        if (best) try_q(best, pred_sdk::hitchance::low);
     }
 
     void clear()
     {
         if (!sdk::orbwalker || !sdk::orbwalker->is_spell_farm_enabled()) return;
         if (mana_pct() < (float)menu::lane_mana_pct) return;
+
+        // Q last-hit: covers the AA→Q range gap regardless of W toggle
+        if (menu::lane_use_q_clear) try_q_lasthit_farm();
+
         if (!menu::lane_use_w) return;
         if (!is_spell_ready(SLOT_W) || !has_enough_mana(SLOT_W)) return;
         if (sdk::orbwalker->would_cancel_attack()) return;
@@ -644,6 +823,9 @@ namespace zeri
     {
         if (!sdk::orbwalker || !sdk::orbwalker->is_spell_farm_enabled()) return;
         if (mana_pct() < (float)menu::lane_mana_pct) return;
+
+        // Q last-hit: covers the AA→Q range gap
+        if (menu::lane_use_q_clear) try_q_lasthit_farm();
 
         if (menu::lane_use_w && is_spell_ready(SLOT_W) && has_enough_mana(SLOT_W)
             && !sdk::orbwalker->would_cancel_attack()) {
@@ -687,8 +869,13 @@ namespace zeri
 
     void lasthit()
     {
-        if (!menu::lh_w_cannon) return;
         if (!sdk::orbwalker || !sdk::orbwalker->is_spell_farm_enabled()) return;
+
+        // Q last-hit beyond AA range
+        if (menu::lane_use_q_lh) try_q_lasthit_farm();
+
+        // W cannon save — gated by its own toggle
+        if (!menu::lh_w_cannon) return;
         if (!is_spell_ready(SLOT_W) || !has_enough_mana(SLOT_W)) return;
         if (sdk::orbwalker->would_cancel_attack()) return;
 
@@ -724,6 +911,7 @@ namespace zeri
         if (!p || p->is_dead()) return;
 
         refresh_state();
+        update_jump_spot();
 
         // Semi-W (manual W on hold)
         if (menu::semi_w_active && is_spell_ready(SLOT_W) && has_enough_mana(SLOT_W)) {
@@ -751,7 +939,8 @@ namespace zeri
         float dmg = 0.f;
         if (is_spell_ready(SLOT_Q)) dmg += sdk::damage->get_spell_damage(p, target, SLOT_Q);
         if (is_spell_ready(SLOT_W)) dmg += sdk::damage->get_spell_damage(p, target, SLOT_W);
-        if (is_spell_ready(SLOT_E)) dmg += sdk::damage->get_spell_damage(p, target, SLOT_E);
+        // E (Spark Surge) has no direct damage — only empowers AAs via Lightning Rounds,
+        // which is already covered by the AA term below.
         if (is_spell_ready(SLOT_R)) dmg += sdk::damage->get_spell_damage(p, target, SLOT_R);
         // 3 AAs (Zeri spams Q/AA hybrid quickly)
         const float aa = sdk::damage->calc_damage(dmg_sdk::damage_type::physical, p, target,
@@ -796,6 +985,45 @@ namespace zeri
             if (c) draw_circle(pos, spell_data::r_radius, c);
         }
 
+        // E landing preview — only shown when a vaultable wall is inside the dash path
+        if (menu::draw_e_preview && is_spell_learned(SLOT_E)
+            && g_sdk->renderer && g_sdk->hud_manager && g_sdk->nav_mesh) {
+            const auto cursor = g_sdk->hud_manager->get_cursor_position();
+            const float cdx = cursor.x - pos.x, cdz = cursor.z - pos.z;
+            const float clen = std::sqrt(cdx * cdx + cdz * cdz);
+            if (clen > 1.f) {
+                const float nx = cdx / clen, nz = cdz / clen;
+
+                // Only activate when the wall face is within 150u of the player
+                // (well inside E range) — prevents triggering from across the map.
+                bool wall_in_path = false;
+                for (float d = 18.f; d <= 130.f; d += 18.f) {
+                    math::vector3 pt = { pos.x + nx * d, pos.y, pos.z + nz * d };
+                    if (!g_sdk->nav_mesh->is_pathable(pt)) { wall_in_path = true; break; }
+                }
+
+                if (wall_in_path) {
+                    const math::vector3 dash_end = {
+                        pos.x + nx * spell_data::e_range,
+                        pos.y,
+                        pos.z + nz * spell_data::e_range
+                    };
+                    const auto landing = compute_e_landing(pos, dash_end);
+
+                    // Only draw if the vault carries us meaningfully past normal dash distance
+                    if (pos.distance(landing) > spell_data::e_range + 50.f) {
+                        const uint32_t clr = menu::color_e_preview;
+                        draw_circle(landing, 55.f, clr);
+
+                        const auto s_start = g_sdk->renderer->world_to_screen(pos);
+                        const auto s_end   = g_sdk->renderer->world_to_screen(landing);
+                        if (s_start.x > 1.f && s_end.x > 1.f)
+                            g_sdk->renderer->add_line_2d(s_start, s_end, 2.f, (clr & 0x00FFFFFFu) | 0xCC000000u);
+                    }
+                }
+            }
+        }
+
         if (menu::draw_jump_spots && is_spell_learned(SLOT_E)) {
             for (size_t i = 0; i < WALL_JUMP_COUNT; ++i) {
                 const auto& s = WALL_JUMPS[i];
@@ -817,62 +1045,35 @@ namespace zeri
             case AA_OFF:         aa_label = "AA: Off"; break;
             }
             const uint32_t aa_clr = (menu::aa_mode == AA_OFF) ? 0xFFFF6060u : 0xFF80FFC0u;
-            g_sdk->renderer->add_text(aa_label, 14.f, { screen.x, screen.y - 80.f }, 1, aa_clr);
+            g_sdk->renderer->add_text(aa_label, 14.f, { screen.x, screen.y + 50.f }, 1, aa_clr);
 
             if (overcharged) {
                 g_sdk->renderer->add_text("OVERCHARGED", 14.f,
-                    { screen.x, screen.y - 60.f }, 1, 0xFFFFFF00u);
+                    { screen.x, screen.y + 70.f }, 1, 0xFFFFFF00u);
             } else if (passive_charged) {
                 g_sdk->renderer->add_text("PASSIVE READY", 14.f,
-                    { screen.x, screen.y - 60.f }, 1, 0xFF00FFA0u);
+                    { screen.x, screen.y + 70.f }, 1, 0xFF00FFA0u);
             }
             if (lightning_rounds) {
                 g_sdk->renderer->add_text("LIGHTNING ROUNDS", 13.f,
-                    { screen.x, screen.y - 40.f }, 1, 0xFFFFB400u);
+                    { screen.x, screen.y + 90.f }, 1, 0xFFFFB400u);
+            }
+            if (hypercharged_stk > 0) {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "R STACKS: %d", hypercharged_stk);
+                g_sdk->renderer->add_text(buf, 13.f,
+                    { screen.x, screen.y + 110.f }, 1, 0xFF50FF78u);
             }
         }
 
-        if ((menu::draw_damage_bar || menu::draw_r_dmg_bar) && sdk::damage && g_sdk->renderer) {
-            const bool r_learned = is_spell_learned(SLOT_R);
-            const float scale = (float)g_sdk->renderer->get_window_height() / 1080.f;
-            const float ox = -45.6f * scale, oy = 15.5f * scale;
-            const float bw = 106.4f * scale, bh = 11.5f * scale;
+        if (menu::draw_r_dmg_bar && sdk::damage && g_sdk->renderer && is_spell_learned(SLOT_R)) {
             for (auto* h : g_sdk->object_manager->get_heroes()) {
                 if (!is_valid_target(h, spell_data::w_range_pulse)) continue;
-                if (menu::draw_damage_bar) {
-                    const float dmg = get_combo_damage(h);
-                    if (dmg > 0.f) g_sdk->renderer->add_damage_indicator(h, dmg);
-                }
-                if (menu::draw_r_dmg_bar && r_learned) {
-                    const float dmg = sdk::damage->get_spell_damage(p, h, SLOT_R);
-                    const float hp = h->get_hp(), mhp = h->get_max_hp();
-                    if (dmg > 0.f && mhp > 0.f && hp > 0.f) {
-                        const auto hbar = h->get_health_bar_position();
-                        if (!(hbar.x < 1.f && hbar.y < 1.f)) {
-                            const float r0 = hp / mhp;
-                            const float r1 = std::max(0.f, hp - dmg) / mhp;
-                            if (r0 > r1) {
-                                math::rect rc;
-                                rc.left   = hbar.x + ox + r1 * bw;
-                                rc.top    = hbar.y + oy;
-                                rc.right  = hbar.x + ox + r0 * bw;
-                                rc.bottom = hbar.y + oy + bh;
-                                g_sdk->renderer->add_rectangle_filled(rc, menu::color_r_dmg);
-                            }
-                        }
-                    }
-                }
+                const float dmg = sdk::damage->get_spell_damage(p, h, SLOT_R);
+                if (dmg > 0.f) g_sdk->renderer->add_damage_indicator(h, dmg);
             }
         }
     }
-
-    void __fastcall on_process_cast(game_object* /*obj*/, spell_cast* /*cast*/)
-    {
-        // Reserved — pending-cast tracking already lives in last_q/w_cast_time
-    }
-
-    void __fastcall on_buff_gain(game_object* /*obj*/, buff_instance* /*buff*/) {}
-    void __fastcall on_buff_loss(game_object* /*obj*/, buff_instance* /*buff*/) {}
 
     // Block the in-game R keypress unless enough enemies are inside R's
     // radius — prevents wasting Lightning Crash on a single straggler.
@@ -884,11 +1085,10 @@ namespace zeri
         if (overcharged) return true;
 
         auto p = g_sdk ? g_sdk->object_manager->get_local_player() : nullptr;
-        if (!p || !obj || obj != p) return true;
+        if (!p || !obj) return true;
+        if (obj->get_network_id() != p->get_network_id()) return true;
 
-        const int needed = menu::r_block_use_custom
-            ? std::max(1, menu::r_block_custom_min)
-            : 1;
+        const int needed = 1;
         const auto pos = p->get_position();
         int count = 0;
         for (auto* h : g_sdk->object_manager->get_heroes()) {
@@ -922,7 +1122,19 @@ namespace zeri
 
         // Q — Burst Fire
         auto q_menu = s_menu->add_sub_category("q_burst_fire", "Q - Burst Fire");
-        q_menu->add_label("Q replaces AAs automatically (always-on).");
+        q_menu->add_checkbox("combo", "Use in Combo", menu::combo_use_q,
+            [](bool v) { menu::combo_use_q = v; });
+        q_menu->add_checkbox("harass", "Use in Harass", menu::harass_use_q,
+            [](bool v) { menu::harass_use_q = v; });
+        q_menu->add_checkbox("clear", "Use in Clear", menu::lane_use_q_clear,
+            [](bool v) { menu::lane_use_q_clear = v; });
+        q_menu->add_checkbox("lh", "Use in Lasthit", menu::lane_use_q_lh,
+            [](bool v) { menu::lane_use_q_lh = v; });
+        q_menu->add_separator();
+        q_menu->add_checkbox("minion_col", "Minion Collision", menu::q_minion_collision,
+            [](bool v) { menu::q_minion_collision = v; });
+        q_menu->add_slider_int("col_remove_lvl", "Remove collision at Level", 0, 18, 1,
+            menu::q_collision_remove_level, [](int v) { menu::q_collision_remove_level = v; });
         q_menu->add_separator();
         q_menu->add_checkbox("draw_range", "Draw Range", menu::draw_q_range,
             [](bool v) { menu::draw_q_range = v; });
@@ -956,9 +1168,18 @@ namespace zeri
             [](bool v) { menu::combo_use_e = v; });
         e_menu->add_slider_int("max_near", "  Max Enemies in 1200u", 1, 5, 1, menu::combo_e_max_near,
             [](int v) { menu::combo_e_max_near = v; });
-        e_menu->add_checkbox("flee", "Use E in Flee (only at wall jump spots)", menu::flee_use_e,
-            [](bool v) { menu::flee_use_e = v; });
         e_menu->add_separator();
+        e_menu->add_hotkey("wall_jump", "Wall Jump", 'N', false, false,
+            [](std::string* hk, bool pressed) {
+                if (pressed) {
+                    // Toggle: first press activates, second cancels
+                    menu::jump_key_active = !menu::jump_key_active;
+                }
+                if (hk) menu::jump_key_str = *hk;
+            });
+        e_menu->add_separator();
+        e_menu->add_checkbox("e_preview", "E Landing Preview", menu::draw_e_preview,
+            [](bool v) { menu::draw_e_preview = v; });
         e_menu->add_checkbox("draw_range", "Draw Range", menu::draw_e_range,
             [](bool v) { menu::draw_e_range = v; });
 
@@ -973,11 +1194,6 @@ namespace zeri
         r_menu->add_separator();
         r_menu->add_checkbox("block", "Block Manual R",
             menu::r_block_enabled, [](bool v) { menu::r_block_enabled = v; });
-        r_menu->add_checkbox("block_custom", "  Use Custom Min Enemies",
-            menu::r_block_use_custom, [](bool v) { menu::r_block_use_custom = v; });
-        r_menu->add_slider_int("block_custom_min", "    Custom Min Enemies in R",
-            1, 5, 1, menu::r_block_custom_min,
-            [](int v) { menu::r_block_custom_min = v; });
         r_menu->add_separator();
         r_menu->add_checkbox("draw_range", "Draw Range", menu::draw_r_range,
             [](bool v) { menu::draw_r_range = v; });
@@ -995,9 +1211,7 @@ namespace zeri
             [](bool v) { menu::draw_only_ready = v; });
         draw_menu->add_checkbox("status", "Status Text Above Player", menu::draw_status_text,
             [](bool v) { menu::draw_status_text = v; });
-        draw_menu->add_checkbox("dmg",    "Combo Damage Indicator", menu::draw_damage_bar,
-            [](bool v) { menu::draw_damage_bar = v; });
-        draw_menu->add_checkbox("r_dmg_bar", "R Damage Indicator (HP-bar overlay)", menu::draw_r_dmg_bar,
+        draw_menu->add_checkbox("r_dmg_bar", "R Damage Indicator", menu::draw_r_dmg_bar,
             [](bool v) { menu::draw_r_dmg_bar = v; });
         draw_menu->add_separator();
         draw_menu->add_colorpicker("col_q", "Q Color", menu::color_q,
@@ -1008,8 +1222,8 @@ namespace zeri
             [](uint32_t c) { menu::color_e = c; });
         draw_menu->add_colorpicker("col_r", "R Color", menu::color_r,
             [](uint32_t c) { menu::color_r = c; });
-        draw_menu->add_colorpicker("col_r_dmg", "R Damage Bar Color", menu::color_r_dmg,
-            [](uint32_t c) { menu::color_r_dmg = c; });
+        draw_menu->add_colorpicker("col_e_preview", "E Preview Color", menu::color_e_preview,
+            [](uint32_t c) { menu::color_e_preview = c; });
         draw_menu->add_separator();
         draw_menu->add_checkbox("jump_spots", "Draw Wall Jump Spots", menu::draw_jump_spots,
             [](bool v) { menu::draw_jump_spots = v; });
@@ -1022,12 +1236,6 @@ namespace zeri
             reinterpret_cast<void*>(on_update));
         g_sdk->event_manager->register_callback(event_manager::event::draw_world,
             reinterpret_cast<void*>(on_draw));
-        g_sdk->event_manager->register_callback(event_manager::event::process_cast,
-            reinterpret_cast<void*>(on_process_cast));
-        g_sdk->event_manager->register_callback(event_manager::event::buff_gain,
-            reinterpret_cast<void*>(on_buff_gain));
-        g_sdk->event_manager->register_callback(event_manager::event::buff_loss,
-            reinterpret_cast<void*>(on_buff_loss));
         g_sdk->event_manager->register_callback(event_manager::event::cast_spell,
             reinterpret_cast<void*>(on_cast_spell));
 
@@ -1046,12 +1254,6 @@ namespace zeri
                 reinterpret_cast<void*>(on_update));
             g_sdk->event_manager->unregister_callback(event_manager::event::draw_world,
                 reinterpret_cast<void*>(on_draw));
-            g_sdk->event_manager->unregister_callback(event_manager::event::process_cast,
-                reinterpret_cast<void*>(on_process_cast));
-            g_sdk->event_manager->unregister_callback(event_manager::event::buff_gain,
-                reinterpret_cast<void*>(on_buff_gain));
-            g_sdk->event_manager->unregister_callback(event_manager::event::buff_loss,
-                reinterpret_cast<void*>(on_buff_loss));
             g_sdk->event_manager->unregister_callback(event_manager::event::cast_spell,
                 reinterpret_cast<void*>(on_cast_spell));
         }
@@ -1064,6 +1266,9 @@ namespace zeri
         s_menu = nullptr;
         overcharged = lightning_rounds = passive_charged = false;
         hypercharged_stk = 0;
+        s_heroes = {};
+        s_jump_locked = false;
+        menu::jump_key_active = false;
         last_q_cast_time = 0.f;
         last_w_cast_time = 0.f;
         last_spell_cast_time = 0.f;
