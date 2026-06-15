@@ -65,7 +65,10 @@ namespace syndra
         constexpr int   r_base_spheres     = 3;
         constexpr int   r_max_grab_spheres = 4;
         constexpr float r_execute_pct      = 0.15f;  // execute under 15% max HP at 100 splinters
-        constexpr float r_overkill_factor  = 1.05f;
+        // 1.0 = fire when calculated dmg >= predicted hp. health_prediction
+        // already accounts for regen/heals over r_delay and shields are added
+        // explicitly, so any extra headroom here just refuses real kills.
+        constexpr float r_overkill_factor  = 1.0f;
 
         // Sphere tracking
         constexpr float sphere_match_radius = 200.f;

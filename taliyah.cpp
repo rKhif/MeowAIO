@@ -29,6 +29,7 @@ namespace
         constexpr float w_range = 900.f;
         constexpr float w_radius = 150.f;
         constexpr float w_delay = 0.85f;
+        constexpr float w_speed = 20000.f; // near-instant indicator; tiny but non-zero travel time
 
         constexpr float e_range = 950.f;
         constexpr float e_radius = 225.f;
@@ -45,7 +46,7 @@ namespace
         inline bool combo_e_before_w = true;
         inline bool combo_w_into_e = true;
         inline bool q_magnet = true;
-        inline int w_direction = 0; // 0 away, 1 toward, 2 cursor
+        inline int w_direction = 0; // 0 away, 1 toward, 2 cursor, 3 smart
 
         inline bool harass_q = true;
         inline bool harass_e = false;
@@ -254,6 +255,8 @@ namespace
             return "Toward";
         case 2:
             return "Cursor";
+        case 3:
+            return "Smart";
         default:
             return "Away";
         }
@@ -267,6 +270,8 @@ namespace
             return 0xFFFFC040u;
         case 2:
             return 0xFF80B0FFu;
+        case 3:
+            return 0xFFB060FFu;
         default:
             return 0xFF80FFF0u;
         }
@@ -278,7 +283,7 @@ namespace
         if (now - s_last_w_mode_switch < 0.2f)
             return;
 
-        menu::w_direction = (menu::w_direction + 1) % 3;
+        menu::w_direction = (menu::w_direction + 1) % 4;
         s_last_w_mode_switch = now;
 
         if (g_sdk)
@@ -341,6 +346,137 @@ namespace
         return nullptr;
     }
 
+    float self_hp_pct()
+    {
+        auto* p = player();
+        if (!p || p->get_max_hp() <= 0.f)
+            return 100.f;
+        return p->get_hp() / p->get_max_hp() * 100.f;
+    }
+
+    float enemy_hp_pct(game_object* obj)
+    {
+        if (!obj || obj->get_max_hp() <= 0.f)
+            return 100.f;
+        return obj->get_hp() / obj->get_max_hp() * 100.f;
+    }
+
+    int count_enemy_heroes_near(const math::vector3& pos, float range)
+    {
+        if (!g_sdk || !g_sdk->object_manager)
+            return 0;
+
+        int count = 0;
+        for (auto* hero : g_sdk->object_manager->get_heroes())
+        {
+            if (!is_valid_enemy(hero))
+                continue;
+            if (hero->get_position().distance(pos) <= range)
+                ++count;
+        }
+        return count;
+    }
+
+    namespace smart
+    {
+        constexpr float self_hp_pct_threshold = 30.f;
+        constexpr float enemy_hp_pct_threshold = 30.f;
+        constexpr int teamfight_count = 2;
+        constexpr float teamfight_range = 1200.f;
+        constexpr float ally_tower_range = 900.f; // tower attack range (775) + small buffer
+    }
+
+    bool under_ally_tower()
+    {
+        auto* p = player();
+        if (!p || !g_sdk || !g_sdk->object_manager)
+            return false;
+
+        const auto pos = p->get_position();
+        const int team = p->get_team_id();
+
+        for (auto* obj : g_sdk->object_manager->get_turrets())
+        {
+            if (!obj || obj->is_dead() || obj->get_team_id() != team)
+                continue;
+            if (pos.distance(obj->get_position()) <= smart::ally_tower_range)
+                return true;
+        }
+        return false;
+    }
+
+    bool in_teamfight()
+    {
+        auto* p = player();
+        if (!p)
+            return false;
+        return count_enemy_heroes_near(p->get_position(), smart::teamfight_range)
+            >= smart::teamfight_count;
+    }
+
+    game_object* lowest_hp_enemy(float range)
+    {
+        auto* p = player();
+        if (!p || !sdk::target_selector)
+            return nullptr;
+
+        if (auto* forced = sdk::target_selector->get_forced_target(); is_valid_enemy(forced, range))
+            return forced;
+
+        game_object* best = nullptr;
+        float best_hp = FLT_MAX;
+        for (auto* hero : sdk::target_selector->get_sorted_heroes())
+        {
+            if (!is_valid_enemy(hero, range))
+                continue;
+            if (hero->get_hp() < best_hp)
+            {
+                best = hero;
+                best_hp = hero->get_hp();
+            }
+        }
+        return best;
+    }
+
+    // Resolves W direction (0 away / 1 toward / 2 cursor) when the menu is in Smart mode.
+    // Priority:
+    //   self-low-HP   -> away   (peel / escape)
+    //   ally tower    -> toward (drag enemy into tower aggro)
+    //   teamfight     -> toward (collapse onto squishy)
+    //   enemy-low-HP  -> toward (kill secure)
+    //   default       -> away
+    int resolve_w_direction(game_object* w_target)
+    {
+        if (menu::w_direction != 3)
+            return menu::w_direction;
+
+        if (self_hp_pct() < smart::self_hp_pct_threshold)
+            return 0; // shove away to peel
+
+        if (under_ally_tower())
+            return 1; // feed them to the tower
+
+        if (in_teamfight())
+            return 1; // pull whoever we hit toward our team
+
+        if (w_target && enemy_hp_pct(w_target) < smart::enemy_hp_pct_threshold)
+            return 1; // kill secure
+
+        return 0;
+    }
+
+    // In Smart + teamfight, override the W target to the lowest-HP enemy in W range.
+    // Falls back to the regular TS pick otherwise.
+    game_object* resolve_w_target(game_object* default_target)
+    {
+        if (menu::w_direction == 3 && in_teamfight())
+        {
+            if (auto* low = lowest_hp_enemy(spell_data::w_range))
+                return low;
+        }
+        return default_target;
+    }
+
     bool cast_position(int slot, const math::vector3& pos)
     {
         if (!sdk::common || !can_cast_now() || !spell_ready(slot) || !has_mana(slot))
@@ -353,6 +489,53 @@ namespace
         return true;
     }
 
+    struct w_solution
+    {
+        bool will_hit = false;
+        math::vector3 cast_position {};
+        math::vector3 predicted_enemy {};
+        float player_to_cast = 0.f;
+        float travel_time = 0.f;
+        float windup = 0.f;
+        float total_time = 0.f;
+        float effective_radius = 0.f;
+        float miss_distance = 0.f;
+    };
+
+    // Manual W hit-check. Math chain:
+    //   tTravel = dPlayerToCast / w_speed
+    //   tTotal  = w_delay + tTravel
+    //   enemyAt(tTotal) = predict_on_path(target, tTotal)
+    //   hit if distance(castPos, enemyAt(tTotal)) <= w_radius + target hitbox
+    w_solution solve_w(game_object* target_obj, const math::vector3& candidate_cast)
+    {
+        w_solution s {};
+        s.cast_position = candidate_cast;
+
+        auto* p = player();
+        if (!p || !target_obj)
+            return s;
+
+        s.player_to_cast = p->get_position().distance(candidate_cast);
+
+        s.travel_time = (spell_data::w_speed > 0.f && spell_data::w_speed < FLT_MAX * 0.5f)
+            ? s.player_to_cast / spell_data::w_speed
+            : 0.f;
+
+        s.windup = spell_data::w_delay;
+        s.total_time = s.windup + s.travel_time;
+
+        if (sdk::prediction)
+            s.predicted_enemy = sdk::prediction->predict_on_path(target_obj, s.total_time, false);
+        else
+            s.predicted_enemy = target_obj->get_position() + target_obj->get_velocity() * s.total_time;
+
+        s.effective_radius = spell_data::w_radius + target_obj->get_bounding_radius();
+        s.miss_distance = candidate_cast.distance(s.predicted_enemy);
+        s.will_hit = s.miss_distance <= s.effective_radius;
+        return s;
+    }
+
     bool cast_w_toward(game_object* target_obj, const math::vector3& anchor)
     {
         if (!sdk::prediction || !sdk::common || !target_obj || !can_cast_now() || !spell_ready(SLOT_W) || !has_mana(SLOT_W))
@@ -362,7 +545,21 @@ namespace
         if (!pred.is_valid || pred.hitchance < menu::w_hitchance)
             return false;
 
-        const auto cast_pos = pred.cast_position;
+        // Validate SDK's chosen cast point with our own math.
+        auto solution = solve_w(target_obj, pred.cast_position);
+        if (!solution.will_hit)
+        {
+            // Fallback: snap to where the enemy will actually be at impact time.
+            solution = solve_w(target_obj, pred.predicted_position);
+            if (!solution.will_hit)
+                return false;
+        }
+
+        auto* p = player();
+        math::vector3 cast_pos = solution.cast_position;
+        if (p && p->get_position().distance(cast_pos) > spell_data::w_range)
+            cast_pos = p->get_position().extended(cast_pos, spell_data::w_range, true);
+
         const auto end_pos = cast_pos.extended(anchor, 450.f, true);
 
         if (!sdk::common->cast_spell(SLOT_W, cast_pos, end_pos))
@@ -390,6 +587,85 @@ namespace
         return cast_w_toward(target_obj, away_anchor);
     }
 
+    struct q_solution
+    {
+        bool will_hit = false;
+        math::vector3 predicted_enemy {};
+        float player_to_cast = 0.f;
+        float travel_time = 0.f;
+        float windup = 0.f;
+        float total_time = 0.f;
+        float along_line = 0.f;   // projection of enemy onto Q's line from player
+        float perp_distance = 0.f; // perpendicular distance from line to enemy
+        float effective_radius = 0.f;
+        float max_along = 0.f;
+    };
+
+    // Manual Q hit-check. Q is linear, so we test against the SEGMENT from player to castPos.
+    // Math chain (with one refinement step for accuracy):
+    //   pass 1: tHit = q_delay + |castPos - player| / q_speed
+    //           enemyAt(tHit) = predict_on_path(target, tHit)
+    //   pass 2: project enemy onto the line, use that projected distance for tHit, re-predict
+    //   hit if projection lies on the segment AND perpendicular distance <= q_radius + hitbox
+    q_solution solve_q(game_object* target_obj, const math::vector3& candidate_cast, bool boulder)
+    {
+        q_solution s {};
+        auto* p = player();
+        if (!p || !target_obj || !sdk::prediction)
+            return s;
+
+        const auto player_pos = p->get_position();
+        const float dx = candidate_cast.x - player_pos.x;
+        const float dz = candidate_cast.z - player_pos.z;
+        const float dir_len = std::sqrt(dx * dx + dz * dz);
+        if (dir_len < 1e-3f)
+            return s;
+
+        const float udx = dx / dir_len;
+        const float udz = dz / dir_len;
+
+        const float q_radius_now = boulder ? spell_data::q_boulder_radius : spell_data::q_radius;
+        const float hitbox = target_obj->get_bounding_radius();
+        s.effective_radius = q_radius_now + hitbox;
+        s.max_along = spell_data::q_range + hitbox;
+        s.windup = spell_data::q_delay;
+        s.player_to_cast = dir_len;
+
+        // Pass 1: initial hit time assuming the spell reaches castPos.
+        float t = s.windup + dir_len / spell_data::q_speed;
+        math::vector3 enemy = sdk::prediction->predict_on_path(target_obj, t, false);
+
+        // Pass 2: refine using the projection of that predicted enemy onto the line.
+        float ex = enemy.x - player_pos.x;
+        float ez = enemy.z - player_pos.z;
+        float along = ex * udx + ez * udz;
+        if (along > 0.f && along < s.max_along)
+        {
+            t = s.windup + along / spell_data::q_speed;
+            enemy = sdk::prediction->predict_on_path(target_obj, t, false);
+            ex = enemy.x - player_pos.x;
+            ez = enemy.z - player_pos.z;
+            along = ex * udx + ez * udz;
+        }
+
+        s.travel_time = t - s.windup;
+        s.total_time = t;
+        s.predicted_enemy = enemy;
+        s.along_line = along;
+
+        // Perpendicular distance: |enemy - (player + udir * along)|
+        const float foot_x = player_pos.x + udx * along;
+        const float foot_z = player_pos.z + udz * along;
+        const float qx = enemy.x - foot_x;
+        const float qz = enemy.z - foot_z;
+        s.perp_distance = std::sqrt(qx * qx + qz * qz);
+
+        s.will_hit = along >= 0.f
+                  && along <= s.max_along
+                  && s.perp_distance <= s.effective_radius;
+        return s;
+    }
+
     bool cast_q(game_object* target_obj)
     {
         if (!sdk::prediction || !target_obj || !can_cast_now() || !spell_ready(SLOT_Q) || !has_mana(SLOT_Q))
@@ -398,6 +674,13 @@ namespace
         const bool boulder = on_worked_ground();
         auto pred = sdk::prediction->predict(target_obj, q_data(boulder));
         if (!pred.is_valid || pred.hitchance < menu::q_hitchance)
+            return false;
+
+        // Veto if our own line math says the SDK's aim point won't actually land.
+        // Don't re-aim for linear shots (predicted_position isn't a valid Q endpoint).
+        // Wind-wall / Braum-wall collisions are already handled by sdk::prediction.
+        const auto solution = solve_q(target_obj, pred.cast_position, boulder);
+        if (!solution.will_hit)
             return false;
 
         if (!cast_position(SLOT_Q, pred.cast_position))
@@ -421,6 +704,14 @@ namespace
         return cast_position(SLOT_E, pred.cast_position);
     }
 
+    // Default jungle policy (no menu): clear epic + large camps, skip small babies.
+    bool is_allowed_monster(game_object* obj)
+    {
+        if (!obj || !obj->is_monster())
+            return false;
+        return obj->is_epic_monster() || obj->is_large_monster();
+    }
+
     int count_units_near(const math::vector3& pos, float radius, bool jungle_only)
     {
         if (!g_sdk || !g_sdk->object_manager)
@@ -431,7 +722,7 @@ namespace
         {
             if (!is_valid_enemy(minion))
                 continue;
-            if (jungle_only ? !minion->is_monster() : !minion->is_lane_minion())
+            if (jungle_only ? !is_allowed_monster(minion) : !minion->is_lane_minion())
                 continue;
             if (minion->get_position().distance(pos) <= radius + minion->get_bounding_radius())
                 ++count;
@@ -452,7 +743,7 @@ namespace
         {
             if (!is_valid_enemy(minion, range))
                 continue;
-            if (jungle_only ? !minion->is_monster() : !minion->is_lane_minion())
+            if (jungle_only ? !is_allowed_monster(minion) : !minion->is_lane_minion())
                 continue;
 
             const int hits = count_units_near(minion->get_position(), 260.f, jungle_only);
@@ -539,17 +830,19 @@ namespace
             return;
 
         auto* q_target = target(spell_data::q_range);
-        auto* w_target = target(spell_data::w_range);
+        auto* w_target = resolve_w_target(target(spell_data::w_range));
         auto* e_target = target(spell_data::e_range);
 
-        if (menu::semi_w && w_target && cast_w(w_target, menu::w_direction))
+        const int w_dir = resolve_w_direction(w_target);
+
+        if (menu::semi_w && w_target && cast_w(w_target, w_dir))
             return;
 
         if (menu::combo_e_before_w && menu::combo_e && e_target && cast_e(e_target))
             return;
         if (menu::combo_w_into_e && menu::combo_w && w_target && e_field_active() && cast_w_toward(w_target, s_last_e_pos))
             return;
-        if (menu::combo_w && w_target && cast_w(w_target, menu::w_direction))
+        if (menu::combo_w && w_target && cast_w(w_target, w_dir))
             return;
         if (!menu::combo_e_before_w && menu::combo_e && e_target && cast_e(e_target))
             return;
@@ -579,14 +872,17 @@ namespace
             return;
 
         const bool jungle = sdk::orbwalker && sdk::orbwalker->fast_clear();
+
         if (jungle)
         {
             auto* monster = best_clear_target(spell_data::q_range, true);
             if (!monster)
                 return;
+
+            // Pull the camp toward us so the AoE doesn't shove it out of W range.
             if (menu::clear_e && cast_position(SLOT_E, monster->get_position()))
                 return;
-            if (menu::clear_w && cast_w(monster, 0))
+            if (menu::clear_w && cast_w(monster, 1))
                 return;
             if (menu::clear_q)
                 cast_q(monster);
@@ -748,7 +1044,7 @@ void load()
             menu::semi_w = pressed;
             if (hk) menu::semi_w_key = *hk;
         });
-    w->add_combo("direction", "Shove Direction", { "Away", "Toward", "Cursor" }, menu::w_direction,
+    w->add_combo("direction", "Shove Direction", { "Away", "Toward", "Cursor", "Smart" }, menu::w_direction,
         [](int v) { menu::w_direction = v; });
     w->add_hotkey("switch_mode", "Switch W Mode", 'U', false, false,
         [](std::string* hk, bool pressed) {

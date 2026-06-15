@@ -171,6 +171,7 @@
     <ClInclude Include="veigar.h" />
     <ClInclude Include="viktor.h" />
     <ClInclude Include="zaahen.h" />
+    <ClInclude Include="senna.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\main.cpp" />
@@ -193,6 +194,7 @@
     <ClCompile Include="veigar.cpp" />
     <ClCompile Include="viktor.cpp" />
     <ClCompile Include="zaahen.cpp" />
+    <ClCompile Include="senna.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

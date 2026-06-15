@@ -107,12 +107,31 @@ namespace zeri
         inline bool        jump_key_active = false;
         inline std::string jump_key_str;
 
+        // --- Q chain bounce while R (Hypercharged) is active ---
+        inline bool combo_q_chain_r = true;
+
+        // --- E Wall Auto-W (auto W mid-dash through a wall) ---
+        inline bool e_wall_auto_w     = true;
+        inline int  e_wall_auto_w_hc  = 40;   // hitchance (0-100)
+
+        // --- Queue Manual E during Q ---
+        inline bool queue_manual_e = true;
+
+        // --- Q cast position humanization (small lateral jitter on hero Qs) ---
+        inline bool  q_randomize       = false;
+        inline float q_randomize_range = 20.f;  // max +/- lateral offset in units
+
+
         // --- Hitchance ---
         inline int  w_hitchance       = 70;
 
         // --- Semi-W hotkey ---
         inline bool        semi_w_active = false;
         inline std::string semi_w_key_str;
+
+        // --- Infotab entry IDs (0 = not registered) ---
+        inline uint32_t infotab_semi_w     = 0;
+        inline uint32_t infotab_wall_jump  = 0;
 
         // --- R input blocker ---
         // Master toggle: when on, the in-game R keypress is suppressed unless
@@ -137,6 +156,7 @@ namespace zeri
         inline uint32_t color_e       = 0xFFFFB400u; // amber
         inline uint32_t color_e_preview = 0xFF00FFFFu; // cyan
         inline uint32_t color_r       = 0xFF50FF78u; // green
+        inline uint32_t color_r_dmg   = 0xFFAA44FFu; // purple — R damage bar
         inline uint32_t color_jump    = 0xFFFFFFFFu; // white
     }
 
