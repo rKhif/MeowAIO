@@ -20,75 +20,105 @@ namespace zeri
     // ============================================================================
     // WALL JUMP SPOTS (Summoner's Rift) — Zeri's E dashes through these walls
     // ============================================================================
+    // Wall-jump table ported from zeri_ps (BlueZeri::InitializeWallJumps).
+    // Each entry is *directional*: `entry` is the standing position the
+    // player walks to and `cast` is the hand-tuned exact E target for that
+    // direction. Both sides of every wall are listed separately so the
+    // picker is a single "entry closest to cursor" comparison.
     struct wall_jump_spot
     {
-        math::vector3 start;
-        math::vector3 end;
+        math::vector3 entry;
+        math::vector3 cast;
     };
 
+    // Old VENPlus spot pairs, expanded into directional {entry, cast} entries
+    // (both ways through every wall).
     static const wall_jump_spot WALL_JUMPS[] = {
         { { 7614.f,   53.f, 3040.f  }, { 10206.f,  49.f, 2836.f  } },
+        { { 10206.f,  49.f, 2836.f  }, { 7614.f,   53.f, 3040.f  } },
         { { 10219.f,  14.f, 6105.f  }, { 11800.f,  34.f, 4889.f  } },
+        { { 11800.f,  34.f, 4889.f  }, { 10219.f,  14.f, 6105.f  } },
         { { 7260.f,   52.f, 6622.f  }, { 8580.f,  -70.f, 5720.f  } },
+        { { 8580.f,  -70.f, 5720.f  }, { 7260.f,   52.f, 6622.f  } },
         { { 5799.f,   51.f, 3494.f  }, { 5529.f,   51.f, 1773.f  } },
+        { { 5529.f,   51.f, 1773.f  }, { 5799.f,   51.f, 3494.f  } },
         { { 3326.f,    9.f, 9880.f  }, { 2020.f,   69.f, 11394.f } },
+        { { 2020.f,   69.f, 11394.f }, { 3326.f,    9.f, 9880.f  } },
         { { 4072.f,   96.f, 534.f   }, { 1076.f,  158.f, 392.f   } },
+        { { 1076.f,  158.f, 392.f   }, { 4072.f,   96.f, 534.f   } },
         { { 14296.f,  91.f, 11074.f }, { 14438.f, 164.f, 13868.f } },
+        { { 14438.f, 164.f, 13868.f }, { 14296.f,  91.f, 11074.f } },
         { { 524.f,    96.f, 4008.f  }, { 176.f,   184.f, 778.f   } },
+        { { 176.f,   184.f, 778.f   }, { 524.f,    96.f, 4008.f  } },
         { { 13222.f,  41.f, 1058.f  }, { 10434.f,  51.f, 792.f   } },
+        { { 10434.f,  51.f, 792.f   }, { 13222.f,  41.f, 1058.f  } },
         { { 13876.f,  48.f, 1854.f  }, { 14078.f,  52.f, 3992.f  } },
+        { { 14078.f,  52.f, 3992.f  }, { 13876.f,  48.f, 1854.f  } },
         { { 4712.f,  106.f, 600.f   }, { 7758.f,   49.f, 734.f   } },
+        { { 7758.f,   49.f, 734.f   }, { 4712.f,  106.f, 600.f   } },
         { { 14246.f,  91.f, 10458.f }, { 14146.f,  52.f, 7360.f  } },
+        { { 14146.f,  52.f, 7360.f  }, { 14246.f,  91.f, 10458.f } },
         { { 700.f,    53.f, 7556.f  }, { 624.f,    96.f, 4508.f  } },
+        { { 624.f,    96.f, 4508.f  }, { 700.f,    53.f, 7556.f  } },
         { { 4144.f,   50.f, 5064.f  }, { 2770.f,   56.f, 6718.f  } },
+        { { 2770.f,   56.f, 6718.f  }, { 4144.f,   50.f, 5064.f  } },
         { { 6912.f,   52.f, 6192.f  }, { 6642.f,   49.f, 4832.f  } },
+        { { 6642.f,   49.f, 4832.f  }, { 6912.f,   52.f, 6192.f  } },
         { { 10984.f,  91.f, 14380.f }, { 13964.f, 172.f, 14468.f } },
+        { { 13964.f, 172.f, 14468.f }, { 10984.f,  91.f, 14380.f } },
         { { 8064.f,   53.f, 14180.f }, { 10472.f,  91.f, 14310.f } },
+        { { 10472.f,  91.f, 14310.f }, { 8064.f,   53.f, 14180.f } },
         { { 9068.f,   53.f, 4216.f  }, { 10418.f,  49.f, 3460.f  } },
+        { { 10418.f,  49.f, 3460.f  }, { 9068.f,   53.f, 4216.f  } },
         { { 9400.f,  -71.f, 5362.f  }, { 9210.f,   56.f, 3874.f  } },
+        { { 9210.f,   56.f, 3874.f  }, { 9400.f,  -71.f, 5362.f  } },
         { { 6492.f,   52.f, 5982.f  }, { 7704.f,   50.f, 5390.f  } },
+        { { 7704.f,   50.f, 5390.f  }, { 6492.f,   52.f, 5982.f  } },
         { { 6312.f,  -71.f, 9090.f  }, { 7556.f,   53.f, 8086.f  } },
+        { { 7556.f,   53.f, 8086.f  }, { 6312.f,  -71.f, 9090.f  } },
         { { 5260.f,   57.f, 11348.f }, { 5986.f,  -57.f, 9436.f  } },
+        { { 5986.f,  -57.f, 9436.f  }, { 5260.f,   57.f, 11348.f } },
         { { 5704.f,   57.f, 10898.f }, { 3874.f,  -70.f, 11172.f } },
+        { { 3874.f,  -70.f, 11172.f }, { 5704.f,   57.f, 10898.f } },
         { { 7248.f,   56.f, 11772.f }, { 4510.f,   56.f, 12090.f } },
+        { { 4510.f,   56.f, 12090.f }, { 7248.f,   56.f, 11772.f } },
         { { 10738.f,  53.f, 9838.f  }, { 12056.f,  52.f, 8150.f  } },
+        { { 12056.f,  52.f, 8150.f  }, { 10738.f,  53.f, 9838.f  } },
         { { 13170.f,  55.f, 6110.f  }, { 12138.f,  52.f, 7268.f  } },
+        { { 12138.f,  52.f, 7268.f  }, { 13170.f,  55.f, 6110.f  } },
         { { 10224.f,  52.f, 7212.f  }, { 11720.f,  52.f, 7308.f  } },
+        { { 11720.f,  52.f, 7308.f  }, { 10224.f,  52.f, 7212.f  } },
         { { 12174.f,  52.f, 5080.f  }, { 11882.f,  52.f, 6550.f  } },
+        { { 11882.f,  52.f, 6550.f  }, { 12174.f,  52.f, 5080.f  } },
         { { 7930.f,   52.f, 8684.f  }, { 8242.f,   50.f, 10098.f } },
+        { { 8242.f,   50.f, 10098.f }, { 7930.f,   52.f, 8684.f  } },
     };
     static constexpr size_t WALL_JUMP_COUNT = sizeof(WALL_JUMPS) / sizeof(WALL_JUMPS[0]);
 
-    static const wall_jump_spot* find_nearest_wall_jump(const math::vector3& pos, float max_dist)
+    // Picks the spot whose entry is closest to the cursor. Each direction is
+    // a separate table entry, so this single comparison chooses both the
+    // wall AND which side to vault from.
+    static const wall_jump_spot* find_wall_jump_for_cursor(const math::vector3& cursor,
+                                                           float max_d = 1000.f)
     {
         const wall_jump_spot* best = nullptr;
-        float best_d = max_dist;
+        float best_d = max_d;
         for (size_t i = 0; i < WALL_JUMP_COUNT; ++i) {
-            const float d = std::min(pos.distance(WALL_JUMPS[i].start),
-                                     pos.distance(WALL_JUMPS[i].end));
+            const float d = cursor.distance(WALL_JUMPS[i].entry);
             if (d < best_d) { best_d = d; best = &WALL_JUMPS[i]; }
         }
         return best;
     }
 
-   
-    static const wall_jump_spot* find_wall_jump_near_cursor(const math::vector3& player_pos,
-                                                            const math::vector3& cursor_pos,
-                                                            float player_max_dist)
+    // Player-distance picker for auto-flee (no cursor input there).
+    static const wall_jump_spot* find_nearest_wall_jump(const math::vector3& player_pos,
+                                                       float max_dist)
     {
         const wall_jump_spot* best = nullptr;
-        float best_score = FLT_MAX;
+        float best_d = max_dist;
         for (size_t i = 0; i < WALL_JUMP_COUNT; ++i) {
-            const auto& spot = WALL_JUMPS[i];
-            const float ds_player = player_pos.distance(spot.start);
-            const float de_player = player_pos.distance(spot.end);
-            const float nearest_player = std::min(ds_player, de_player);
-            if (nearest_player > player_max_dist) continue;
-
-            
-            const math::vector3& far_pt = (ds_player < de_player) ? spot.end : spot.start;
-            const float cursor_d = cursor_pos.distance(far_pt);
-            if (cursor_d < best_score) { best_score = cursor_d; best = &spot; }
+            const float d = player_pos.distance(WALL_JUMPS[i].entry);
+            if (d < best_d) { best_d = d; best = &WALL_JUMPS[i]; }
         }
         return best;
     }
@@ -133,9 +163,9 @@ namespace zeri
     static hero_snapshot s_heroes{};
 
     // --- Wall jump hotkey state ---
-    static math::vector3 s_jump_near        = {};
-    static math::vector3 s_jump_far         = {};
-    static bool          s_jump_locked      = false; // spot committed, walking to near pt
+    static math::vector3 s_jump_entry       = {};    // standing spot the player walks to
+    static math::vector3 s_jump_cast        = {};    // exact E target (hand-tuned per spot)
+    static bool          s_jump_locked      = false; // spot committed, walking to entry
     static bool          s_jump_orb_blocked = false; // orbwalker frozen during walk
     static float         s_jump_last_move   = 0.f;   // throttle move_to spam
 
@@ -178,18 +208,21 @@ namespace zeri
         const float now = g_sdk->clock_facade->get_game_time();
 
         if (!s_jump_locked) {
+            // Pick the spot whose entry is closest to the cursor (zeri_ps
+            // style). Each direction is a separate table entry, so this one
+            // comparison chooses both the wall and which side to vault from.
             const wall_jump_spot* spot = nullptr;
             if (g_sdk->hud_manager) {
                 const auto cursor = g_sdk->hud_manager->get_cursor_position();
-                spot = find_wall_jump_near_cursor(pos, cursor, 750.f);
+                spot = find_wall_jump_for_cursor(cursor, 1000.f);
             }
-            if (!spot) spot = find_nearest_wall_jump(pos, 500.f);
+            // Cursor wasn't near any spot — fall back to whatever entry is
+            // closest to the player so the hotkey still does something useful.
+            if (!spot) spot = find_nearest_wall_jump(pos, 1500.f);
             if (!spot) { menu::jump_key_active = false; return; }
 
-            const float d1 = pos.distance(spot->start);
-            const float d2 = pos.distance(spot->end);
-            if (d1 < d2) { s_jump_near = spot->start; s_jump_far = spot->end; }
-            else          { s_jump_near = spot->end;   s_jump_far = spot->start; }
+            s_jump_entry = spot->entry;
+            s_jump_cast  = spot->cast;
 
             s_jump_locked    = true;
             s_jump_last_move = 0.f;
@@ -200,37 +233,26 @@ namespace zeri
                 s_jump_orb_blocked = true;
             }
 
-            sdk::common->issue_order(game_object_order::move_to, s_jump_near, false);
+            sdk::common->issue_order(game_object_order::move_to, s_jump_entry, false);
             s_jump_last_move = now;
             return;
         }
 
-        // Cancel if the player's path destination diverged from the near point
-        // (user clicked somewhere else).
+        // Cancel if the player's path destination diverged from the entry
+        // (user clicked somewhere else). 150u absorbs normal path-prediction
+        // wobble while still catching genuine redirects.
         auto path = p->get_path();
-        if (!path.empty() && path.back().distance(s_jump_near) > 80.f) {
+        if (!path.empty() && path.back().distance(s_jump_entry) > 150.f) {
             release_jump_orb_block();
             menu::jump_key_active = false;
             s_jump_locked = false;
             return;
         }
 
-        if (pos.distance(s_jump_near) <= 25.f) {
+        if (pos.distance(s_jump_entry) <= 45.f) {
             if (is_spell_ready(SLOT_E) && has_enough_mana(SLOT_E)) {
-                // Normalize direction toward far_pt and cap cast position to
-                // exactly E's max range. Passing a raw far_pt that's thousands
-                // of units away makes the server short the dash on some spots.
-                const float dx = s_jump_far.x - pos.x;
-                const float dz = s_jump_far.z - pos.z;
-                const float len = std::sqrt(dx * dx + dz * dz);
-                math::vector3 cast_pos = s_jump_far;
-                if (len > 1.f) {
-                    const float nx = dx / len, nz = dz / len;
-                    cast_pos = { pos.x + nx * spell_data::e_range,
-                                 pos.y,
-                                 pos.z + nz * spell_data::e_range };
-                }
-                if (sdk::common->cast_spell(SLOT_E, cast_pos)) {
+                // Hand-tuned exact cast target — no extension math needed.
+                if (sdk::common->cast_spell(SLOT_E, s_jump_cast)) {
                     last_spell_cast_time = now;
                     release_jump_orb_block();
                     menu::jump_key_active = false;
@@ -242,7 +264,7 @@ namespace zeri
             // Spamming move_to every frame can cause the server to drop or
             // reorder commands, jittering the path.
             if (now - s_jump_last_move >= 0.1f) {
-                sdk::common->issue_order(game_object_order::move_to, s_jump_near, false);
+                sdk::common->issue_order(game_object_order::move_to, s_jump_entry, false);
                 s_jump_last_move = now;
             }
         }
@@ -632,8 +654,10 @@ namespace zeri
         auto p = g_sdk->object_manager->get_local_player();
         if (!p) return q_result::failed;
 
-        // For structures, just point Q toward them
-        if (target->is_turret() || target->is_inhibitor() || target->is_nexus()) {
+        // Stationary objects (structures, wards, traps, plants) — point Q
+        // directly at them; prediction would just spin on a non-moving unit.
+        if (target->is_turret() || target->is_inhibitor() || target->is_nexus()
+            || target->is_ward() || target->is_trap() || target->is_plant()) {
             const auto tp = target->get_position();
             const auto cast_pos = p->get_position().extended(tp, get_q_range(), true);
             if (sdk::common->cast_spell(SLOT_Q, cast_pos)) {
@@ -811,34 +835,17 @@ namespace zeri
         auto* spot = find_nearest_wall_jump(pos, menu::flee_wall_jump_max_dist);
         if (!spot) return false;
 
-        const float d_start = pos.distance(spot->start);
-        const float d_end   = pos.distance(spot->end);
+        // Only trigger if we're standing on (or very near) the entry — the
+        // table is directional so this naturally fires for whichever wall
+        // side the player is currently on.
+        const float d_entry = pos.distance(spot->entry);
+        if (d_entry > menu::flee_wall_jump_max_dist) return false;
 
-        // near_pt = whichever endpoint the player is closest to (the entry side).
-        // Only trigger the jump if the NEAR endpoint (wall entry) is within
-        // flee_wall_jump_max_dist, not the far landing point.
-        const bool near_is_start = d_start < d_end;
-        const float d_near = near_is_start ? d_start : d_end;
-        if (d_near > menu::flee_wall_jump_max_dist) return false;
+        // Cast must be toward the cursor for flee to feel intentional.
+        if (!is_in_flee_direction(spot->cast)) return false;
 
-        const auto& far_pt = near_is_start ? spot->end : spot->start;
-        if (!is_in_flee_direction(far_pt)) return false;
-
-        // Normalize direction toward far_pt and cap cast position to E's
-        // max range (300u). Some wall-jump endpoints are 2000-3000u away,
-        // and passing a raw far_pt that out-of-range makes the server short
-        // the dash to half distance on certain spots.
-        const float dx = far_pt.x - pos.x;
-        const float dz = far_pt.z - pos.z;
-        const float len = std::sqrt(dx * dx + dz * dz);
-        math::vector3 cast_pos = far_pt;
-        if (len > 1.f) {
-            const float nx = dx / len, nz = dz / len;
-            cast_pos = { pos.x + nx * spell_data::e_range,
-                         pos.y,
-                         pos.z + nz * spell_data::e_range };
-        }
-        bool ok = sdk::common->cast_spell(SLOT_E, cast_pos);
+        // Use the hand-tuned cast position directly — no extension math.
+        bool ok = sdk::common->cast_spell(SLOT_E, spot->cast);
         if (ok) last_spell_cast_time = g_sdk->clock_facade->get_game_time();
         return ok;
     }
@@ -1001,20 +1008,66 @@ namespace zeri
     // ============================================================================
     // True when the basic-attack itself should be allowed to fire on a hero.
     // Q is fired first by on_before_attack; this controls the remaining AA.
-    static bool allow_normal_aa(game_object* target)
+    // Mode-aware AA decision for the current orbwalker context. Returns
+    // true if the basic-attack should be allowed to fire on `target` in the
+    // current orbwalker mode. Implements zerisource's per-mode gates:
+    //   combo + hero        : AA only if charged OR volley would execute
+    //   combo + lane minion : strict last-hit only (preserve charge for hero)
+    //   clear + lane minion : AA when charged (consume) or volley last-hits
+    //   lasthit/harass + minion : pure last-hit
+    //   monster (big)       : volley executes (or charged in clear)
+    //   monster (small)     : no AA when charged (preserve empowered shot)
+    //   structures/wards    : only AA with passive charge
+    static bool smart_aa_gate(game_object* target, bool combo_mode,
+                              bool clear_mode, bool lasthit_mode, bool harass_mode)
     {
         if (!target) return false;
-        const bool execute = q_will_kill(target);
 
-        switch (menu::aa_mode) {
-        case AA_OFF:        return false;
-        case AA_FULL_CHARGE: return passive_charged && target->is_hero();
-        case AA_EXECUTE:    return execute;
-        case AA_SMART:
-        default:
-            if (passive_charged && target->is_hero()) return true;
-            return execute;
+        if (target->is_hero()) {
+            if (combo_mode) {
+                // Defensive backoff vs ready engage spell in AA range
+                if (enemy_has_ready_close_spell(target)
+                    && distance_to(target) <= c_aa_range - 50.f) return false;
+                if (passive_charged) return true;
+                return q_volley_will_kill(target, false);
+            }
+            // harass / lasthit / out-of-mode: only AA if kill secured
+            return q_volley_will_kill(target, false);
         }
+
+        if (target->is_minion() && target->is_lane_minion()) {
+            if (combo_mode) {
+                // Don't burn AA cycles on minions mid-combo
+                return q_volley_will_kill(target, false);
+            }
+            if (clear_mode) {
+                // Consume the empowered shot immediately when charged,
+                // otherwise only last-hit (preserves wave control).
+                if (passive_charged) return true;
+                return q_volley_will_kill(target, false);
+            }
+            // lasthit / harass
+            return q_volley_will_kill(target, false);
+        }
+
+        if (target->is_monster()) {
+            const bool big = target->is_large_monster() || target->is_epic_monster();
+            if (big) {
+                if (clear_mode && passive_charged) return true;
+                return q_volley_will_kill(target, false);
+            }
+            // Small camps: hold the empowered shot for something better.
+            if (clear_mode || lasthit_mode) return !passive_charged;
+            return true;
+        }
+
+        if (target->is_turret() || target->is_inhibitor() || target->is_nexus()
+            || target->is_ward() || target->is_trap() || target->is_plant()) {
+            return passive_charged;
+        }
+
+        // Unknown target type — let the orbwalker proceed.
+        return true;
     }
 
     bool __stdcall on_before_attack(orb_sdk::event_data* data)
@@ -1022,46 +1075,41 @@ namespace zeri
         if (!data || !data->target || !sdk::orbwalker) return true;
 
         auto* target = data->target;
-        const bool in_combo = sdk::orbwalker->combo();
-        const bool q_allowed = is_spell_learned(SLOT_Q) && is_spell_ready(SLOT_Q)
-            && (!in_combo || menu::combo_use_q);
+        const bool combo_mode   = sdk::orbwalker->combo();
+        const bool clear_mode   = sdk::orbwalker->clear() || sdk::orbwalker->fast_clear();
+        const bool lasthit_mode = sdk::orbwalker->lasthit();
+        const bool harass_mode  = sdk::orbwalker->harass();
+        const bool any_mode     = combo_mode || clear_mode || lasthit_mode || harass_mode;
 
-        // Try Q first if ready; if cast succeeded, suppress the AA
+        const bool q_allowed = is_spell_learned(SLOT_Q) && is_spell_ready(SLOT_Q)
+            && (!combo_mode || menu::combo_use_q);
+
+        // Try Q first if ready. try_q has a direct-cast branch for stationary
+        // objects (structures, wards, traps, plants) so prediction won't spin
+        // on a non-moving unit.
         if (q_allowed) {
             if (try_q(target, pred_sdk::hitchance::low) == q_result::casted)
                 return false;
         }
 
-        // ---- Smart pre-attack gates per target type --------------------
-        if (target->is_minion()) {
-            // Jungle / non-lane: only attack large/epic monsters with the
-            // empowered shot (don't waste the passive on a krug).
-            if (!target->is_lane_minion() && target->is_monster()) {
-                const bool big = target->is_large_monster() || target->is_epic_monster();
-                if (big) return q_volley_will_kill(target, false);
-                return true; // small monsters: always AA (no charge to waste)
-            }
-            // Lane minion: take the AA when a volley would kill (or when not charged).
-            return q_volley_will_kill(target, in_combo);
-        }
-        if (target->is_turret()) {
+        // ---- Explicit user override modes ----------------------------
+        switch (menu::aa_mode) {
+        case AA_OFF:
+            return false;
+        case AA_FULL_CHARGE:
+            // Only consume the AA when passive charge is up.
             return passive_charged;
+        case AA_EXECUTE:
+            // Only AA when the volley would kill the target.
+            return q_volley_will_kill(target, false);
+        case AA_SMART:
+        default:
+            break;
         }
-        if (target->is_inhibitor() || target->is_nexus()) {
-            return passive_charged;
-        }
-        if (target->is_ward() || target->is_trap() || target->is_plant()) {
-            return passive_charged;
-        }
-        if (target->is_hero()) {
-            // Defensive: back off heroes with a ready close-range engage spell.
-            if (in_combo && enemy_has_ready_close_spell(target)) {
-                const float aa_range = c_aa_range;
-                if (distance_to(target) <= aa_range - 50.f) return false;
-            }
-            return allow_normal_aa(target);
-        }
-        return true;
+
+        // SMART: no active orbwalker mode -> let the orbwalker proceed.
+        if (!any_mode) return true;
+        return smart_aa_gate(target, combo_mode, clear_mode, lasthit_mode, harass_mode);
     }
 
     // ============================================================================
@@ -1345,18 +1393,17 @@ namespace zeri
     void clear()
     {
         if (!sdk::orbwalker || !sdk::orbwalker->is_spell_farm_enabled()) return;
-        if (mana_pct() < (float)menu::lane_mana_pct) return;
 
+        // Q is free — always run it regardless of mana threshold
         if (try_q_structure()) return;
         if (try_q_empowered_clear()) return;
         if (try_q_jungle()) return;
-
-        // Q clear: any minion in the AA→Q gap, push the wave
         if (menu::lane_use_q_clear) try_q_clear_farm();
-
         if (try_q_wards())     return;
         if (try_q_traps_pets()) return;
 
+        // W and beyond respect the mana threshold
+        if (mana_pct() < (float)menu::lane_mana_pct) return;
         if (!menu::lane_use_w) return;
         if (!is_spell_ready(SLOT_W) || !has_enough_mana(SLOT_W)) return;
         if (sdk::orbwalker->would_cancel_attack()) return;
@@ -1389,18 +1436,17 @@ namespace zeri
     void fast_clear()
     {
         if (!sdk::orbwalker || !sdk::orbwalker->is_spell_farm_enabled()) return;
-        if (mana_pct() < (float)menu::lane_mana_pct) return;
 
-        // Extended Q farm targets — same priority order as clear()
+        // Q is free — always run it regardless of mana threshold
         if (try_q_structure()) return;
         if (try_q_empowered_clear()) return;
         if (try_q_jungle()) return;
-
-        // Q clear: any minion in the AA→Q gap, push the wave
         if (menu::lane_use_q_clear) try_q_clear_farm();
-
         if (try_q_wards())     return;
         if (try_q_traps_pets()) return;
+
+        // W and beyond respect the mana threshold
+        if (mana_pct() < (float)menu::lane_mana_pct) return;
 
         if (menu::lane_use_w && is_spell_ready(SLOT_W) && has_enough_mana(SLOT_W)
             && !sdk::orbwalker->would_cancel_attack()) {
@@ -1430,8 +1476,8 @@ namespace zeri
             }
         }
 
-        // Jungle fallback
-        if (menu::jungle_use_w && is_spell_ready(SLOT_W) && has_enough_mana(SLOT_W)
+        // Jungle W — governed by the same "Use in Clear" toggle as lane W
+        if (menu::lane_use_w && is_spell_ready(SLOT_W) && has_enough_mana(SLOT_W)
             && !sdk::orbwalker->would_cancel_attack() && sdk::target_selector) {
             auto* monster = sdk::target_selector->get_monster_target(
                 [](game_object* m) {
@@ -1651,10 +1697,8 @@ namespace zeri
         if (menu::draw_jump_spots && is_spell_learned(SLOT_E)) {
             for (size_t i = 0; i < WALL_JUMP_COUNT; ++i) {
                 const auto& s = WALL_JUMPS[i];
-                const float d = std::min(pos.distance(s.start), pos.distance(s.end));
-                if (d > menu::draw_jump_max_dist) continue;
-                draw_circle(s.start, 30.f, menu::color_jump);
-                draw_circle(s.end,   30.f, menu::color_jump);
+                if (pos.distance(s.entry) > menu::draw_jump_max_dist) continue;
+                draw_circle(s.entry, 30.f, menu::color_jump);
             }
         }
 
@@ -1793,11 +1837,9 @@ namespace zeri
         auto w_menu = s_menu->add_sub_category("w_ultrashock_laser", "W - Ultrashock Laser");
         w_menu->add_checkbox("combo",  "Use in Combo",  menu::combo_use_w,  [](bool v) { menu::combo_use_w = v; });
         w_menu->add_checkbox("harass", "Use in Harass", menu::harass_use_w, [](bool v) { menu::harass_use_w = v; });
-        w_menu->add_checkbox("clear",  "Use in Clear",  menu::lane_use_w,   [](bool v) { menu::lane_use_w = v; });
+        w_menu->add_checkbox("clear",  "Use in Clear / Jungle",  menu::lane_use_w,   [](bool v) { menu::lane_use_w = v; });
         w_menu->add_checkbox("lh_cannon", "Use to Save Cannon", menu::lh_w_cannon,
             [](bool v) { menu::lh_w_cannon = v; });
-        w_menu->add_checkbox("jungle", "Use on Jungle Monsters", menu::jungle_use_w,
-            [](bool v) { menu::jungle_use_w = v; });
         w_menu->add_checkbox("ks", "Killsteal", menu::combo_w_killsteal,
             [](bool v) { menu::combo_w_killsteal = v; });
         w_menu->add_separator();

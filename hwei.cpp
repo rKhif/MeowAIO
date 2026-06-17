@@ -1270,6 +1270,62 @@ namespace hwei
             return tick_pending();
         }
 
+        // Auto WE (Stirring Lights) for mana sustain. WE itself costs mana but
+        // each of its 3 empowered hits restores 45-65 -> 135-195 total, easily
+        // net positive if we have something to hit. Gated on having a target in
+        // attack range so the buff doesn't expire unused.
+        bool handle_auto_we()
+        {
+            if (!menu::auto_we_mana)
+                return false;
+            if (!is_spell_learned(SLOT_W) || !is_spell_ready(SLOT_W) || !has_mana_for(SLOT_W))
+                return false;
+            if (consume_cast_engine_busy())
+                return false;
+            if (mana_percent() > static_cast<float>(menu::auto_we_mana_pct))
+                return false;
+
+            auto* player = get_player();
+            if (!player || !g_sdk || !g_sdk->object_manager)
+                return false;
+
+            const auto ppos = player->get_position();
+            // Small slack on attack range so we fire WE as we walk into orbwalk range.
+            const float aa_range = player->get_attack_range() + 100.f;
+
+            auto in_aa_range = [&](game_object* obj) {
+                return obj && obj->is_valid() && !obj->is_dead()
+                    && ppos.distance(obj->get_position()) <= aa_range;
+            };
+
+            bool target_in_range = false;
+            for (auto* hero : g_sdk->object_manager->get_heroes())
+            {
+                if (!hero || hero->get_team_id() == player->get_team_id())
+                    continue;
+                if (!hero->is_visible() || !hero->is_targetable())
+                    continue;
+                if (in_aa_range(hero)) { target_in_range = true; break; }
+            }
+            if (!target_in_range)
+            {
+                for (auto* m : g_sdk->object_manager->get_minions())
+                {
+                    if (!m || m->get_team_id() == player->get_team_id())
+                        continue;
+                    if (!m->is_lane_minion() || !m->is_targetable())
+                        continue;
+                    if (in_aa_range(m)) { target_in_range = true; break; }
+                }
+            }
+            if (!target_in_range)
+                return false;
+
+            if (!start_cast(ABILITY_WE, {}, nullptr))
+                return false;
+            return tick_pending();
+        }
+
         bool try_cast_eq(int hitchance)
         {
             return try_cast_linear(ABILITY_EQ, s_pred_eq, hitchance);
@@ -1563,10 +1619,21 @@ namespace hwei
             return false;
         }
 
+        // Wraps try_cast_we for combo use. When "combo WE only when low mana"
+        // is on, returns false (skip) above the shared mana threshold so we
+        // save the W mood for QW/WW utility instead of burning it on poke buff.
+        bool combo_try_we()
+        {
+            if (menu::combo_we_low_mana_only
+                && mana_percent() > static_cast<float>(menu::auto_we_mana_pct))
+                return false;
+            return try_cast_we();
+        }
+
         bool combo_basic()
         {
             if (handle_ee_qq_followup()) return true;
-            if (cast_or_busy(try_cast_we())) return true;
+            if (cast_or_busy(combo_try_we())) return true;
             if (cast_or_busy(try_cast_ee(menu::combo_ee_hitchance))) return true;
             if (cast_or_busy(try_cast_qq(menu::combo_qq_hitchance))) return true;
             return false;
@@ -1574,7 +1641,7 @@ namespace hwei
 
         bool combo_qe_qw()
         {
-            if (cast_or_busy(try_cast_we())) return true;
+            if (cast_or_busy(combo_try_we())) return true;
             if (cast_or_busy(try_cast_qe(menu::combo_qe_hitchance))) return true;
             if (cast_or_busy(try_cast_qw(menu::combo_qw_hitchance))) return true;
             return false;
@@ -1597,7 +1664,7 @@ namespace hwei
         bool combo_all_in_burst()
         {
             if (handle_ee_qq_followup()) return true;
-            if (cast_or_busy(try_cast_we())) return true;
+            if (cast_or_busy(combo_try_we())) return true;
             if (cast_or_busy(try_cast_ee(menu::combo_ee_hitchance))) return true;
             if (try_cast_r_semi(menu::combo_r_hitchance)) return true;
             if (cast_or_busy(try_cast_qq(menu::combo_qq_hitchance))) return true;
@@ -1607,7 +1674,7 @@ namespace hwei
 
         bool combo_teamfight_all_in()
         {
-            if (cast_or_busy(try_cast_we())) return true;
+            if (cast_or_busy(combo_try_we())) return true;
             if (cast_or_busy(try_cast_ee(menu::combo_ee_hitchance))) return true;
             if (try_cast_r_semi(menu::combo_r_hitchance)) return true;
             if (should_wait_for_r()) return true;
@@ -2420,6 +2487,11 @@ namespace hwei
             if (!sdk::orbwalker || !sdk::orbwalker->is_spell_farm_enabled())
                 return;
 
+            // Auto WE for mana sustain runs before the lane mana gate so it can
+            // actually fire while we're at low mana (the whole point of it).
+            if (handle_auto_we())
+                return;
+
             if (consume_cast_engine_busy())
                 return;
 
@@ -2749,6 +2821,13 @@ namespace hwei
                 [](int v) { menu::ww_self_hp_pct = v; });
             w_menu->add_slider_int("ww_ally_hp", "  WW Ally HP %", 0, 100, 5, menu::ww_ally_hp_pct,
                 [](int v) { menu::ww_ally_hp_pct = v; });
+            w_menu->add_separator();
+            w_menu->add_checkbox("auto_we_mana", "Auto WE on Low Mana", menu::auto_we_mana,
+                [](bool v) { menu::auto_we_mana = v; });
+            w_menu->add_slider_int("auto_we_mana_pct", "  WE Mana % Threshold", 0, 100, 5, menu::auto_we_mana_pct,
+                [](int v) { menu::auto_we_mana_pct = v; });
+            w_menu->add_checkbox("combo_we_low_only", "Combo WE Only When Low Mana", menu::combo_we_low_mana_only,
+                [](bool v) { menu::combo_we_low_mana_only = v; });
         }
 
         if (auto* e_menu = s_menu->add_sub_category("e", "E - Subject: Torment"))

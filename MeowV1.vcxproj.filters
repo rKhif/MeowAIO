@@ -111,6 +111,15 @@
     <ClInclude Include="hwei.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="nami.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="twitch.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="champion_drawings.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="vex.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -124,6 +133,27 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="senna.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="kalista.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="zeri_ps.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="lulu.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="jinx.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="soraka.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="thresh.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ziggs.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
@@ -170,6 +200,12 @@
     <ClCompile Include="hwei.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="nami.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="twitch.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="vex.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -183,6 +219,27 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="senna.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="kalista.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="zeri_ps.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="lulu.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="jinx.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="soraka.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="thresh.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ziggs.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

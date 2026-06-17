@@ -554,33 +554,29 @@ namespace orianna
         spell.targetting_type    = pred_sdk::targetting_type::center_to_edge;
         spell.spell_slot         = SLOT_Q;
         spell.range              = spell_data::q_range;
+        // q_radius = 87.5 = q_effect_radius / 2. The pred SDK expects the
+        // half-radius (center-to-edge distance), NOT the full AOE diameter.
+        spell.radius             = spell_data::q_radius;
         spell.expected_hitchance = hitchance;
 
-        // Effective hit radius = full detonation AOE + target's bounding radius.
-        // Using the conservative q_radius (87.5) under-reported reachable edge
-        // targets; q_effect_radius (175) is the actual hit circle radius.
-        const float bounding = target ? target->get_bounding_radius() : 0.f;
-        spell.radius = spell_data::q_effect_radius + bounding;
-
-        // Total time before the AOE detonates:
-        //   windup delay (0.25s) + ball travel time (ball_pos → cast point at 1400 u/s)
-        // On-self: SDK derives travel time from player→cast_point / speed.
-        // Off-self: ball launches from a non-player origin so we bake total
-        //   flight time into delay (FLT_MAX speed = instantaneous from SDK's view).
-        //   One refinement pass corrects for enemy movement during the windup +
-        //   rough travel window — crude estimate → predict enemy pos → recalculate.
+        // Total time before the AOE detonates =
+        //   cast time + (ball-to-cast-point travel at ball_q_missile_speed)
+        // When the ball is on the player, pred handles the second term itself
+        // via projectile_speed (caster → cast point). When the ball is on the
+        // ground / on an ally, the missile flies from the ball — not the
+        // player — so we bake the ball→target distance into `delay` and tell
+        // pred the rest is instant. The SDK then predicts enemy movement from
+        // that total delay internally — we must NOT pre-predict here or we
+        // double-lead the cast point.
         constexpr float Q_CAST_TIME = 0.25f;
         if (g_ball_state == ball_state::on_self) {
             spell.delay            = Q_CAST_TIME;
             spell.projectile_speed = spell_data::ball_q_missile_speed;
         } else if (target) {
-            const auto  bp           = get_ball_position();
-            const float rough_travel = bp.distance(target->get_position())
-                                     / spell_data::ball_q_missile_speed;
-            const auto  refined_pos  = predict_position(target, Q_CAST_TIME + rough_travel);
-            const float final_travel = bp.distance(refined_pos)
-                                     / spell_data::ball_q_missile_speed;
-            spell.delay            = Q_CAST_TIME + final_travel;
+            const auto bp = get_ball_position();
+            const float ball_to_target = bp.distance(target->get_position());
+            spell.delay            = Q_CAST_TIME
+                                   + ball_to_target / spell_data::ball_q_missile_speed;
             spell.projectile_speed = FLT_MAX;
         } else {
             spell.delay            = Q_CAST_TIME;
@@ -641,6 +637,49 @@ namespace orianna
         bool ok = sdk::common->cast_spell(SLOT_W);
         if (ok) last_spell_cast_time = g_sdk->clock_facade->get_game_time();
         return ok;
+    }
+
+    // Q→W extended-reach combo. When Q's own hit prediction fails (target is
+    // beyond Q range or dodging enough to be sub-threshold) but Q + W's edge
+    // could still catch the target, place the ball at the closest reachable
+    // point to the target's predicted position and let W finish the job.
+    //
+    // Geometry: Q range 825 + W effect radius 225 = ~1050u effective reach.
+    // W is instant once the ball is placed, so even a "wasted" Q (missed AOE)
+    // is worth it for the guaranteed W follow-up.
+    static bool try_force_qw(game_object* target)
+    {
+        if (!target || !sdk::prediction || !sdk::common) return false;
+        if (!is_spell_ready(SLOT_Q) || !has_enough_mana(SLOT_Q)) return false;
+        // W must be ready and have mana — the whole point is the follow-up.
+        if (!is_spell_ready(SLOT_W) || !has_enough_mana(SLOT_W)) return false;
+        if (g_ball_state == ball_state::in_transit_e) return false;
+        if (sdk::orbwalker && sdk::orbwalker->would_cancel_attack()) return false;
+
+        auto p = g_sdk->object_manager->get_local_player();
+        if (!p) return false;
+        const auto ppos = p->get_position();
+
+        // Low hitchance: we don't need Q to hit the target, only to extract a
+        // predicted position. The predictor still bails out on stasis/dashes.
+        auto pred = predict_q(target, pred_sdk::hitchance::low);
+        if (!pred.is_valid) return false;
+
+        // Place the ball as close to the predicted position as Q range allows.
+        math::vector3 cast_pos = pred.predicted_position;
+        if (ppos.distance(cast_pos) > spell_data::q_range)
+            cast_pos = ppos.extended(cast_pos, spell_data::q_range);
+
+        // Will W's AOE actually catch the target? Subtract a small movement
+        // buffer for the ~0.25–0.3s between Q landing and W detonating.
+        constexpr float W_TIMING_BUFFER = 60.f;  // ~0.15s of enemy movement
+        const float w_reach = spell_data::w_effect_radius
+                            + target->get_bounding_radius()
+                            - W_TIMING_BUFFER;
+        if (w_reach <= 0.f) return false;
+        if (cast_pos.distance(pred.predicted_position) > w_reach) return false;
+
+        return cast_q_at(cast_pos);
     }
 
     static bool try_r()
@@ -1188,6 +1227,17 @@ namespace orianna
             if (try_q(target, menu::combo_q_hitchance)) return;
         }
 
+        // Force Q→W when standard Q wouldn't connect. Looks at the extended
+        // (Q + W) range, picks the highest-priority target, and places the
+        // ball where W will catch them on the next tick. Only runs if both Q
+        // and W are enabled in combo — otherwise the follow-up wouldn't fire.
+        if (menu::combo_force_qw && menu::combo_use_q && menu::combo_use_w) {
+            const float extended_range = spell_data::q_range
+                                       + spell_data::w_effect_radius;
+            auto* extended_target = pick_hero_target(extended_range);
+            if (extended_target && try_force_qw(extended_target)) return;
+        }
+
         // W second — fires at the ball position (after Q, ball is on enemy).
         if (menu::combo_use_w && try_w()) return;
 
@@ -1695,13 +1745,15 @@ namespace orianna
         auto q_menu = s_menu->add_sub_category("q_command_attack", "Q - Command: Attack");
         q_menu->add_checkbox("combo",  "Use in Combo",  menu::combo_use_q,  [](bool v) { menu::combo_use_q = v; });
         q_menu->add_checkbox("harass", "Use in Harass", menu::harass_use_q, [](bool v) { menu::harass_use_q = v; });
-        q_menu->add_checkbox("ks_q", "Killsteal", menu::ks_use_q,
-            [](bool v) { menu::ks_use_q = v; });
         q_menu->add_checkbox("lasthit", "Use in Lasthit", menu::lasthit_use_q,
             [](bool v) { menu::lasthit_use_q = v; });
         q_menu->add_checkbox("clear",  "Use in Clear",  menu::clear_use_q,  [](bool v) { menu::clear_use_q = v; });
         q_menu->add_slider_int("clr_min", "  Clear Min Minions", 1, 6, 1, menu::clear_q_min,
             [](int v) { menu::clear_q_min = v; });
+        q_menu->add_checkbox("ks_q", "Killsteal", menu::ks_use_q,
+            [](bool v) { menu::ks_use_q = v; });
+        q_menu->add_checkbox("force_qw", "Force QW",
+            menu::combo_force_qw, [](bool v) { menu::combo_force_qw = v; });
         q_menu->add_slider_int("c_hc", "Hitchance",  0, 100, 5, menu::combo_q_hitchance,
             [](int v) { menu::combo_q_hitchance = v; });
         q_menu->add_separator();

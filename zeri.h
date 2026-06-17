@@ -20,8 +20,8 @@ namespace zeri
     namespace spell_data
     {
         // Q — Burst Fire (Zeri's primary "auto attack" — replaces AAs)
-        constexpr float q_range              = 750.f;
-        constexpr float q_radius             = 40.f;
+        constexpr float q_range              = 715.f;
+        constexpr float q_radius             = 65.f;
         constexpr float q_speed              = 2600.f;
         constexpr float q_speed_overcharged  = 3400.f;
         constexpr float q_as_cap             = 1.5f;
@@ -95,7 +95,6 @@ namespace zeri
         inline bool lane_use_w        = true;
         inline int  lane_mana_pct     = 30;
         inline bool lh_w_cannon       = false;
-        inline bool jungle_use_w      = true;
 
         // --- Flee ---
         inline bool  flee_use_e              = true;

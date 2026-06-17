@@ -71,6 +71,11 @@ namespace orianna
         inline bool combo_use_q       = true;
         inline bool combo_use_w       = true;
         inline bool combo_use_r       = true;
+        // Force Q→W: when Q alone won't connect (out of range / sidestepped),
+        // place the ball at the closest reachable point to the target's
+        // predicted position and rely on W's instant AOE to land the hit.
+        // Extends effective combo reach from ~825 (Q) to ~1050 (Q + W).
+        inline bool combo_force_qw    = true;
         inline int  combo_q_hitchance = pred_sdk::hitchance::medium;
         inline bool combo_r_killable  = true;     // also fire R if 1 hero is killable
 

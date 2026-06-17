@@ -113,7 +113,6 @@ namespace viktor
         inline bool r_only_killable = false;
         inline int  min_enemies_for_r = 1;
         inline bool auto_r_movement = true;
-        inline bool auto_r_follow_selected = true;
 
         // Semi-manual keys
         inline bool         semi_w_active = false;

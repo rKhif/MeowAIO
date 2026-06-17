@@ -69,6 +69,10 @@ namespace viktor
     // Storm redirect reach is larger than the initial cast range, so the
     // auto-mover can steer the storm well past where it was first placed.
     static constexpr float R_REDIRECT_RANGE   = 1500.f;
+    // Hard cap on auto-chase distance from the storm — without this the
+    // selected-target and fallback branches happily steered the storm toward
+    // botlane enemies while the player was in mid/top.
+    static constexpr float R_AUTO_MAX_CHASE   = 1500.f;
 
     static math::vector3 last_r_move_pos{};
     static float         last_r_move_score = 0.f;
@@ -295,16 +299,45 @@ namespace viktor
     {
         if (!obj || !player || !obj->is_valid()) return false;
         if (!obj->is_particle()) return false;
+        if (obj->get_owner() != player) return false;
 
-        const auto name = obj->get_name();
-        const bool has_viktor = name.find("Viktor") != std::string::npos
-                             || name.find("Victor") != std::string::npos;
-        const bool has_storm  = name.find("R_Aoe")       != std::string::npos
-                             || name.find("ChaosStorm")  != std::string::npos
-                             || name.find("ChaosField")  != std::string::npos;
-        if (!has_viktor || !has_storm) return false;
+        // Case-insensitive: skin/patch variations capitalize differently and
+        // the strict matcher kept missing on some skins, leaving r_instance
+        // null forever — which then blocked auto-R move.
+        std::string name = obj->get_name();
+        std::transform(name.begin(), name.end(), name.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-        return obj->get_owner() == player;
+        const bool has_viktor = name.find("viktor") != std::string::npos
+                             || name.find("victor") != std::string::npos;
+        if (!has_viktor) return false;
+
+        // Broad set of storm-particle name fragments seen across patches/skins.
+        if (name.find("r_aoe")      != std::string::npos) return true;
+        if (name.find("r_storm")    != std::string::npos) return true;
+        if (name.find("chaosstorm") != std::string::npos) return true;
+        if (name.find("chaosfield") != std::string::npos) return true;
+        if (name.find("_r_")        != std::string::npos
+            && (name.find("aoe")    != std::string::npos
+             || name.find("storm")  != std::string::npos
+             || name.find("field")  != std::string::npos
+             || name.find("tick")   != std::string::npos)) return true;
+
+        // Position-near-cast fallback: if the script just recorded a cast end
+        // position and a Viktor-owned particle spawns near it within the cast
+        // windup, treat it as the storm even if the name is unfamiliar.
+        if (r_cast_pos_valid && g_sdk && g_sdk->clock_facade)
+        {
+            const float now = g_sdk->clock_facade->get_game_time();
+            const float since_cast = now - r_storm_start_t;
+            if (since_cast >= 0.f && since_cast <= 1.0f)
+            {
+                const float d = obj->get_position().distance(r_cast_pos);
+                if (d < 100.f) return true;
+            }
+        }
+
+        return false;
     }
 
     bool is_spell_learned(int slot)
@@ -363,16 +396,28 @@ namespace viktor
         auto player = g_sdk->object_manager->get_local_player();
         if (!looks_like_viktor_storm(obj, player)) return;
 
-        r_instance      = obj;
-        r_storm_active  = true;
-        r_storm_start_t = g_sdk->clock_facade->get_game_time();
-        }
+        r_instance     = obj;
+        r_storm_active = true;
+        // Only seed start time here if on_process_cast didn't already (or its
+        // value is stale). Pushing it forward at spawn time would re-arm the
+        // 0.35s stabilization gate and delay auto-move on every manual cast.
+        const float now = g_sdk->clock_facade->get_game_time();
+        if (r_storm_start_t <= 0.f || (now - r_storm_start_t) > 1.0f)
+            r_storm_start_t = now;
+    }
 
     void __fastcall on_delete_object(game_object* obj)
     {
-        if (obj == r_instance)
+        if (obj != r_instance) return;
+        r_instance = nullptr;
+
+        // The storm can shed/re-spawn child particles inside its lifetime.
+        // Only kill storm state if the CHAOS_STORM buff is also gone — that's
+        // the engine ground-truth signal for "the storm itself is over".
+        auto player = g_sdk && g_sdk->object_manager
+                    ? g_sdk->object_manager->get_local_player() : nullptr;
+        if (!is_chaos_storm_buff_active(player))
         {
-            r_instance       = nullptr;
             r_storm_active   = false;
             r_cast_pos_valid = false;
         }
@@ -1588,7 +1633,6 @@ namespace viktor
             game_object* sel = sdk::target_selector->get_forced_target();
 
             if ((!sel || !is_valid_target(sel))
-                && menu::auto_r_follow_selected
                 && sdk::target_selector->get_manual_target_mode() != 0)
             {
                 game_object* clicked = sdk::target_selector->get_hero_target();
@@ -1598,7 +1642,10 @@ namespace viktor
 
             if (sel && is_valid_target(sel))
             {
-                move_r_to_target(sel);
+                // Hard distance cap: don't fling the storm across the map
+                // just because the TS reports a target in another lane.
+                if (storm_pos.distance(sel->get_position()) <= R_AUTO_MAX_CHASE)
+                    move_r_to_target(sel);
                 return;
             }
         }
@@ -1623,8 +1670,10 @@ namespace viktor
 
         if (enemies.empty())
         {
-            // Fallback retarget: if the current focus died or left storm search
-            // radius, move toward the nearest valid enemy so R does not stall.
+            // Fallback retarget: if the current focus died or left the storm
+            // search radius, move toward the nearest valid enemy so R doesn't
+            // stall — but only within a hard distance cap so the script
+            // doesn't fling the storm at far-lane enemies it can't reach.
             game_object* nearest_enemy = nullptr;
             float nearest_dist = FLT_MAX;
 
@@ -1647,7 +1696,7 @@ namespace viktor
                 }
             }
 
-            if (nearest_enemy)
+            if (nearest_enemy && nearest_dist <= R_AUTO_MAX_CHASE)
                 move_r_to_target(nearest_enemy);
 
             return;
@@ -2740,11 +2789,18 @@ namespace viktor
         if (!player) return false;
         if (!is_spell_learned(SLOT_R)) return false;
 
+        // Storm must be alive — but we DON'T require the particle handle.
+        // The recast spell goes through whether we captured r_instance or
+        // not (engine routes it to the player's storm via the buff). Missing
+        // r_instance used to silently block every move when the particle
+        // matcher missed.
         auto r_obj = get_r_instance();
-        if (!r_obj) return false;
+        const bool storm_alive = r_obj
+                              || is_chaos_storm_buff_active(player)
+                              || r_storm_active;
+        if (!storm_alive) return false;
 
         const auto  ppos = player->get_position();
-        const auto  spos = r_obj->get_position();
 
         // Engine range-clamps the redirect against the caster, not the storm.
         // Redirect reach is larger than the initial cast range, so the storm
@@ -2759,7 +2815,17 @@ namespace viktor
             const float jitter = pos.distance(last_r_move_pos);
             if (jitter < R_DEAD_ZONE && score <= last_r_move_score + R_HYSTERESIS)
                 return false;
-            if (spos.distance(pos) < R_DEAD_ZONE && score <= last_r_move_score + R_HYSTERESIS)
+
+            // Approximate storm position when the particle wasn't captured:
+            // fall back to the last known cast position. Skip the check
+            // entirely if we have no estimate at all.
+            const math::vector3 spos = r_obj            ? r_obj->get_position()
+                                     : r_cast_pos_valid ? r_cast_pos
+                                                        : math::vector3{};
+            const bool have_spos = r_obj || r_cast_pos_valid;
+            if (have_spos
+                && spos.distance(pos) < R_DEAD_ZONE
+                && score <= last_r_move_score + R_HYSTERESIS)
                 return false;
         }
 
@@ -2778,12 +2844,18 @@ namespace viktor
         if (!g_sdk || !g_sdk->object_manager) return;
         auto player = g_sdk->object_manager->get_local_player();
         if (!player || !target) return;
-
-        auto r_obj = get_r_instance();
-        if (!r_obj) return;
         if (!is_spell_learned(SLOT_R)) return;
 
-        const auto spos = r_obj->get_position();
+        // Same as move_r_to_pos: don't gate on r_instance; let the buff /
+        // active flag decide whether the recast can fire. Particle handle
+        // is only used for a better storm-position estimate.
+        auto r_obj = get_r_instance();
+        if (!r_obj && !is_chaos_storm_buff_active(player) && !r_storm_active)
+            return;
+
+        const math::vector3 spos = r_obj            ? r_obj->get_position()
+                                 : r_cast_pos_valid ? r_cast_pos
+                                                    : player->get_position();
         const auto tpos = target->get_position();
 
         // CC'd → no lead; otherwise server lag + storm travel time.
@@ -3018,7 +3090,6 @@ namespace viktor
         r_menu->add_checkbox("only_kill", "Only if Killable", menu::r_only_killable, [](bool v) { menu::r_only_killable = v; });
         r_menu->add_slider_int("min_enemies", "Min Enemies", 1, 5, 1, menu::min_enemies_for_r, [](int v) { menu::min_enemies_for_r = v; });
         r_menu->add_checkbox("auto_move", "Auto Move", menu::auto_r_movement, [](bool v) { menu::auto_r_movement = v; });
-        r_menu->add_checkbox("auto_move_selected", "Auto Move: Follow Selected Target", menu::auto_r_follow_selected, [](bool v) { menu::auto_r_follow_selected = v; });
         r_menu->add_checkbox("draw_range", "Draw Range", menu::draw_r_range, [](bool v) { menu::draw_r_range = v; });
         r_menu->add_hotkey("semi_r", "Semi-Manual R", 'Y', false, false,
             [](std::string* key, bool val)

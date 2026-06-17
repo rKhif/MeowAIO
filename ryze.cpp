@@ -73,6 +73,7 @@ namespace ryze
         static menu_category* s_menu = nullptr;
         static std::array<flux_entry, 10> s_fluxed_targets{};
         static float s_last_spell_cast_time = 0.f;
+        static float s_last_non_q_cast_time = 0.f;
         static int   s_rune_stacks = 0;
         static game_object* s_semi_root_target = nullptr;
         static float s_semi_root_expire_time = 0.f;
@@ -81,6 +82,14 @@ namespace ryze
         static constexpr float MIN_SPELL_DELAY = 0.05f;
         static constexpr float SEMI_ROOT_SPELL_DELAY = 0.015f;
         static constexpr float SEMI_ROOT_BUFFER_WINDOW = 0.35f;
+        // Q's remaining-CD threshold below which we know the passive reset has
+        // landed (after refund Q sits at a fraction of a second; before refund
+        // it's at multi-second base CD).
+        static constexpr float Q_RESET_CD_THRESHOLD = 0.55f;
+        // Fallback time window keyed off the last non-Q cast, used while the
+        // reset packet is still in flight (covers E/W windup + network RTT).
+        static constexpr float Q_RESET_FALLBACK_BASE = 0.35f;
+        static constexpr float Q_RESET_FALLBACK_MAX  = 0.85f;
         static constexpr uint32_t RYZE_FLUX_HASH = 0x86A30558u;
 
         static game_object* player()
@@ -344,7 +353,12 @@ namespace ryze
                 ok = sdk::common->cast_spell(SLOT_W, target);
             }
 
-            if (ok) s_last_spell_cast_time = game_time();
+            if (ok)
+            {
+                const float now = game_time();
+                s_last_spell_cast_time = now;
+                s_last_non_q_cast_time = now;
+            }
             return ok;
         }
 
@@ -367,7 +381,12 @@ namespace ryze
                 ok = sdk::common->cast_spell(SLOT_E, target);
             }
 
-            if (ok) s_last_spell_cast_time = game_time();
+            if (ok)
+            {
+                const float now = game_time();
+                s_last_spell_cast_time = now;
+                s_last_non_q_cast_time = now;
+            }
             return ok;
         }
 
@@ -375,10 +394,10 @@ namespace ryze
         {
             switch (menu::combo_mode)
             {
-            case 0: return "Basic";
-            case 1: return "QEQWQ";
-            case 2: return "Root";
-            default: return "Smart";
+            case 0: return "QEQWQ";
+            case 1: return "Root";
+            case 2: return "Smart";
+            default: return "QEQWQ";
             }
         }
 
@@ -426,7 +445,7 @@ namespace ryze
 
         static void cycle_combo_mode()
         {
-            menu::combo_mode = (menu::combo_mode + 1) % 4;
+            menu::combo_mode = (menu::combo_mode + 1) % 3;
         }
 
         static bool is_flux_buff(buff_instance* buff)
@@ -801,92 +820,134 @@ namespace ryze
             return false;
         }
 
+        // After E or W is cast, Ryze's passive (Arcane Mastery) refunds most of
+        // Q's cooldown — but the reset is server-authoritative. The packet only
+        // arrives back on the client after:
+        //     E/W windup (~250 ms) + network round-trip (2 × ping).
+        // During that gap the local Q still reads as on cooldown, so a naive
+        // combo will fall through to W (or another non-Q spell) when it should
+        // have waited a beat for the reset and Q-priority pattern.
+        //
+        // Two signals are used to decide whether to wait:
+        //   1. Q's remaining cooldown. After the refund lands, Q sits at a
+        //      fraction of a second. If it's below Q_RESET_CD_THRESHOLD, the
+        //      reset has clearly arrived and waiting that last sliver is
+        //      strictly better than burning W.
+        //   2. Time since the last non-Q cast. Until the reset packet has had
+        //      time to fly back, we wait by clock alone — scaled to ping so it
+        //      adapts to network conditions, and hard-capped so we never
+        //      softlock if the reset never fires (spell shield, target dies).
+        static bool should_wait_for_q_reset()
+        {
+            if (!is_spell_learned(SLOT_Q)) return false;
+            if (is_spell_ready(SLOT_Q)) return false;
+
+            auto* p = player();
+            if (!p) return false;
+
+            auto* q_spell = p->get_spell(SLOT_Q);
+            const float q_remaining = q_spell ? q_spell->get_cooldown() : 0.f;
+
+            const int ping_ms = (g_sdk && g_sdk->net_client) ? g_sdk->net_client->get_ping() : 60;
+            const float ping_s = (std::max)(0.f, static_cast<float>(ping_ms) * 0.001f);
+
+            // Signal 1: refund already landed — wait the tiny remainder out.
+            if (q_remaining > 0.f && q_remaining <= Q_RESET_CD_THRESHOLD + ping_s)
+                return true;
+
+            // Signal 2: refund packet still in flight. Window = base + 2x ping
+            // (RTT), capped so we never get stuck if the reset never arrives.
+            if (s_last_non_q_cast_time <= 0.f) return false;
+
+            const float elapsed = game_time() - s_last_non_q_cast_time;
+            const float fallback = (std::min)(Q_RESET_FALLBACK_MAX,
+                                              Q_RESET_FALLBACK_BASE + ping_s * 2.f);
+            return elapsed < fallback;
+        }
+
+        // Ryze's passive (Arcane Mastery) refunds most of Q's cooldown whenever
+        // another spell is cast, so the optimal pattern is Q > E > Q > W > Q with
+        // Q always taking priority the instant it comes back up. Because combo()
+        // runs every tick and casts at most one spell, re-checking Q first on
+        // every path produces that sequence naturally as the reset fires.
         static void combo()
         {
+            auto* p = player();
+            if (!p) return;
+
             auto* target = pick_target(sc::Q_RANGE);
             if (!target) return;
 
-            const float dist = player()->get_position().distance(target->get_position());
+            const float dist = p->get_position().distance(target->get_position());
             const bool fluxed = has_flux(target);
 
+            const auto try_q = [&]() -> bool
+            {
+                return menu::combo_use_q && cast_combo_q(target);
+            };
+
+            // Block non-Q casts while we're still waiting for a Q reset to
+            // register from the previous E/W. This is what prevents the W
+            // misfire when the passive hasn't synced back from the server yet.
+            const bool wait_for_q = should_wait_for_q_reset();
+
+            const auto try_e = [&]() -> bool
+            {
+                if (!menu::combo_use_e || wait_for_q) return false;
+                if (try_e_on_collision_setup(target)) return true;
+                if (!is_spell_ready(SLOT_E) || !has_enough_mana(SLOT_E)) return false;
+                if (dist > sc::E_RANGE) return false;
+                return cast_e(target);
+            };
+
+            const auto try_w = [&]() -> bool
+            {
+                if (!menu::combo_use_w || wait_for_q) return false;
+                if (!is_spell_ready(SLOT_W) || !has_enough_mana(SLOT_W)) return false;
+                if (dist > sc::W_RANGE) return false;
+                return cast_w(target);
+            };
+
+            // Mode 0 (QEQWQ) — canonical Ryze pattern. Q has absolute priority;
+            // E and W only fire to trigger the passive Q reset between them.
             if (menu::combo_mode == 0)
             {
-                if (menu::combo_use_q && cast_combo_q(target)) return;
-
-                if (menu::combo_use_e && try_e_on_collision_setup(target)) return;
-                if (menu::combo_use_e && is_spell_ready(SLOT_E) && has_enough_mana(SLOT_E) && dist <= sc::E_RANGE)
-                {
-                    if (cast_e(target)) return;
-                }
-
-                if (menu::combo_use_w && is_spell_ready(SLOT_W) && has_enough_mana(SLOT_W) && dist <= sc::W_RANGE)
-                {
-                    if (cast_w(target)) return;
-                }
-
-                if (menu::combo_use_q && cast_combo_q(target)) return;
+                if (try_q()) return;
+                if (try_e()) return;
+                if (try_q()) return;
+                if (try_w()) return;
+                if (try_q()) return;
                 return;
             }
 
+            // Mode 1 (Root) — lead with E for the flux + W chain to lock the
+            // target, weaving Q after every non-Q cast.
             if (menu::combo_mode == 1)
             {
-                if (menu::combo_use_q && cast_combo_q(target)) return;
-
-                if (menu::combo_use_e && try_e_on_collision_setup(target)) return;
-                if (menu::combo_use_e && is_spell_ready(SLOT_E) && has_enough_mana(SLOT_E) && dist <= sc::E_RANGE)
-                {
-                    if (cast_e(target)) return;
-                }
-
-                if (menu::combo_use_q && cast_combo_q(target)) return;
-
-                if (menu::combo_use_w && is_spell_ready(SLOT_W) && has_enough_mana(SLOT_W) && dist <= sc::W_RANGE)
-                {
-                    if (cast_w(target)) return;
-                }
-
-                if (menu::combo_use_q && cast_combo_q(target)) return;
+                if (try_e()) return;
+                if (try_q()) return;
+                if (try_w()) return;
+                if (try_q()) return;
                 return;
             }
 
-            if (menu::combo_mode == 2)
+            // Mode 2 (Smart) — context aware: if target already fluxed, drop W
+            // first to lock then Q-spam; otherwise lay E for flux, Q, W, Q.
+            if (try_q()) return;
+
+            if (fluxed)
             {
-                if (menu::combo_use_e && try_e_on_collision_setup(target)) return;
-                if (menu::combo_use_e && is_spell_ready(SLOT_E) && has_enough_mana(SLOT_E) && dist <= sc::E_RANGE)
-                {
-                    if (cast_e(target)) return;
-                }
-
-                if (menu::combo_use_w && is_spell_ready(SLOT_W) && has_enough_mana(SLOT_W) && dist <= sc::W_RANGE)
-                {
-                    if (cast_w(target)) return;
-                }
-
-                if (menu::combo_use_q && cast_combo_q(target)) return;
+                if (try_w()) return;
+                if (try_q()) return;
+                if (try_e()) return;
+                if (try_q()) return;
                 return;
             }
 
-            if (menu::combo_use_e && !fluxed && try_e_on_collision_setup(target)) return;
-            if (menu::combo_use_e && !fluxed && is_spell_ready(SLOT_E) && has_enough_mana(SLOT_E) && dist <= sc::E_RANGE)
-            {
-                if (cast_e(target)) return;
-            }
-
-            if (menu::combo_use_w && fluxed && is_spell_ready(SLOT_W) && has_enough_mana(SLOT_W) && dist <= sc::W_RANGE)
-            {
-                if (cast_w(target)) return;
-            }
-
-            if (menu::combo_use_w && !fluxed && is_spell_ready(SLOT_W) && has_enough_mana(SLOT_W)
-                && dist <= sc::W_RANGE && !is_spell_ready(SLOT_E))
-            {
-                if (cast_w(target)) return;
-            }
-
-            if (menu::combo_use_q && cast_combo_q(target)) return;
-
-            if (menu::combo_use_e && is_spell_ready(SLOT_E) && has_enough_mana(SLOT_E) && dist <= sc::E_RANGE)
-                cast_e(target);
+            if (try_e()) return;
+            if (try_q()) return;
+            if (try_w()) return;
+            if (try_q()) return;
         }
 
         static void harass()
@@ -1062,7 +1123,7 @@ namespace ryze
             if (!s_menu) return;
 
             auto* q_menu = s_menu->add_sub_category("q_overload", "Q - Overload");
-            q_menu->add_combo("combo_mode", "Combo Mode", { "Basic Q > E > W > Q", "Q > E > Q > W > Q", "Root E > W > Q", "Smart" }, menu::combo_mode,
+            q_menu->add_combo("combo_mode", "Combo Mode", { "Q > E > Q > W > Q", "Root E > Q > W > Q", "Smart" }, menu::combo_mode,
                 [](int v) { menu::combo_mode = v; });
             q_menu->add_hotkey("combo_mode_switch", "Cycle Combo Mode", 'Y', false, true,
                 [](std::string* key, bool pressed) {
@@ -1220,6 +1281,7 @@ namespace ryze
 
         s_fluxed_targets.fill({});
         s_last_spell_cast_time = 0.f;
+        s_last_non_q_cast_time = 0.f;
         s_rune_stacks = 0;
         s_semi_root_target = nullptr;
         s_semi_root_expire_time = 0.f;

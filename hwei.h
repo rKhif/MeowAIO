@@ -128,6 +128,13 @@ namespace hwei
         inline int  ww_self_hp_pct = 45;
         inline int  ww_ally_hp_pct = 40;
 
+        // Auto WE for mana recovery (Stirring Lights restores mana per hit).
+        // The mana % threshold here is also used to gate WE in combo when
+        // `combo_we_low_mana_only` is enabled.
+        inline bool auto_we_mana          = true;
+        inline int  auto_we_mana_pct      = 30;
+        inline bool combo_we_low_mana_only = false;
+
         // Lane Clear
         inline bool lane_use_qq = true;
         inline bool lane_use_qe = true;
