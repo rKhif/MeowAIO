@@ -45,13 +45,17 @@ namespace kalista
         constexpr uint32_t buff_oath_coop     = 0x71C0793Cu;
     }
 
-    // E damage tables (rank 0..4)
-    constexpr float E_BASE_FIRST[5]       = { 20.f, 30.f, 40.f, 50.f, 60.f };
-    constexpr float E_FIRST_RATIO_AD      = 0.70f;
-    constexpr float E_FIRST_RATIO_AP      = 0.20f;
-    constexpr float E_BASE_ADDITIONAL[5]  = { 8.f, 12.f, 16.f, 20.f, 24.f };
-    constexpr float E_ADD_RATIO_AD[5]     = { 0.25f, 0.30f, 0.35f, 0.40f, 0.45f };
-    constexpr float E_ADD_RATIO_AP        = 0.20f;
+    // E damage tables (rank 0..4) - matches VENPlus / Riot client values.
+    // Both first-spear and per-stack AD ratios scale on BONUS AD.
+    constexpr float E_BASE_FIRST[5]       = { 5.f, 15.f, 25.f, 35.f, 45.f };
+    constexpr float E_FIRST_RATIO_AD      = 0.70f;       // x bonus AD
+    constexpr float E_FIRST_RATIO_AP      = 0.65f;
+    constexpr float E_BASE_ADDITIONAL[5]  = { 7.f, 14.f, 21.f, 28.f, 35.f };
+    constexpr float E_ADD_RATIO_AD[5]     = { 0.20f, 0.275f, 0.35f, 0.425f, 0.50f }; // x bonus AD
+    constexpr float E_ADD_RATIO_AP        = 0.50f;
+    constexpr float E_EPIC_MULT           = 0.50f;       // applied pre-mitigation
+    constexpr float E_STACK_DURATION      = 4.0f;
+    constexpr float E_MANA_REFUND[5]      = { 10.f, 15.f, 20.f, 25.f, 30.f };
 
     // ============================================================================
     // MENU VARIABLES
@@ -78,6 +82,7 @@ namespace kalista
         inline bool auto_e_before_expire = true;
         inline int  e_expire_min_stacks  = 3;     // 1..10
         inline int  damage_draw_mode     = 0;     // 0 = Damage, 1 = Percent, 2 = Off
+        inline bool draw_full_combo      = true;  // overlay shows E + Q (if inflight) + 3 AAs
 
         // --- Auto Save R (Fate's Call) ---
         inline bool auto_save_r        = true;

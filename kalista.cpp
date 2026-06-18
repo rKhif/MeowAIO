@@ -23,6 +23,11 @@ static float          s_last_attack_time = -30.f;
 // Direction of the most recent auto-attack hop (xz-plane), un-normalized.
 static math::vector3  s_last_hop_dir{ 0.f, 0.f, 0.f };
 
+// "Our Q is currently flying toward this hero" — used to anticipate the extra
+// spear it will plant when computing E damage / kill checks.
+static uint32_t       s_q_inflight_id    = 0;
+static float          s_q_inflight_until = 0.f;
+
 // ============================================================================
 // HELPERS
 // ============================================================================
@@ -94,38 +99,95 @@ static int get_rend_stacks( game_object* target )
 {
     if ( !target ) return 0;
     auto* buff = target->get_buff_by_hash( spell_data::buff_rend_stacks );
-    if ( !buff ) return 0;
-    return ( std::max )( static_cast< int >( buff->get_stacks() ), buff->get_count() );
+    if ( !buff || !buff->is_active() ) return 0;
+    int s = ( std::max )( static_cast< int >( buff->get_stacks() ), buff->get_count() );
+    return s > 0 ? s : 0;
 }
 
+// True while our last Q is still traveling toward `target`. We count one extra
+// spear in the kill check during that window so we can fire E one stack earlier
+// without waiting to see the Q land.
+static int q_inflight_extra_stacks( game_object* target )
+{
+    if ( !target || s_q_inflight_id == 0 || !g_sdk->clock_facade ) return 0;
+    if ( target->get_network_id() != s_q_inflight_id ) return 0;
+    return g_sdk->clock_facade->get_game_time() < s_q_inflight_until ? 1 : 0;
+}
+
+static void mark_q_inflight( game_object* target )
+{
+    if ( !target || !target->is_hero() || !g_sdk->clock_facade ) return;
+    auto* p = g_sdk->object_manager->get_local_player();
+    if ( !p ) return;
+
+    const float dist   = p->get_position().distance( target->get_position() );
+    const float travel = spell_data::q_delay
+                       + ( spell_data::q_speed > 1.f ? dist / spell_data::q_speed : 0.f );
+    s_q_inflight_id    = target->get_network_id();
+    s_q_inflight_until = g_sdk->clock_facade->get_game_time() + travel + 0.25f;
+}
+
+// `additional_stacks` is a caller-supplied delta on top of what's already on the
+// target (e.g. +1 if a Q is in flight, +N for a "what-if" damage preview).
 static float get_e_damage( game_object* target, int additional_stacks = 0 )
 {
     if ( !target || !sdk::damage ) return 0.f;
     auto* p = g_sdk->object_manager->get_local_player();
     if ( !p ) return 0.f;
 
-    int r        = e_rank_idx();
-    float bad    = ( std::max )( 0.f, p->get_attack_damage() - p->get_base_attack_damage() );
-    float ap     = p->get_ability_power();
+    const int   r   = e_rank_idx();
+    const float bad = ( std::max )( 0.f, p->get_attack_damage() - p->get_base_attack_damage() );
+    const float ap  = p->get_ability_power();
 
-    auto* buff   = target->get_buff_by_hash( spell_data::buff_rend_stacks );
-    if ( !buff ) return 0.f;
+    const int cur   = get_rend_stacks( target );
+    const int total = cur + additional_stacks;
+    if ( total <= 0 ) return 0.f;
 
-    int  cur     = ( std::max )( static_cast< int >( buff->get_stacks() ), buff->get_count() );
-    int  stacks  = cur + additional_stacks - 1;   // bonus stacks past the first spear
-
-    float dmg = E_BASE_FIRST[ r ]
-              + E_FIRST_RATIO_AD * p->get_attack_damage()
+    float raw = E_BASE_FIRST[ r ]
+              + E_FIRST_RATIO_AD * bad        // BONUS AD
               + E_FIRST_RATIO_AP * ap;
 
-    if ( stacks > 0 )
+    const int extra = total - 1;
+    if ( extra > 0 )
     {
-        dmg += static_cast< float >( stacks ) *
+        raw += static_cast< float >( extra ) *
                ( E_BASE_ADDITIONAL[ r ] + E_ADD_RATIO_AD[ r ] * bad + E_ADD_RATIO_AP * ap );
     }
 
-    float mit = sdk::damage->calc_damage( dmg_sdk::damage_type::physical, p, target, dmg );
-    return target->is_epic_monster() ? mit * 0.5f : mit;
+    if ( target->is_epic_monster() ) raw *= E_EPIC_MULT;
+    return sdk::damage->calc_damage( dmg_sdk::damage_type::physical, p, target, raw );
+}
+
+// Effective mana cost of E once we account for the per-stack refund Kalista
+// gets back when the cast actually kills something.
+static float get_e_effective_cost( int kills_in_blast = 1 )
+{
+    auto* p = g_sdk->object_manager->get_local_player();
+    if ( !p ) return 0.f;
+    const float raw     = p->get_spell_mana_cost( SLOT_E );
+    const float refund  = E_MANA_REFUND[ e_rank_idx() ]
+                        * static_cast< float >( ( std::max )( 0, kills_in_blast ) );
+    return ( std::max )( 0.f, raw - refund );
+}
+
+// Approximate full-combo damage preview: E (with inflight Q stack accounted
+// for) + a few AAs. Used by the HP-bar overlay.
+static float get_combo_damage( game_object* target )
+{
+    if ( !target || !sdk::damage ) return 0.f;
+    auto* p = g_sdk->object_manager->get_local_player();
+    if ( !p ) return 0.f;
+
+    const bool q_ready = is_spell_ready( SLOT_Q );
+    const int  q_extra = ( q_ready ? 1 : 0 ) + q_inflight_extra_stacks( target );
+
+    float dmg = is_spell_learned( SLOT_E ) ? get_e_damage( target, q_extra ) : 0.f;
+
+    if ( q_ready )
+        dmg += sdk::damage->get_spell_damage( p, target, SLOT_Q );
+
+    dmg += sdk::damage->get_aa_damage( p, target ) * 3.f;
+    return dmg;
 }
 
 static bool can_attack_now()
@@ -180,10 +242,12 @@ static bool killable_e()
     for ( auto* h : g_sdk->object_manager->get_heroes() )
     {
         if ( !is_valid_enemy( h, spell_data::e_range ) ) continue;
-        int stacks = get_rend_stacks( h );
+
+        const int extra  = q_inflight_extra_stacks( h );
+        const int stacks = get_rend_stacks( h ) + extra;
         if ( stacks <= 0 ) continue;
 
-        float dmg = get_e_damage( h );
+        float dmg = get_e_damage( h, extra );
         float ehp = h->get_hp() + h->get_all_shield();
         if ( dmg >= ehp )
             return sdk::common->cast_spell( SLOT_E );
@@ -275,8 +339,10 @@ static bool slow_e()
     auto* p = g_sdk->object_manager->get_local_player();
     if ( !p ) return false;
 
-    // Only consider when we have plenty of mana for E twice over.
-    if ( p->get_par() < p->get_spell_mana_cost( SLOT_E ) * 2.f ) return false;
+    // Need enough for this E plus a follow-up E. The follow-up cost is reduced
+    // by the per-stack mana refund this slow-E is expected to grant.
+    const float e_cost = p->get_spell_mana_cost( SLOT_E );
+    if ( p->get_par() < e_cost + get_e_effective_cost( 1 ) ) return false;
 
     bool any_stacked_enemy = false;
     for ( auto* h : g_sdk->object_manager->get_heroes() )
@@ -342,8 +408,17 @@ static bool try_q_combo( game_object* target )
     catch ( ... ) { pred.is_valid = false; }
     if ( !pred.is_valid || pred.hitchance < pred_sdk::hitchance::medium ) return false;
 
+    auto fire = [&]() -> bool {
+        if ( sdk::common->cast_spell( SLOT_Q, pred.cast_position ) )
+        {
+            mark_q_inflight( target );
+            return true;
+        }
+        return false;
+    };
+
     if ( menu::q_mode_always )
-        return sdk::common->cast_spell( SLOT_Q, pred.cast_position );
+        return fire();
 
     const float aa_r        = p->get_attack_range() + p->get_bounding_radius()
                             + target->get_bounding_radius();
@@ -352,10 +427,10 @@ static bool try_q_combo( game_object* target )
     // After-AA mode: fire Q in the AA windup window, OR whenever the target
     // is out of AA range (we can't be "between attacks" if no AA is happening).
     if ( menu::q_mode_after_aa && ( !can_attack_now() || target_oor ) )
-        return sdk::common->cast_spell( SLOT_Q, pred.cast_position );
+        return fire();
 
     if ( menu::q_mode_oor && target_oor )
-        return sdk::common->cast_spell( SLOT_Q, pred.cast_position );
+        return fire();
 
     return false;
 }
@@ -523,9 +598,12 @@ bool __stdcall on_before_attack( orb_sdk::event_data* data )
 
     // Only swap an AA for an E when we'd actually be securing the kill.
     if ( !is_spell_ready( SLOT_E ) || !has_enough_mana( SLOT_E ) ) return true;
-    if ( get_rend_stacks( data->target ) <= 0 ) return true;
 
-    const float dmg = get_e_damage( data->target );
+    const int extra  = q_inflight_extra_stacks( data->target );
+    const int stacks = get_rend_stacks( data->target ) + extra;
+    if ( stacks <= 0 ) return true;
+
+    const float dmg = get_e_damage( data->target, extra );
     const float ehp = data->target->get_hp() + data->target->get_all_shield();
     if ( dmg < ehp ) return true;
 
@@ -560,7 +638,8 @@ bool __stdcall on_after_attack( orb_sdk::event_data* data )
     catch ( ... ) { pred.is_valid = false; }
     if ( !pred.is_valid || pred.hitchance < pred_sdk::hitchance::medium ) return true;
 
-    sdk::common->cast_spell( SLOT_Q, pred.cast_position );
+    if ( sdk::common->cast_spell( SLOT_Q, pred.cast_position ) )
+        mark_q_inflight( data->target );
     return true;
 }
 
@@ -636,9 +715,18 @@ void __fastcall on_draw()
     {
         menu::draw_cfg.draw( p, []( game_object* t ) -> float
         {
+            if ( !t ) return 0.f;
+
+            if ( menu::draw_full_combo )
+            {
+                if ( !is_spell_learned( SLOT_E ) && !is_spell_learned( SLOT_Q ) ) return 0.f;
+                return get_combo_damage( t );
+            }
+
             if ( !is_spell_learned( SLOT_E ) ) return 0.f;
-            if ( get_rend_stacks( t ) <= 0 ) return 0.f;
-            return get_e_damage( t );
+            const int extra = q_inflight_extra_stacks( t );
+            if ( get_rend_stacks( t ) + extra <= 0 ) return 0.f;
+            return get_e_damage( t, extra );
         } );
     }
 
@@ -651,10 +739,11 @@ void __fastcall on_draw()
         if ( !t || !t->is_valid() || t->is_dead() || !t->is_visible() ) return;
         if ( t->get_team_id() == p->get_team_id() ) return;
 
+        const int extra  = q_inflight_extra_stacks( t );
         const int stacks = get_rend_stacks( t );
-        if ( stacks <= 0 ) return;
+        if ( stacks + extra <= 0 ) return;
 
-        const float dmg = get_e_damage( t );
+        const float dmg = get_e_damage( t, extra );
         const float ehp = t->get_hp() + t->get_all_shield();
         const bool killable = dmg >= ehp;
 
@@ -747,6 +836,8 @@ static void setup_menu()
     e->add_combo( "dmg_draw_mode", "Damage Draw Mode",
         std::vector< std::string >{ "Damage", "Percentage", "Off" },
         menu::damage_draw_mode, []( int v ) { menu::damage_draw_mode = v; } );
+    e->add_checkbox( "draw_full_combo", "Overlay = Full Combo (Q + E + 3 AAs)", menu::draw_full_combo,
+        []( bool v ) { menu::draw_full_combo = v; } );
     e->add_separator();
     e->add_label( "Drawings" );
     e->add_checkbox( "draw_e", "Draw E Range", menu::draw_e,
@@ -849,6 +940,8 @@ void unload()
     s_menu             = nullptr;
     s_last_attack_time = -30.f;
     s_last_hop_dir     = { 0.f, 0.f, 0.f };
+    s_q_inflight_id    = 0;
+    s_q_inflight_until = 0.f;
     menu::jump_trick_active = false;
 
     if ( g_sdk ) g_sdk->log_console( "[MeowAIO] Kalista unloaded" );

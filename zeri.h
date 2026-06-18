@@ -42,7 +42,7 @@ namespace zeri
         constexpr float e_range              = 300.f;
 
         // R — Lightning Crash (self-cast AOE)
-        constexpr float r_radius             = 825.f;
+        constexpr float r_radius             = 800.f;
         constexpr float r_cast_time          = 0.25f;
 
         // Buff hashes
@@ -128,9 +128,14 @@ namespace zeri
         inline bool        semi_w_active = false;
         inline std::string semi_w_key_str;
 
+        // --- Auto-Q hero in farm hotkey (toggle) ---
+        inline bool        auto_q_farm_enabled = false;
+        inline std::string auto_q_farm_key_str;
+
         // --- Infotab entry IDs (0 = not registered) ---
-        inline uint32_t infotab_semi_w     = 0;
-        inline uint32_t infotab_wall_jump  = 0;
+        inline uint32_t infotab_semi_w      = 0;
+        inline uint32_t infotab_wall_jump   = 0;
+        inline uint32_t infotab_auto_q_farm = 0;
 
         // --- R input blocker ---
         // Master toggle: when on, the in-game R keypress is suppressed unless

@@ -78,7 +78,14 @@ namespace hwei
         constexpr float EW_QW_FOLLOWUP_WINDOW = 1.25f;
         constexpr float EW_ROOT_FOLLOWUP_DELAY = 0.75f;
         // Max time the teamfight combo stalls QE/QW while waiting for R to land.
-        constexpr float TEAMFIGHT_R_WAIT = 2.0f;
+        // Upper bound on stalling QE/QW to "wait for R to land". Long enough to
+        // cover one prediction re-evaluation + cast-engine latency, short enough
+        // that we don't withhold damage when R simply isn't going to land.
+        constexpr float TEAMFIGHT_R_WAIT = 0.8f;
+        // If R's prediction hasn't been "fireable" within this window, the wait
+        // is futile (target out of range / dashing / hitchance too low) and we
+        // fall through to QE/QW.
+        constexpr float R_PRED_FRESHNESS = 0.40f;
         static bool HWEI_DEBUG_LOGS = false;
 
         static menu_category* s_menu = nullptr;
@@ -107,6 +114,7 @@ namespace hwei
         static bool s_combo_mode_was_pressed = false;
         static std::string s_last_observed_cast_name;
         static float s_r_wait_started_at = 0.f;
+        static float s_r_last_pred_acceptable_at = 0.f;
         static subject s_cached_subject = subject::none;
         static bool s_subject_cache_authoritative = false;
 
@@ -774,6 +782,22 @@ namespace hwei
                         SUBJECT_RETRY_LOCKOUT);
                 }
                 apply_subject_lockout(s_pending.info.mood);
+
+                // Wash Brush auto-recovery: if the palette is still open after a
+                // timeout, the next cast will fight against a stale subject and
+                // likely time out again. Pressing R while in a mood closes the
+                // palette for free (no CD, no mana). Only do this when the live
+                // game state confirms a mood is open, so we never accidentally
+                // fire the R ultimate.
+                if (auto* player = get_player())
+                {
+                    if (read_live_game_subject() != subject::none)
+                    {
+                        if (HWEI_DEBUG_LOGS && g_sdk)
+                            g_sdk->log_console("[MeowAIO] wash-brush recovery (palette stuck open)");
+                        player->cast_spell(SLOT_R);
+                    }
+                }
             }
             if (s_pending.active && (apply_lockout || (reason && std::strcmp(reason, "confirmed-followup") == 0)))
                 cache_selected_subject(subject::none, reason ? reason : "reset");
@@ -916,8 +940,11 @@ namespace hwei
                     float hp = tgt->get_hp();
                     if (sdk::health_prediction)
                     {
+                        // Defensive gate: a 0 (or negative) reply often means "no
+                        // prediction available", not "unit will be dead". Only
+                        // trust positive predictions within the max-HP range.
                         const float pred_hp = sdk::health_prediction->get_predicted_health(tgt, t + hit_time);
-                        if (pred_hp >= 0.f)
+                        if (pred_hp > 0.f && pred_hp <= tgt->get_max_hp())
                             hp = pred_hp;
                     }
                     if (hp <= 0.f || hp > get_qq_damage(tgt))
@@ -1225,6 +1252,21 @@ namespace hwei
             if (!player || !g_sdk || !g_sdk->object_manager)
                 return false;
 
+            // Defer to auto-WE when we're starving for mana so WW doesn't put
+            // W on cooldown for 16-18s and lock us out of the only sustain path.
+            // Emergency self-heal (HP < 25%) still wins because dying beats mana.
+            const float self_max_for_emergency = player->get_max_hp();
+            const float self_pct = self_max_for_emergency > 0.f
+                ? (player->get_hp() / self_max_for_emergency) * 100.f
+                : 100.f;
+            const bool emergency_self = self_pct <= 25.f;
+            if (menu::auto_we_mana
+                && !emergency_self
+                && mana_percent() <= static_cast<float>(menu::auto_we_mana_pct) + 5.f)
+            {
+                return false;
+            }
+
             bool should_heal = false;
 
             if (menu::use_ww_self)
@@ -1475,6 +1517,11 @@ namespace hwei
                 return false;
             }
 
+            // Prediction is fireable as far as hitchance/range are concerned;
+            // even if validate_r_prediction rejects (backwards/edge cases) we
+            // still consider the wait worth extending for one more re-evaluation.
+            s_r_last_pred_acceptable_at = now();
+
             if (!validate_r_prediction(target, prediction, cast_dist, spell.range))
                 return false;
 
@@ -1513,6 +1560,8 @@ namespace hwei
             if (!prediction.is_valid || prediction.hitchance < hitchance || cast_dist > spell.range)
                 return false;
 
+            s_r_last_pred_acceptable_at = now();
+
             if (!validate_r_prediction(target, prediction, cast_dist, spell.range))
                 return false;
 
@@ -1549,6 +1598,16 @@ namespace hwei
             if (wait_max <= 0.f)
                 return false;
             const float t = now();
+            // If R prediction hasn't been acceptable in a while, the wait is
+            // futile (target out of range / dashing / hitchance too low).
+            // Caller (try_cast_r_*) ran this same tick, so a stale timestamp
+            // really does mean "R can't land right now".
+            if (s_r_last_pred_acceptable_at <= 0.f
+                || t - s_r_last_pred_acceptable_at > R_PRED_FRESHNESS)
+            {
+                s_r_wait_started_at = 0.f;
+                return false;
+            }
             if (s_r_wait_started_at <= 0.f)
                 s_r_wait_started_at = t;
             if (t - s_r_wait_started_at >= wait_max)
@@ -2022,12 +2081,18 @@ namespace hwei
                     const float max_hp = hero->get_max_hp();
                     const float missing_pct = max_hp > 0.f
                         ? (max_hp - hero->get_hp()) / max_hp * 100.f : 0.f;
-                    // The bolt must land while the CC still holds, or the
-                    // missing-HP bonus (and the guaranteed hit) is gone.
-                    const float confirm = get_game_subject() == subject::disaster
-                        ? 0.05f : SUBJECT_CONFIRM_DELAY;
+                    // Two regimes:
+                    //  - disaster already active: bolt just needs the CC to
+                    //    outlast a partial qw_delay (prediction returns
+                    //    `undodgeable` and the bolt's hitbox is forgiving).
+                    //  - palette swap needed: stricter so we don't waste mood
+                    //    on a CC that ends mid-swap.
+                    const bool subject_ready = get_game_subject() == subject::disaster;
+                    const float gate = subject_ready
+                        ? 0.05f + spell_data::qw_delay * 0.6f
+                        : SUBJECT_CONFIRM_DELAY + spell_data::qw_delay;
                     if (missing_pct >= static_cast<float>(menu::auto_qw_cc_min_missing)
-                        && cc_left > confirm + spell_data::qw_delay
+                        && cc_left > gate
                         && cast_or_busy(try_cast_qw_on_target(hero, pred_sdk::hitchance::any)))
                         return true;
                 }
@@ -2239,9 +2304,6 @@ namespace hwei
 
             if (menu::harass_use_qq && cast_or_busy(try_cast_linear(ABILITY_QQ, s_pred_qq, menu::combo_qq_hitchance)))
                 return;
-
-            if (menu::harass_use_we && cast_or_busy(try_cast_we()))
-                return;
         }
 
         void flee()
@@ -2353,10 +2415,13 @@ namespace hwei
 
         // Best QE line through `units` from the player's position: anchor the line
         // on each unit and count how many others it clips. Returns hit count.
+        // Optionally outputs the anchor object so callers can drive repredict.
         int best_qe_line(const std::vector<game_object*>& units,
-            const math::vector3& ppos, math::vector3& out_pos)
+            const math::vector3& ppos, math::vector3& out_pos,
+            game_object** out_anchor = nullptr)
         {
             int best_hits = 0;
+            if (out_anchor) *out_anchor = nullptr;
             for (auto* anchor : units)
             {
                 const auto apos = anchor->get_position();
@@ -2371,14 +2436,43 @@ namespace hwei
                 {
                     best_hits = hits;
                     out_pos = apos;
+                    if (out_anchor) *out_anchor = anchor;
                 }
             }
             return best_hits;
         }
 
+        // Heuristic match for Summoner's Rift epic camps. Auto-clear should
+        // never burn Q on these — they're objectives, not farm.
+        bool is_epic_monster(game_object* m)
+        {
+            if (!m) return false;
+            const auto& name = m->get_name();
+            static const char* const epic_prefixes[] = {
+                "SRU_Dragon",
+                "SRU_Baron",
+                "SRU_RiftHerald",
+                "SRU_Atakhan",
+                "Sru_Dragon",   // some name variants observed in the wild
+                "Sru_Baron",
+                "Sru_RiftHerald",
+                "Sru_Atakhan",
+            };
+            for (const char* prefix : epic_prefixes)
+            {
+                const size_t plen = std::strlen(prefix);
+                if (name.size() >= plen && name.compare(0, plen, prefix) == 0)
+                    return true;
+            }
+            return false;
+        }
+
         bool lane_qe_clear()
         {
             if (!menu::lane_use_qe)
+                return false;
+            // Skip the per-frame anchor scan when QE can't fire anyway.
+            if (!is_spell_ready(SLOT_Q) || !has_mana_for(SLOT_Q))
                 return false;
 
             auto* player = get_player();
@@ -2435,6 +2529,9 @@ namespace hwei
                     continue;
                 if (ppos.distance(m->get_position()) > s_pred_qe.range)
                     continue;
+                // Epic camps (Drake/Baron/Herald/Atakhan) are objectives, not farm.
+                if (is_epic_monster(m))
+                    continue;
                 monsters.push_back(m);
             }
 
@@ -2445,10 +2542,19 @@ namespace hwei
             if (menu::jungle_use_qe && monsters.size() >= static_cast<size_t>(menu::jungle_qe_min_monsters))
             {
                 math::vector3 best_pos{};
-                const int best_hits = best_qe_line(monsters, ppos, best_pos);
+                game_object* anchor = nullptr;
+                const int best_hits = best_qe_line(monsters, ppos, best_pos, &anchor);
                 if (best_hits >= menu::jungle_qe_min_monsters
-                    && start_cast(ABILITY_QE, best_pos, nullptr, s_pred_qe.range))
+                    && start_cast(ABILITY_QE, best_pos, anchor, s_pred_qe.range))
                 {
+                    // Refresh aim on the anchor at fire-time so a drifting camp
+                    // (Krug splits, Raptors post-AoE) still lines up.
+                    if (anchor && !s_pending.repredict)
+                    {
+                        s_pending.repredict = true;
+                        s_pending.repredict_spell = s_pred_qe;
+                        s_pending.repredict_hitchance = 0; // any valid prediction
+                    }
                     tick_pending();
                     return true;
                 }
@@ -2810,8 +2916,6 @@ namespace hwei
                 });
             w_menu->add_checkbox("flee_wq", "Use in Flee WQ", menu::flee_use_wq,
                 [](bool v) { menu::flee_use_wq = v; });
-            w_menu->add_checkbox("harass_we", "Use in Harass WE", menu::harass_use_we,
-                [](bool v) { menu::harass_use_we = v; });
             w_menu->add_separator();
             w_menu->add_checkbox("use_ww", "Use WW", menu::use_ww,
                 [](bool v) { menu::use_ww = v; });
@@ -3046,6 +3150,7 @@ namespace hwei
         s_cached_subject = subject::none;
         s_subject_cache_authoritative = false;
         s_r_wait_started_at = 0.f;
+        s_r_last_pred_acceptable_at = 0.f;
         clear_all_mode_binds();
         clear_pending();
 

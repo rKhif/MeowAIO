@@ -116,7 +116,6 @@ namespace hwei
         inline bool harass_use_qw = true;
         inline bool harass_use_qe = true;
         inline bool harass_use_eq = true;
-        inline bool harass_use_we = true;
         inline int  harass_mana_pct = 55;
 
         // Flee

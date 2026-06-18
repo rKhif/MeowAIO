@@ -156,6 +156,27 @@
     <ClInclude Include="ziggs.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="kayle.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="zyra.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="zy\pch.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="zy\zyra.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="zy\framework\champion_base.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="zy\db\champions\zyra.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="zy\champions\zyra\zyra.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\main.cpp">
@@ -240,6 +261,15 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="ziggs.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="kayle.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="zyra.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="zy\zyra.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

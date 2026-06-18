@@ -1028,8 +1028,10 @@ namespace zeri
                 // Defensive backoff vs ready engage spell in AA range
                 if (enemy_has_ready_close_spell(target)
                     && distance_to(target) <= c_aa_range - 50.f) return false;
-                if (passive_charged) return true;
-                return q_volley_will_kill(target, false);
+                // Combo = full DPS on the target. Always AA — basic shots
+                // build the next passive charge, empowered shots fire the
+                // moment they're up, executes naturally fall through.
+                return true;
             }
             // harass / lasthit / out-of-mode: only AA if kill secured
             return q_volley_will_kill(target, false);
@@ -1081,8 +1083,16 @@ namespace zeri
         const bool harass_mode  = sdk::orbwalker->harass();
         const bool any_mode     = combo_mode || clear_mode || lasthit_mode || harass_mode;
 
+        // Hero auto-Q in farm modes is gated by the "Auto Q Enemies in Farm"
+        // toggle so the orbwalker won't auto-Q a hero who walks into AA
+        // range during clear/lasthit when the user has the toggle off.
+        const bool farm_hero = (clear_mode || lasthit_mode)
+            && target->is_hero();
+        const bool farm_q_blocked = farm_hero && !menu::auto_q_farm_enabled;
+
         const bool q_allowed = is_spell_learned(SLOT_Q) && is_spell_ready(SLOT_Q)
-            && (!combo_mode || menu::combo_use_q);
+            && (!combo_mode || menu::combo_use_q)
+            && !farm_q_blocked;
 
         // Try Q first if ready. try_q has a direct-cast branch for stationary
         // objects (structures, wards, traps, plants) so prediction won't spin
@@ -1130,7 +1140,10 @@ namespace zeri
 
         const float dist     = distance_to(target);
         const float q_range  = get_q_range();
-        const float aa_range = c_aa_range;
+        // Base AA range (c_aa_range reflects passive-shot range when charged
+        // and would shrink the AA->Q gap below Q range, blocking Q at heroes
+        // in the gap).
+        const float aa_range = spell_data::passive_aa_range;
 
         // R inside its radius
         if (menu::combo_use_r && !overcharged && dist <= spell_data::r_radius + 125.f) {
@@ -1170,7 +1183,9 @@ namespace zeri
         if (now - last_spell_cast_time < MIN_SPELL_DELAY) return;
 
         const float q_range     = get_q_range();
-        const float aa_range    = c_aa_range;
+        // Base AA range (not c_aa_range, which jumps to ~825 with passive
+        // charge and would close the AA->Q gap below Q range).
+        const float aa_range    = spell_data::passive_aa_range;
         const float w_max_range = spell_data::w_range_pulse + 100.f;
         const bool  would_cancel = sdk::orbwalker && sdk::orbwalker->would_cancel_attack();
         // Q is free — let it fire regardless of mana threshold. W/E/R obey it.
@@ -1353,22 +1368,66 @@ namespace zeri
     // unit-collision rejection can't block farming through a stacked wave.
     // For farm we *want* the projectile to hit whatever's first — that's
     // still a minion getting damaged.
+    // True if `target` sits within Q's hit width along the line from `from`
+    // to `cast`, and is within Q's max travel from `from`. Used to score
+    // farm-mode Q casts that also pierce through enemy heroes behind a
+    // minion — zerisource's `select_best_q_estimate` does the same trick
+    // (see champions_killable / champions_touched scoring).
+    static bool q_line_passes_through(const math::vector3& from,
+                                      const math::vector3& cast,
+                                      game_object* target,
+                                      float q_range)
+    {
+        if (!target) return false;
+        const auto tp = target->get_position();
+        const float dx = cast.x - from.x, dz = cast.z - from.z;
+        const float seg2 = dx*dx + dz*dz;
+        if (seg2 <= 1.f) return false;
+
+        // Project target onto the cast ray (clamped to [0, q_range]).
+        const float tx = tp.x - from.x, tz = tp.z - from.z;
+        float t = (tx*dx + tz*dz) / seg2;             // along the unit segment
+        const float seg_len = std::sqrt(seg2);
+        const float along   = t * seg_len;            // distance along ray
+        if (along < 0.f || along > q_range) return false;
+
+        // Perpendicular distance from target to the ray
+        const float px = from.x + dx * t;
+        const float pz = from.z + dz * t;
+        const float perp_dx = tp.x - px, perp_dz = tp.z - pz;
+        const float perp2   = perp_dx*perp_dx + perp_dz*perp_dz;
+        const float radius  = spell_data::q_radius + target->get_bounding_radius();
+        return perp2 <= radius * radius;
+    }
+
     static void try_q_minion_farm(bool lasthit_only)
     {
         if (!is_spell_ready(SLOT_Q)) return;
         if (!sdk::damage || !sdk::orbwalker) return;
-        if (sdk::orbwalker->would_cancel_attack()) return;
 
         auto p = g_sdk->object_manager->get_local_player();
         if (!p) return;
 
-        const float q_range  = get_q_range();
-        const float aa_range = c_aa_range;
+        const auto from    = p->get_position();
+        const float q_range = get_q_range();
+        // Use Zeri's BASE AA range (500u). c_aa_range reflects the passive
+        // shot range (~825u when charged) which is wider than Q range and
+        // would zero out the AA->Q gap, blocking Q at distant minions.
+        const float aa_range = spell_data::passive_aa_range;
 
-        game_object* lethal      = nullptr;
-        float        lethal_hp   = FLT_MAX;
-        game_object* nearest     = nullptr;
-        float        nearest_d   = FLT_MAX;
+        // Snapshot enemy heroes in Q range once (used for pierce scoring).
+        struct hero_info { game_object* h; float hp; };
+        std::vector<hero_info> heroes;
+        heroes.reserve(5);
+        for (auto* h : g_sdk->object_manager->get_heroes()) {
+            if (!h || !h->is_valid() || h->is_dead() || !h->is_targetable()) continue;
+            if (!h->is_visible() || h->get_team_id() == p->get_team_id()) continue;
+            if (distance_to(h) > q_range + 50.f) continue;
+            heroes.push_back({ h, h->get_hp() + std::max(h->get_all_shield(), 0.f) });
+        }
+
+        game_object* best        = nullptr;
+        float        best_score  = -FLT_MAX;
 
         for (auto* m : g_sdk->object_manager->get_minions()) {
             if (!m || !m->is_valid() || m->is_dead() || !m->is_targetable()) continue;
@@ -1376,19 +1435,70 @@ namespace zeri
             if (!m->is_lane_minion()) continue;
             const float d = distance_to(m);
             if (d <= aa_range || d > q_range) continue;
+
             const float mhp = m->get_hp();
             const float dmg = sdk::damage->get_spell_damage(p, m, SLOT_Q);
-            if (dmg >= mhp && mhp < lethal_hp) { lethal_hp = mhp; lethal = m; }
-            if (d < nearest_d) { nearest_d = d; nearest = m; }
+            const bool  killable = dmg >= mhp;
+
+            // Skip non-lethal candidates if caller only wants lasthits.
+            if (lasthit_only && !killable) continue;
+
+            // ---- Volley scoring (zerisource select_best_q_estimate) ----
+            float score = 0.f;
+            if (killable) score += 1300.f;
+            else          score += 200.f - std::min(mhp, 200.f); // prefer low-HP minion when no lethal
+
+            // Pierce through heroes behind the minion: +220 per champion in
+            // line, +500 per champion the volley would also kill.
+            const auto cast_pos = m->get_position();
+            for (const auto& hi : heroes) {
+                if (!q_line_passes_through(from, cast_pos, hi.h, q_range)) continue;
+                score += 220.f;
+                const float qdmg = sdk::damage->get_spell_damage(p, hi.h, SLOT_Q);
+                if (qdmg >= hi.hp) score += 500.f;
+            }
+
+            if (m->is_dashing()) score += 400.f;
+
+            // Mild closeness bonus to break ties (prefer the nearer minion).
+            score += (q_range - d) * 0.1f;
+
+            if (score > best_score) { best_score = score; best = m; }
         }
 
-        game_object* pick = lethal ? lethal
-                                   : (lasthit_only ? nullptr : nearest);
-        if (pick) cast_q_at_pos(pick->get_position());
+        if (best) cast_q_at_pos(best->get_position());
     }
 
     static void try_q_lasthit_farm() { try_q_minion_farm(true);  }
     static void try_q_clear_farm()   { try_q_minion_farm(false); }
+
+    // Q at an enemy hero while in farm mode (clear / fast-clear / lasthit /
+    // harass key not held). Without this Q only fires at heroes via
+    // on_before_attack, which means it only ever lands when the hero is
+    // already in AA range — never on heroes 500-750u away. Picks the
+    // lowest-effective-HP hero in Q range and fires through the regular
+    // try_q (so prediction + collision behave the same as combo/harass).
+    static bool try_q_hero_in_farm()
+    {
+        if (!menu::auto_q_farm_enabled) return false;
+        if (!is_spell_ready(SLOT_Q)) return false;
+        auto p = g_sdk->object_manager->get_local_player();
+        if (!p) return false;
+
+        const float q_range = get_q_range();
+
+        game_object* best     = nullptr;
+        float        best_ehp = FLT_MAX;
+        for (auto* h : g_sdk->object_manager->get_heroes()) {
+            if (!h || !h->is_valid() || h->is_dead() || !h->is_targetable()) continue;
+            if (!h->is_visible() || h->get_team_id() == p->get_team_id()) continue;
+            if (distance_to(h) > q_range) continue;
+            const float ehp = h->get_hp() + std::max(h->get_all_shield(), 0.f);
+            if (ehp < best_ehp) { best_ehp = ehp; best = h; }
+        }
+        if (!best) return false;
+        return try_q(best, pred_sdk::hitchance::low) == q_result::casted;
+    }
 
     void clear()
     {
@@ -1397,6 +1507,7 @@ namespace zeri
         // Q is free — always run it regardless of mana threshold
         if (try_q_structure()) return;
         if (try_q_empowered_clear()) return;
+        if (try_q_hero_in_farm()) return;
         if (try_q_jungle()) return;
         if (menu::lane_use_q_clear) try_q_clear_farm();
         if (try_q_wards())     return;
@@ -1440,6 +1551,7 @@ namespace zeri
         // Q is free — always run it regardless of mana threshold
         if (try_q_structure()) return;
         if (try_q_empowered_clear()) return;
+        if (try_q_hero_in_farm()) return;
         if (try_q_jungle()) return;
         if (menu::lane_use_q_clear) try_q_clear_farm();
         if (try_q_wards())     return;
@@ -1491,6 +1603,10 @@ namespace zeri
     void lasthit()
     {
         if (!sdk::orbwalker || !sdk::orbwalker->is_spell_farm_enabled()) return;
+
+        // Q at any enemy hero in Q range first (otherwise Q only fires on
+        // heroes through on_before_attack — i.e. only at AA range).
+        if (try_q_hero_in_farm()) return;
 
         // Q last-hit beyond AA range
         if (menu::lane_use_q_lh) try_q_lasthit_farm();
@@ -1732,6 +1848,10 @@ namespace zeri
                 g_sdk->renderer->add_text(buf, 13.f,
                     { screen.x, screen.y + 95.f }, 1, 0xFF50FF78u);
             }
+            if (menu::auto_q_farm_enabled) {
+                g_sdk->renderer->add_text("AUTO Q", 13.f,
+                    { screen.x, screen.y + 115.f }, 1, 0xFF00FF00u);
+            }
         }
 
         if (menu::draw_r_dmg_bar && sdk::damage && g_sdk->renderer && is_spell_learned(SLOT_R)) {
@@ -1822,6 +1942,14 @@ namespace zeri
             [](bool v) { menu::lane_use_q_clear = v; });
         q_menu->add_checkbox("lh", "Use in Lasthit", menu::lane_use_q_lh,
             [](bool v) { menu::lane_use_q_lh = v; });
+        q_menu->add_hotkey("auto_q_farm", "Auto Q", 'T', false, true,
+            [](std::string* hk, bool state) {
+                menu::auto_q_farm_enabled = state;
+                if (hk) menu::auto_q_farm_key_str = *hk;
+            });
+        // Seed the key string so the infotab renders before the user toggles
+        // it once (toggle hotkeys don't fire the callback at registration).
+        if (menu::auto_q_farm_key_str.empty()) menu::auto_q_farm_key_str = "T";
         q_menu->add_checkbox("minion_col", "Collision", menu::q_minion_collision,
             [](bool v) { menu::q_minion_collision = v; });
         q_menu->add_slider_int("col_remove_lvl", "Remove collision at Level", 0, 18, 1,
@@ -1959,6 +2087,14 @@ namespace zeri
                     const uint32_t clr = menu::jump_key_active ? 0xFF00FF00u : 0xFFFF4040u;
                     return { menu::jump_key_active ? "ACTIVE" : "OFF", clr };
                 });
+
+            menu::infotab_auto_q_farm = sdk::infotab->add_hotkey_text(
+                &menu::auto_q_farm_key_str,
+                { "Auto Q", 0xFFFFFFFFu },
+                []() -> infotab_sdk::text_entry {
+                    const uint32_t clr = menu::auto_q_farm_enabled ? 0xFF00FF00u : 0xFFFF4040u;
+                    return { menu::auto_q_farm_enabled ? "ON" : "OFF", clr };
+                });
         }
 
         g_sdk->log_console("[!] [MeowAIO] Zeri module loaded");
@@ -1988,6 +2124,10 @@ namespace zeri
             if (menu::infotab_wall_jump != 0) {
                 sdk::infotab->remove_text(menu::infotab_wall_jump);
                 menu::infotab_wall_jump = 0;
+            }
+            if (menu::infotab_auto_q_farm != 0) {
+                sdk::infotab->remove_text(menu::infotab_auto_q_farm);
+                menu::infotab_auto_q_farm = 0;
             }
         }
 

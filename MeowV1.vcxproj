@@ -181,6 +181,13 @@
     <ClInclude Include="jinx.h" />
     <ClInclude Include="soraka.h" />
     <ClInclude Include="thresh.h" />
+    <ClInclude Include="kayle.h" />
+    <ClInclude Include="zyra.h" />
+    <ClInclude Include="zy\pch.hpp" />
+    <ClInclude Include="zy\zyra.hpp" />
+    <ClInclude Include="zy\framework\champion_base.hpp" />
+    <ClInclude Include="zy\db\champions\zyra.hpp" />
+    <ClInclude Include="zy\champions\zyra\zyra.hpp" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\main.cpp" />
@@ -213,6 +220,11 @@
     <ClCompile Include="soraka.cpp" />
     <ClCompile Include="thresh.cpp" />
     <ClCompile Include="ziggs.cpp" />
+    <ClCompile Include="kayle.cpp" />
+    <ClCompile Include="zyra.cpp" />
+    <ClCompile Include="zy\zyra.cpp">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </ClCompile>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
