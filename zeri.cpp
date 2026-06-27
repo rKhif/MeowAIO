@@ -680,6 +680,22 @@ namespace zeri
         return q_result::casted;
     }
 
+    // True when the straight line from `from` to `cast` crosses a terrain
+    // wall (i.e. the path leaves the navmesh and re-enters it). Used by
+    // the wall-pierce W path AND by the `w_only_walls` toggle.
+    static bool w_path_pierces_wall(const math::vector3& from,
+                                    const math::vector3& cast)
+    {
+        if (!g_sdk || !g_sdk->nav_mesh) return false;
+        const float dx = cast.x - from.x, dz = cast.z - from.z;
+        const float seg_len = std::sqrt(dx * dx + dz * dz);
+        if (seg_len < 1.f) return false;
+        const math::vector3 dir = { dx / seg_len, 0.f, dz / seg_len };
+        float os = 0.f, oe = 0.f;
+        return find_open_wall_window(from, dir, seg_len, os, oe)
+            && os > 5.f && os < seg_len;
+    }
+
     static bool try_w(game_object* target, int hitchance)
     {
         if (!target || !sdk::common || !sdk::prediction) return false;
@@ -690,22 +706,29 @@ namespace zeri
 
         if (distance_to(target) > spell_data::w_range_pulse + 100.f) return false;
 
-        auto pred = predict_w(target, hitchance);
-        if (pred.is_valid && pred.hitchance >= hitchance) {
-            if (sdk::common->cast_spell(SLOT_W, pred.cast_position)) {
-                last_w_cast_time = now;
-                last_spell_cast_time = now;
-                return true;
+        auto p = g_sdk->object_manager->get_local_player();
+        if (!p) return false;
+
+        // Standard prediction first (forbids yasuo / braum walls). When
+        // `w_only_walls` is on we skip this path entirely — that mode
+        // ONLY wants casts that pierce a terrain wall, never normal
+        // line-of-sight shots.
+        if (!menu::w_only_walls) {
+            auto pred = predict_w(target, hitchance);
+            if (pred.is_valid && pred.hitchance >= hitchance) {
+                if (sdk::common->cast_spell(SLOT_W, pred.cast_position)) {
+                    last_w_cast_time = now;
+                    last_spell_cast_time = now;
+                    return true;
+                }
+                return false;
             }
-            return false;
         }
 
-        // Cross-wall fallback: prediction was rejected (likely yasuo_wall /
-        // braum_wall flagged a blocker, or the path looks blocked). Re-run
-        // without forbidden collisions and check if the W can thread through
-        // an open wall-window between us and the target.
-        auto p = g_sdk->object_manager->get_local_player();
-        if (!p || !g_sdk->nav_mesh) return false;
+        // Cross-wall path. Re-run prediction without forbidden collisions
+        // (or for the first time when w_only_walls is on) and require an
+        // open wall-window between us and the cast position.
+        if (!g_sdk->nav_mesh) return false;
 
         pred_sdk::spell_data raw{};
         raw.spell_type         = pred_sdk::spell_type::linear;
@@ -722,20 +745,10 @@ namespace zeri
         catch (...) { return false; }
         if (!raw_pred.is_valid || raw_pred.hitchance < hitchance) return false;
 
-        const auto from = p->get_position();
-        const auto cast = raw_pred.cast_position;
-        const float dx = cast.x - from.x, dz = cast.z - from.z;
-        const float seg_len = std::sqrt(dx * dx + dz * dz);
-        if (seg_len < 1.f) return false;
-        const math::vector3 dir = { dx / seg_len, 0.f, dz / seg_len };
+        if (!w_path_pierces_wall(p->get_position(), raw_pred.cast_position))
+            return false;
 
-        float open_start = 0.f, open_end = 0.f;
-        const bool window =
-            find_open_wall_window(from, dir, seg_len, open_start, open_end) &&
-            open_start > 5.f && open_start < seg_len;
-        if (!window) return false;
-
-        if (sdk::common->cast_spell(SLOT_W, cast)) {
+        if (sdk::common->cast_spell(SLOT_W, raw_pred.cast_position)) {
             last_w_cast_time = now;
             last_spell_cast_time = now;
             return true;
@@ -1003,6 +1016,38 @@ namespace zeri
         if (best) try_w(best, menu::w_hitchance);
     }
 
+    // Auto-W enemies that are outside our AA range AND killable by W
+    // damage. Acts as a poke finisher — when the target has walked just
+    // out of AA range with low HP, W secures the kill instead of letting
+    // them walk away. Distinct from killsteal_w: that one fires on any
+    // killable hero in W range; this one is gated on "outside AA range"
+    // so it won't override AA-Q DPS in close combat.
+    static void try_w_kill_outside_aa()
+    {
+        if (!menu::w_kill_outside_aa) return;
+        if (!is_spell_ready(SLOT_W) || !has_enough_mana(SLOT_W)) return;
+        auto p = g_sdk->object_manager->get_local_player();
+        if (!p || !sdk::damage) return;
+
+        // c_aa_range expands with passive charge; use it so the gate
+        // mirrors actual AA reach instead of base 500u.
+        const float aa_reach = c_aa_range;
+
+        game_object* best = nullptr;
+        float best_ehp = FLT_MAX;
+        for (auto* h : g_sdk->object_manager->get_heroes()) {
+            if (!is_valid_target(h)) continue;
+            if (venplus::utility::has_anti_burst_buff(h)) continue;
+            const float d = distance_to(h);
+            if (d <= aa_reach || d > spell_data::w_range_pulse) continue;
+            const float ehp = h->get_hp() + h->get_all_shield();
+            if (ehp >= best_ehp) continue;
+            const float dmg = sdk::damage->get_spell_damage(p, h, SLOT_W);
+            if (dmg >= ehp) { best_ehp = ehp; best = h; }
+        }
+        if (best) try_w(best, menu::w_hitchance);
+    }
+
     // ============================================================================
     // AA SUBSTITUTION (on_before_attack)
     // ============================================================================
@@ -1023,15 +1068,28 @@ namespace zeri
     {
         if (!target) return false;
 
+        // ---- LAST-HIT (V) OVERRIDE -----------------------------------
+        // When V is held, the charged passive is reserved exclusively
+        // for executing lane minions. Any AA that would consume the
+        // passive on a non-minion (or a non-killable minion) is blocked
+        // so the empowered shot stays available for the killshot.
+        if (lasthit_mode && passive_charged) {
+            if (!target->is_minion() || !target->is_lane_minion()) return false;
+            return q_volley_will_kill(target, false);
+        }
+
         if (target->is_hero()) {
             if (combo_mode) {
-                // Defensive backoff vs ready engage spell in AA range
-                if (enemy_has_ready_close_spell(target)
-                    && distance_to(target) <= c_aa_range - 50.f) return false;
-                // Combo = full DPS on the target. Always AA — basic shots
-                // build the next passive charge, empowered shots fire the
-                // moment they're up, executes naturally fall through.
-                return true;
+                // ---- COMBO (Space) OVERRIDE --------------------------
+                // Mirrors zerisource: AA the hero ONLY when (a) passive
+                // is charged (fire the empowered shot for max burst) or
+                // (b) the Q + passive volley will execute. Non-lethal
+                // basic AAs are blocked — they add little DPS on Zeri
+                // and committing to them just locks our position.
+                // Letting the orbwalker free-walk between AAs keeps
+                // kite freedom for poke / dodge.
+                if (passive_charged) return true;
+                return q_volley_will_kill(target, false);
             }
             // harass / lasthit / out-of-mode: only AA if kill secured
             return q_volley_will_kill(target, false);
@@ -1048,7 +1106,7 @@ namespace zeri
                 if (passive_charged) return true;
                 return q_volley_will_kill(target, false);
             }
-            // lasthit / harass
+            // lasthit / harass — pure execute logic
             return q_volley_will_kill(target, false);
         }
 
@@ -1140,10 +1198,6 @@ namespace zeri
 
         const float dist     = distance_to(target);
         const float q_range  = get_q_range();
-        // Base AA range (c_aa_range reflects passive-shot range when charged
-        // and would shrink the AA->Q gap below Q range, blocking Q at heroes
-        // in the gap).
-        const float aa_range = spell_data::passive_aa_range;
 
         // R inside its radius
         if (menu::combo_use_r && !overcharged && dist <= spell_data::r_radius + 125.f) {
@@ -1167,9 +1221,17 @@ namespace zeri
             try_w(target, menu::w_hitchance);
         }
 
-        const bool would_cancel = sdk::orbwalker && sdk::orbwalker->would_cancel_attack();
-        if (menu::combo_use_q && dist > aa_range && dist <= q_range
-            && is_spell_ready(SLOT_Q) && !would_cancel) {
+        // Q at any in-range hero. We intentionally do NOT gate on:
+        //   - dist > aa_range : Q's cooldown is independent of AA timing.
+        //     If we only try Q outside base AA range, there's a 200-500ms
+        //     window each cycle where Q is ready and target is in range
+        //     but combo() won't fire and on_before_attack hasn't ticked
+        //     yet — Q "randomly refuses" for that window.
+        //   - !would_cancel_attack : Q is a self-cast that replaces the
+        //     next AA, not interrupted by windup. on_before_attack still
+        //     fires Q first when an AA does happen, so duplicate-cast
+        //     can't happen (is_spell_ready blocks it on the second path).
+        if (menu::combo_use_q && dist <= q_range && is_spell_ready(SLOT_Q)) {
             try_q(target, pred_sdk::hitchance::low);
         }
     }
@@ -1183,19 +1245,17 @@ namespace zeri
         if (now - last_spell_cast_time < MIN_SPELL_DELAY) return;
 
         const float q_range     = get_q_range();
-        // Base AA range (not c_aa_range, which jumps to ~825 with passive
-        // charge and would close the AA->Q gap below Q range).
-        const float aa_range    = spell_data::passive_aa_range;
         const float w_max_range = spell_data::w_range_pulse + 100.f;
-        const bool  would_cancel = sdk::orbwalker && sdk::orbwalker->would_cancel_attack();
         // Q is free — let it fire regardless of mana threshold. W/E/R obey it.
         const bool  mana_ok      = mana_pct() >= (float)menu::harass_mana_pct;
 
         auto* hero = sdk::target_selector ? pick_hero_target(w_max_range) : nullptr;
 
-        if (menu::harass_use_q && hero && is_spell_ready(SLOT_Q) && !would_cancel) {
-            const float dh = distance_to(hero);
-            if (dh > aa_range && dh <= q_range) {
+        // Q at any in-range hero — see combo() comment for why we don't
+        // gate on aa_range / would_cancel_attack (causes Q to "refuse"
+        // randomly in the AA-cooldown window).
+        if (menu::harass_use_q && hero && is_spell_ready(SLOT_Q)) {
+            if (distance_to(hero) <= q_range) {
                 if (try_q(hero, pred_sdk::hitchance::low) == q_result::casted) return;
             }
         }
@@ -1206,7 +1266,7 @@ namespace zeri
             if (try_w(hero, hc)) return;
         }
 
-        if (menu::harass_use_q && is_spell_ready(SLOT_Q) && sdk::damage && !would_cancel) {
+        if (menu::harass_use_q && is_spell_ready(SLOT_Q) && sdk::damage) {
             game_object* best = nullptr;
             float best_hp = FLT_MAX;
             for (auto* m : g_sdk->object_manager->get_minions()) {
@@ -1400,7 +1460,7 @@ namespace zeri
         return perp2 <= radius * radius;
     }
 
-    static void try_q_minion_farm(bool lasthit_only)
+    static void try_q_minion_farm(bool lasthit_only, bool spam = false)
     {
         if (!is_spell_ready(SLOT_Q)) return;
         if (!sdk::damage || !sdk::orbwalker) return;
@@ -1413,6 +1473,8 @@ namespace zeri
         // Use Zeri's BASE AA range (500u). c_aa_range reflects the passive
         // shot range (~825u when charged) which is wider than Q range and
         // would zero out the AA->Q gap, blocking Q at distant minions.
+        // In spam mode (fast-clear) we drop the floor entirely and let Q
+        // fire on the best line through the wave regardless of distance.
         const float aa_range = spell_data::passive_aa_range;
 
         // Snapshot enemy heroes in Q range once (used for pierce scoring).
@@ -1426,15 +1488,26 @@ namespace zeri
             heroes.push_back({ h, h->get_hp() + std::max(h->get_all_shield(), 0.f) });
         }
 
-        game_object* best        = nullptr;
-        float        best_score  = -FLT_MAX;
-
+        // Snapshot lane minions in Q range (used for spam-mode line scoring).
+        std::vector<game_object*> minions;
+        minions.reserve(16);
         for (auto* m : g_sdk->object_manager->get_minions()) {
             if (!m || !m->is_valid() || m->is_dead() || !m->is_targetable()) continue;
             if (!m->is_visible() || m->get_team_id() == p->get_team_id()) continue;
             if (!m->is_lane_minion()) continue;
+            if (distance_to(m) > q_range + 50.f) continue;
+            minions.push_back(m);
+        }
+
+        game_object* best        = nullptr;
+        float        best_score  = -FLT_MAX;
+
+        for (auto* m : minions) {
             const float d = distance_to(m);
-            if (d <= aa_range || d > q_range) continue;
+            if (d > q_range) continue;
+            // Standard farm honors the AA→Q gap so orbwalker handles
+            // anything inside AA range with autos. Spam mode ignores it.
+            if (!spam && d <= aa_range) continue;
 
             const float mhp = m->get_hp();
             const float dmg = sdk::damage->get_spell_damage(p, m, SLOT_Q);
@@ -1448,14 +1521,27 @@ namespace zeri
             if (killable) score += 1300.f;
             else          score += 200.f - std::min(mhp, 200.f); // prefer low-HP minion when no lethal
 
+            const auto cast_pos = m->get_position();
+
             // Pierce through heroes behind the minion: +220 per champion in
             // line, +500 per champion the volley would also kill.
-            const auto cast_pos = m->get_position();
             for (const auto& hi : heroes) {
                 if (!q_line_passes_through(from, cast_pos, hi.h, q_range)) continue;
                 score += 220.f;
                 const float qdmg = sdk::damage->get_spell_damage(p, hi.h, SLOT_Q);
                 if (qdmg >= hi.hp) score += 500.f;
+            }
+
+            // Spam mode: prefer the line that volleys the most minions.
+            // +180 per extra minion hit, +400 per extra minion killed.
+            if (spam) {
+                for (auto* om : minions) {
+                    if (om == m) continue;
+                    if (!q_line_passes_through(from, cast_pos, om, q_range)) continue;
+                    score += 180.f;
+                    const float omdmg = sdk::damage->get_spell_damage(p, om, SLOT_Q);
+                    if (omdmg >= om->get_hp()) score += 400.f;
+                }
             }
 
             if (m->is_dashing()) score += 400.f;
@@ -1469,8 +1555,11 @@ namespace zeri
         if (best) cast_q_at_pos(best->get_position());
     }
 
-    static void try_q_lasthit_farm() { try_q_minion_farm(true);  }
-    static void try_q_clear_farm()   { try_q_minion_farm(false); }
+    static void try_q_lasthit_farm()   { try_q_minion_farm(true,  false); }
+    static void try_q_clear_farm()     { try_q_minion_farm(false, false); }
+    // Fast-clear "Q spam" — fires Q on the best volley line through the
+    // wave regardless of mana / AA-range gap (zerisource Fast Q Spam).
+    static void try_q_fast_spam_farm() { try_q_minion_farm(false, true);  }
 
     // Q at an enemy hero while in farm mode (clear / fast-clear / lasthit /
     // harass key not held). Without this Q only fires at heroes via
@@ -1548,12 +1637,14 @@ namespace zeri
     {
         if (!sdk::orbwalker || !sdk::orbwalker->is_spell_farm_enabled()) return;
 
-        // Q is free — always run it regardless of mana threshold
+        // Q is free — always run it regardless of mana threshold.
+        // Fast-clear uses the "Q spam" scoring (multi-hit volley line, no
+        // AA-range floor) instead of the gap-aware clear pick.
         if (try_q_structure()) return;
         if (try_q_empowered_clear()) return;
         if (try_q_hero_in_farm()) return;
         if (try_q_jungle()) return;
-        if (menu::lane_use_q_clear) try_q_clear_farm();
+        if (menu::lane_use_q_clear) try_q_fast_spam_farm();
         if (try_q_wards())     return;
         if (try_q_traps_pets()) return;
 
@@ -1714,6 +1805,7 @@ namespace zeri
         }
 
         killsteal_w();
+        try_w_kill_outside_aa();
 
         if (!sdk::orbwalker) return;
 
@@ -1970,6 +2062,10 @@ namespace zeri
             [](bool v) { menu::lh_w_cannon = v; });
         w_menu->add_checkbox("ks", "Killsteal", menu::combo_w_killsteal,
             [](bool v) { menu::combo_w_killsteal = v; });
+        //w_menu->add_checkbox("only_walls", "Only Use on Walls (wall-pierce only)",
+           // menu::w_only_walls, [](bool v) { menu::w_only_walls = v; });
+        //w_menu->add_checkbox("kill_outside_aa", "Auto-Kill Outside AA Range",
+           // menu::w_kill_outside_aa, [](bool v) { menu::w_kill_outside_aa = v; });
         w_menu->add_separator();
         w_menu->add_slider_int("hitchance", "Hitchance", 0, 100, 1, menu::w_hitchance,
             [](int v) { menu::w_hitchance = v; });

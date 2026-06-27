@@ -170,6 +170,65 @@ static float get_e_effective_cost( int kills_in_blast = 1 )
     return ( std::max )( 0.f, raw - refund );
 }
 
+// Returns ready Ignite (SummonerDot) damage against a hero — true damage, no mitigation.
+static float get_ignite_damage( game_object* target )
+{
+    if ( !target || !target->is_hero() ) return 0.f;
+    auto* p = g_sdk->object_manager->get_local_player();
+    if ( !p ) return 0.f;
+
+    for ( int slot = 4; slot <= 5; ++slot )
+    {
+        auto* entry = p->get_spell( slot );
+        if ( !entry ) continue;
+        auto* data = entry->get_data();
+        if ( !data ) continue;
+        auto* sd = data->get_static_data();
+        if ( !sd || !sd->get_name() ) continue;
+        if ( std::string( sd->get_name() ) != "SummonerDot" ) continue;
+        if ( entry->get_cooldown() > 0.f ) return 0.f;
+
+        const int lvl = std::clamp( p->get_level(), 1, 18 );
+        return 70.f + ( 525.f - 70.f ) * static_cast< float >( lvl - 1 ) / 17.f;
+    }
+    return 0.f;
+}
+
+// Returns damage multiplier from precision row-3 runes: Coup de Grace, Cut Down, Last Stand.
+static float get_rune_dmg_amp( game_object* target )
+{
+    if ( !target || !target->is_hero() ) return 1.f;
+    auto* p = g_sdk->object_manager->get_local_player();
+    if ( !p ) return 1.f;
+
+    // Cut Down: +8% vs targets above 60% max HP
+    if ( p->has_rune( 8017u ) )
+    {
+        const float pct = target->get_max_hp() > 0.f ? target->get_hp() / target->get_max_hp() : 0.f;
+        if ( pct > 0.60f ) return 1.08f;
+    }
+
+    // Coup de Grace: +8% vs targets below 40% HP
+    if ( p->has_rune( 8014u ) )
+    {
+        const float pct = target->get_max_hp() > 0.f ? target->get_hp() / target->get_max_hp() : 1.f;
+        if ( pct < 0.40f ) return 1.08f;
+    }
+
+    // Last Stand: +5–11% when we're below 60% HP, maxing at 30%
+    if ( p->has_rune( 8299u ) )
+    {
+        const float my_pct = p->get_max_hp() > 0.f ? p->get_hp() / p->get_max_hp() : 1.f;
+        if ( my_pct < 0.60f )
+        {
+            const float t = std::min( 1.f, ( 0.60f - my_pct ) / 0.30f );
+            return 1.f + 0.05f + t * 0.06f;
+        }
+    }
+
+    return 1.f;
+}
+
 // Approximate full-combo damage preview: E (with inflight Q stack accounted
 // for) + a few AAs. Used by the HP-bar overlay.
 static float get_combo_damage( game_object* target )
@@ -247,7 +306,7 @@ static bool killable_e()
         const int stacks = get_rend_stacks( h ) + extra;
         if ( stacks <= 0 ) continue;
 
-        float dmg = get_e_damage( h, extra );
+        float dmg = get_e_damage( h, extra ) * get_rune_dmg_amp( h ) + get_ignite_damage( h );
         float ehp = h->get_hp() + h->get_all_shield();
         if ( dmg >= ehp )
             return sdk::common->cast_spell( SLOT_E );
@@ -262,11 +321,17 @@ static bool cast_e_before_expire()
     if ( !is_spell_ready( SLOT_E ) || !has_enough_mana( SLOT_E ) ) return false;
     if ( !sdk::common || !g_sdk->clock_facade ) return false;
 
+    auto* p = g_sdk->object_manager->get_local_player();
+    if ( !p ) return false;
+
     const float now = g_sdk->clock_facade->get_game_time();
 
     for ( auto* h : g_sdk->object_manager->get_heroes() )
     {
-        if ( !is_valid_enemy( h, spell_data::e_range ) ) continue;
+        // Don't require visibility — E is self-cast and hits in-range enemies in fog.
+        if ( !h || !h->is_valid() || h->is_dead() ) continue;
+        if ( h->get_team_id() == p->get_team_id() ) continue;
+        if ( distance_to( h ) > spell_data::e_range ) continue;
 
         int stacks = get_rend_stacks( h );
         if ( stacks < menu::e_expire_min_stacks ) continue;
@@ -334,15 +399,10 @@ static bool cast_r_save_ally()
 static bool slow_e()
 {
     if ( !menu::slow_e ) return false;
-    if ( !is_spell_ready( SLOT_E ) || !sdk::common ) return false;
+    if ( !is_spell_ready( SLOT_E ) || !has_enough_mana( SLOT_E ) || !sdk::common ) return false;
 
     auto* p = g_sdk->object_manager->get_local_player();
     if ( !p ) return false;
-
-    // Need enough for this E plus a follow-up E. The follow-up cost is reduced
-    // by the per-stack mana refund this slow-E is expected to grant.
-    const float e_cost = p->get_spell_mana_cost( SLOT_E );
-    if ( p->get_par() < e_cost + get_e_effective_cost( 1 ) ) return false;
 
     bool any_stacked_enemy = false;
     for ( auto* h : g_sdk->object_manager->get_heroes() )
@@ -352,13 +412,22 @@ static bool slow_e()
     }
     if ( !any_stacked_enemy ) return false;
 
-    // Refund: only fire if there is a stacked minion in range we can finish (CD reset).
+    // Fire if any killable stacked minion or monster is in range (CD reset).
     for ( auto* m : g_sdk->object_manager->get_minions() )
     {
         if ( !is_valid_enemy( m, spell_data::e_range ) ) continue;
         int stacks = get_rend_stacks( m );
         if ( stacks <= 0 ) continue;
-        if ( get_e_damage( m ) >= m->get_hp() )
+        if ( get_e_damage( m ) >= m->get_hp() + m->get_all_shield() )
+            return sdk::common->cast_spell( SLOT_E );
+    }
+    for ( auto* m : g_sdk->object_manager->get_monsters() )
+    {
+        if ( !m || !m->is_valid() || m->is_dead() || !m->is_targetable() ) continue;
+        if ( distance_to( m ) > spell_data::e_range ) continue;
+        int stacks = get_rend_stacks( m );
+        if ( stacks <= 0 ) continue;
+        if ( get_e_damage( m ) >= m->get_hp() + m->get_all_shield() )
             return sdk::common->cast_spell( SLOT_E );
     }
     return false;
@@ -495,7 +564,7 @@ void clear()
         if ( !is_valid_enemy( m, spell_data::e_range ) ) continue;
         if ( get_rend_stacks( m ) <= 0 ) continue;
 
-        if ( get_e_damage( m ) >= m->get_hp() && m->is_lane_minion() )
+        if ( get_e_damage( m ) >= m->get_hp() + m->get_all_shield() && m->is_lane_minion() )
             killable_lane++;
     }
 
@@ -520,7 +589,7 @@ void clear()
                     || ( is_small && menu::jungle_clear_e_small );
 
         if ( !allowed ) continue;
-        if ( get_e_damage( m ) < m->get_hp() ) continue;
+        if ( get_e_damage( m ) < m->get_hp() + m->get_all_shield() ) continue;
 
         sdk::common->cast_spell( SLOT_E );
         return;
@@ -603,7 +672,7 @@ bool __stdcall on_before_attack( orb_sdk::event_data* data )
     const int stacks = get_rend_stacks( data->target ) + extra;
     if ( stacks <= 0 ) return true;
 
-    const float dmg = get_e_damage( data->target, extra );
+    const float dmg = get_e_damage( data->target, extra ) * get_rune_dmg_amp( data->target ) + get_ignite_damage( data->target );
     const float ehp = data->target->get_hp() + data->target->get_all_shield();
     if ( dmg < ehp ) return true;
 
@@ -623,6 +692,23 @@ bool __stdcall on_after_attack( orb_sdk::event_data* data )
     if ( !sdk::orbwalker->combo() ) return true;
     if ( !data || !data->target || !data->target->is_hero() ) return true;
     if ( data->target->get_team_id() == p->get_team_id() ) return true;
+
+    // After-AA E: fire E right after AA when it can kill the target.
+    if ( menu::allow_after_aa_e && is_spell_ready( SLOT_E ) && has_enough_mana( SLOT_E ) )
+    {
+        const int extra  = q_inflight_extra_stacks( data->target );
+        const int stacks = get_rend_stacks( data->target ) + extra;
+        if ( stacks > 0 )
+        {
+            const float dmg = get_e_damage( data->target, extra ) * get_rune_dmg_amp( data->target ) + get_ignite_damage( data->target );
+            const float ehp = data->target->get_hp() + data->target->get_all_shield();
+            if ( dmg >= ehp )
+            {
+                sdk::common->cast_spell( SLOT_E );
+                return true;
+            }
+        }
+    }
 
     // Attack-speed lockout.
     if ( ( 1.f / p->get_attack_delay() ) > menu::block_q_as ) return true;
@@ -679,7 +765,7 @@ void __fastcall on_update()
     if ( !sdk::orbwalker ) return;
 
     if      ( sdk::orbwalker->combo() ) combo();
-    else if ( sdk::orbwalker->clear() || sdk::orbwalker->fast_clear() ) clear();
+    else if ( sdk::orbwalker->clear() || sdk::orbwalker->fast_clear() || sdk::orbwalker->lasthit() ) clear();
 }
 
 void __fastcall on_draw_world()
@@ -743,7 +829,8 @@ void __fastcall on_draw()
         const int stacks = get_rend_stacks( t );
         if ( stacks + extra <= 0 ) return;
 
-        const float dmg = get_e_damage( t, extra );
+        const float dmg_e   = get_e_damage( t, extra );
+        const float dmg     = dmg_e * get_rune_dmg_amp( t ) + get_ignite_damage( t );
         const float ehp = t->get_hp() + t->get_all_shield();
         const bool killable = dmg >= ehp;
 

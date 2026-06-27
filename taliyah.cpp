@@ -43,7 +43,6 @@ namespace
         inline bool combo_q = true;
         inline bool combo_w = true;
         inline bool combo_e = true;
-        inline bool combo_e_before_w = true;
         inline bool combo_w_into_e = true;
         inline bool q_magnet = true;
         inline int w_direction = 0; // 0 away, 1 toward, 2 cursor, 3 smart
@@ -95,6 +94,11 @@ namespace
     float s_last_w_mode_switch = 0.f;
     math::vector3 s_last_e_pos {};
     float s_e_active_until = 0.f;
+
+    // W->E follow-up: after a combo W shoves the target, E is dropped on the
+    // predicted landing spot on the next tick(s) within this window.
+    game_object* s_we_target = nullptr;
+    float s_we_until = 0.f;
 
     struct ground_object
     {
@@ -838,14 +842,45 @@ namespace
         if (menu::semi_w && w_target && cast_w(w_target, w_dir))
             return;
 
-        if (menu::combo_e_before_w && menu::combo_e && e_target && cast_e(e_target))
+        // W->E follow-up: the W we just cast shoves the target — drop E on them
+        // immediately so the rocks detonate where they land. Highest priority so
+        // it isn't pre-empted by another W.
+        if (menu::combo_e && s_we_target && game_time() <= s_we_until
+            && is_valid_enemy(s_we_target, spell_data::e_range))
+        {
+            if (cast_e(s_we_target))
+            {
+                s_we_target = nullptr;
+                s_we_until = 0.f;
+                return;
+            }
+        }
+
+        // Primary combo: W first, then instant E. Only shove when E can follow up,
+        // otherwise the displacement is wasted.
+        if (menu::combo_w && w_target && spell_ready(SLOT_E) && has_mana(SLOT_E)
+            && cast_w(w_target, w_dir))
+        {
+            // Arm the E follow-up. Window spans the W displacement (~0.85s) plus
+            // a margin so E lands as the target arrives at the shoved position.
+            s_we_target = w_target;
+            s_we_until = game_time() + 1.0f;
             return;
-        if (menu::combo_w_into_e && menu::combo_w && w_target && e_field_active() && cast_w_toward(w_target, s_last_e_pos))
+        }
+
+        // Legacy "W into already-placed E field" path (kept for users who prefer it).
+        if (menu::combo_w_into_e && menu::combo_w && w_target && e_field_active()
+            && cast_w_toward(w_target, s_last_e_pos))
             return;
-        if (menu::combo_w && w_target && cast_w(w_target, w_dir))
+
+        // E on its own when W isn't available (or combo_w disabled).
+        if (menu::combo_e && e_target && cast_e(e_target))
             return;
-        if (!menu::combo_e_before_w && menu::combo_e && e_target && cast_e(e_target))
+
+        // W as a pure peel/displacement tool when E is down but W is up.
+        if (menu::combo_w && w_target && !spell_ready(SLOT_E) && cast_w(w_target, w_dir))
             return;
+
         if (menu::combo_q && q_target)
             cast_q(q_target);
     }
@@ -1061,7 +1096,6 @@ void load()
 
     auto* e = s_menu->add_sub_category("e_unraveled_earth", "E - Unraveled Earth");
     e->add_checkbox("combo", "Use in Combo", menu::combo_e, [](bool v) { menu::combo_e = v; });
-    e->add_checkbox("combo_pre_w", "Cast E Before W", menu::combo_e_before_w, [](bool v) { menu::combo_e_before_w = v; });
     e->add_checkbox("harass", "Use in Harass", menu::harass_e, [](bool v) { menu::harass_e = v; });
     e->add_checkbox("auto_cc", "Auto E on CC", menu::auto_e_cc, [](bool v) { menu::auto_e_cc = v; });
     e->add_checkbox("anti_gap", "Anti Gapclose E", menu::anti_gap_e, [](bool v) { menu::anti_gap_e = v; });
@@ -1159,6 +1193,8 @@ void unload()
     s_last_w_mode_switch = 0.f;
     s_last_e_pos = {};
     s_e_active_until = 0.f;
+    s_we_target = nullptr;
+    s_we_until = 0.f;
     s_worked_ground.clear();
 }
 }

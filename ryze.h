@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sdk.hpp"
+#include "orb_sdk.hpp"
 
 namespace ryze
 {
@@ -17,4 +18,5 @@ namespace ryze
     void __fastcall on_present();
     void __fastcall on_buff_gain(game_object* obj, buff_instance* buff);
     void __fastcall on_buff_loss(game_object* obj, buff_instance* buff);
+    bool __stdcall on_before_attack(orb_sdk::event_data* data);
 }

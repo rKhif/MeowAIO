@@ -43,6 +43,9 @@ namespace ryze
         inline uint32_t    infotab_combo_mode = 0;
         inline std::string combo_mode_key = "Y";
 
+        inline bool block_aa_enabled = false;
+        inline int  block_aa_level = 6;
+
         inline bool draw_q_range = true;
         inline bool draw_w_range = true;
         inline bool draw_e_range = true;
@@ -197,51 +200,21 @@ namespace ryze
             return nullptr;
         }
 
-        static int effective_q_hitchance(game_object* target, int hitchance)
-        {
-            auto* p = player();
-            if (!p || !target || !target->is_hero())
-                return hitchance;
-
-            const float dist = p->get_position().distance(target->get_position());
-            int effective = hitchance;
-
-            if (dist > 850.f)
-                effective = (std::max)(effective, static_cast<int>(pred_sdk::hitchance::very_high));
-            else if (dist > 650.f)
-                effective = (std::max)(effective, static_cast<int>(pred_sdk::hitchance::high));
-
-            if (dist > 550.f && target->get_move_speed() > 420.f)
-                effective = (std::max)(effective, static_cast<int>(pred_sdk::hitchance::very_high));
-
-            return effective;
-        }
-
         static bool is_unstable_q_prediction(game_object* target, const pred_sdk::pred_data& pred)
         {
-            auto* p = player();
-            if (!p || !target || !target->is_hero())
+            if (!target || !target->is_hero())
                 return false;
 
-            const float dist = p->get_position().distance(target->get_position());
-            if (dist <= 600.f)
-                return false;
-
-            return pred.state == pred_sdk::prediction_state::juking
-                || pred.state == pred_sdk::prediction_state::awaiting_netvar_update;
+            // Only block on awaiting_netvar_update (transient, clears in 1-2 frames).
+            // Juking is handled by the hitchance filter — hard-blocking it causes Q to hold.
+            return pred.state == pred_sdk::prediction_state::awaiting_netvar_update;
         }
 
         // Geometric post-validation of a Q prediction result.
-        //
-        // Checks four things from first principles:
-        //   1. Perpendicular distance from the missile line to the target's predicted
-        //      center must fit within the effective hit radius (Q_RADIUS + target hitbox).
-        //   2. Edge-to-edge range: target center must be within Q_RANGE + target_radius.
-        //   3. Precise total time: Q windup delay + flight time until the missile edge
-        //      first contacts the target edge.
-        //   4. Reachability: the distance the target would need to travel from its
-        //      current position to the predicted position must not exceed what it can
-        //      cover at its current move-speed within that total time (+ 15% buffer).
+        // Verifies the SDK cast_position actually lines up with the predicted
+        // target position on the missile axis. The reachability check is
+        // intentionally omitted — get_move_speed() doesn't account for dashes,
+        // and the SDK already validates reachability internally.
         static bool verify_q_geometry(game_object* target, const pred_sdk::pred_data& pred)
         {
             auto* p = player();
@@ -254,7 +227,6 @@ namespace ryze
             const auto cast_pos   = pred.cast_position;
             const auto pred_pos   = pred.predicted_position;
 
-            // Cast direction unit vector (x/z plane, matching distance())
             const float dir_x  = cast_pos.x - player_pos.x;
             const float dir_z  = cast_pos.z - player_pos.z;
             const float dir_len = std::sqrt(dir_x * dir_x + dir_z * dir_z);
@@ -263,35 +235,18 @@ namespace ryze
             const float nx = dir_x / dir_len;
             const float nz = dir_z / dir_len;
 
-            // Scalar projection of predicted target center onto missile direction
             const float dpx  = pred_pos.x - player_pos.x;
             const float dpz  = pred_pos.z - player_pos.z;
             const float proj = dpx * nx + dpz * nz;
             if (proj <= 0.f) return false;
 
-            // Perpendicular distance from predicted center to missile line
             const float perp_x    = dpx - proj * nx;
             const float perp_z    = dpz - proj * nz;
             const float perp_dist = std::sqrt(perp_x * perp_x + perp_z * perp_z);
             if (perp_dist > eff_radius) return false;
 
-            // Edge-to-edge range check
             const float dist_center = player_pos.distance(pred_pos);
             if (dist_center > sc::Q_RANGE + target_radius) return false;
-
-            // Precise forward distance at first missile-edge / target-edge contact:
-            //   proj - sqrt(eff_radius^2 - perp_dist^2)
-            const float inside_sq  = (std::max)(0.f, eff_radius * eff_radius - perp_dist * perp_dist);
-            const float hit_proj   = (std::max)(0.f, proj - std::sqrt(inside_sq));
-
-            // Total time = windup delay + flight
-            const float flight_time = hit_proj / sc::Q_SPEED;
-            const float total_time  = sc::Q_DELAY + flight_time;
-
-            // Reachability: target must be able to reach pred_pos within total_time
-            const float dist_to_pred = target->get_position().distance(pred_pos);
-            const float max_travel   = target->get_move_speed() * total_time * 1.15f;
-            if (dist_to_pred > max_travel) return false;
 
             return true;
         }
@@ -323,14 +278,17 @@ namespace ryze
             if (!sdk::common || !sdk::prediction || !target) return false;
             if (!is_spell_ready(SLOT_Q) || !has_enough_mana(SLOT_Q)) return false;
 
-            const int effective_hc = effective_q_hitchance(target, hitchance);
-            const auto pred = predict_q(target, effective_hc);
-            if (!pred.is_valid || pred.hitchance < effective_hc) return false;
+            const auto pred = predict_q(target, hitchance);
+            if (!pred.is_valid || pred.hitchance < hitchance) return false;
             if (is_unstable_q_prediction(target, pred)) return false;
             if (!verify_q_geometry(target, pred)) return false;
 
             const bool ok = sdk::common->cast_spell(SLOT_Q, pred.cast_position);
-            if (ok) s_last_spell_cast_time = game_time();
+            if (ok)
+            {
+                s_last_spell_cast_time    = game_time();
+                s_last_non_q_cast_time    = 0.f;  // passive reset consumed; E/W may fire next tick
+            }
             return ok;
         }
 
@@ -753,11 +711,10 @@ namespace ryze
             const auto player_pos = p->get_position();
             const auto target_pos = target->get_position();
             const float target_dist = player_pos.distance(target_pos);
-            const int direct_hc = effective_q_hitchance(target, menu::combo_q_hitchance);
-            const auto direct_pred = predict_q(target, direct_hc);
+            const auto direct_pred = predict_q(target, menu::combo_q_hitchance);
 
             // Keep the normal direct pattern when Q already has a clean line.
-            if (direct_pred.is_valid && direct_pred.hitchance >= direct_hc
+            if (direct_pred.is_valid && direct_pred.hitchance >= menu::combo_q_hitchance
                 && !is_unstable_q_prediction(target, direct_pred))
                 return false;
 
@@ -803,9 +760,8 @@ namespace ryze
 
             if (menu::combo_flux_q_collision)
             {
-                const int direct_hc = effective_q_hitchance(target, menu::combo_q_hitchance);
-                const auto direct_pred = predict_q(target, direct_hc);
-                if (!direct_pred.is_valid || direct_pred.hitchance < direct_hc
+                const auto direct_pred = predict_q(target, menu::combo_q_hitchance);
+                if (!direct_pred.is_valid || direct_pred.hitchance < menu::combo_q_hitchance
                     || is_unstable_q_prediction(target, direct_pred))
                 {
                     if (try_q_on_fluxed_collision(target)) return true;
@@ -910,9 +866,12 @@ namespace ryze
 
             // Mode 0 (QEQWQ) — canonical Ryze pattern. Q has absolute priority;
             // E and W only fire to trigger the passive Q reset between them.
+            // If Q is ready but prediction rejected the cast, hold E/W rather
+            // than degrading the rotation to EWQ.
             if (menu::combo_mode == 0)
             {
                 if (try_q()) return;
+                if (is_spell_ready(SLOT_Q)) return;
                 if (try_e()) return;
                 if (try_q()) return;
                 if (try_w()) return;
@@ -931,19 +890,11 @@ namespace ryze
                 return;
             }
 
-            // Mode 2 (Smart) — context aware: if target already fluxed, drop W
-            // first to lock then Q-spam; otherwise lay E for flux, Q, W, Q.
+            // Mode 2 (Smart) — E always leads for Q resets (shorter CD than W).
+            // W is a fallback when E is on CD. No flux branching — E-Q cycling
+            // is more efficient than switching to W-first when flux is up.
             if (try_q()) return;
-
-            if (fluxed)
-            {
-                if (try_w()) return;
-                if (try_q()) return;
-                if (try_e()) return;
-                if (try_q()) return;
-                return;
-            }
-
+            if (is_spell_ready(SLOT_Q)) return;
             if (try_e()) return;
             if (try_q()) return;
             if (try_w()) return;
@@ -1149,6 +1100,12 @@ namespace ryze
                 [](int v) { menu::combo_q_hitchance = v; });
             q_menu->add_slider_int("clear_min", "Clear Min Minions", 2, 6, 1, menu::clear_q_min_hit,
                 [](int v) { menu::clear_q_min_hit = v; });
+            q_menu->add_separator();
+            q_menu->add_checkbox("block_aa", "Block AA", menu::block_aa_enabled,
+                [](bool v) { menu::block_aa_enabled = v; });
+            q_menu->add_slider_int("block_aa_level", "Block at Level", 1, 18, 1, menu::block_aa_level,
+                [](int v) { menu::block_aa_level = v; });
+            q_menu->add_separator();
             q_menu->add_checkbox("draw_range", "Draw Range", menu::draw_q_range,
                 [](bool v) { menu::draw_q_range = v; });
 
@@ -1239,6 +1196,10 @@ namespace ryze
         g_sdk->event_manager->register_callback(event_manager::event::buff_loss,
             reinterpret_cast<void*>(on_buff_loss));
 
+        if (sdk::orbwalker)
+            sdk::orbwalker->register_callback(orb_sdk::event_type::before_attack,
+                reinterpret_cast<void*>(on_before_attack));
+
         setup_menu();
         cleanup_flux();
 
@@ -1278,6 +1239,10 @@ namespace ryze
             g_sdk->event_manager->unregister_callback(event_manager::event::buff_loss,
                 reinterpret_cast<void*>(on_buff_loss));
         }
+
+        if (sdk::orbwalker)
+            sdk::orbwalker->unregister_callback(orb_sdk::event_type::before_attack,
+                reinterpret_cast<void*>(on_before_attack));
 
         s_fluxed_targets.fill({});
         s_last_spell_cast_time = 0.f;
@@ -1464,5 +1429,28 @@ namespace ryze
 
         if (obj == p && is_passive_stack_buff(buff))
             s_rune_stacks = 0;
+    }
+
+    // Suppress auto-attacks past a configurable level. Ryze is purely spell
+    // driven once the rotation comes online — every AA windup is time stolen
+    // from another Q reset, and AAs can desync the QEQWQ pattern by occupying
+    // the cast slot the moment a passive Q refund arrives.
+    //
+    // Returning `true` from this callback allows the orbwalker to attack;
+    // `false` blocks the attack for this tick. We only block in combo and
+    // harass — those modes are pure spell rotations. Clear, lasthit, and flee
+    // always allow AAs (needed for CS and disengage).
+    bool __stdcall on_before_attack(orb_sdk::event_data* data)
+    {
+        if (!menu::block_aa_enabled) return true;
+        if (!sdk::orbwalker) return true;
+
+        auto* p = player();
+        if (!p || p->is_dead()) return true;
+        if (p->get_level() < menu::block_aa_level) return true;
+
+        if (!sdk::orbwalker->combo() && !sdk::orbwalker->harass()) return true;
+
+        return false;
     }
 }

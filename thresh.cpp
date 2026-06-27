@@ -489,6 +489,9 @@ namespace
         if (!menu::combo_r) return;
         if (!is_spell_ready(SLOT_R)) return;
 
+        // Hook-aware: pause offensive abilities while any enemy is hooked.
+        if (is_q_successful()) return;
+
         auto* p = get_player();
         if (!p) return;
 
@@ -510,12 +513,16 @@ namespace
     }
 
     // ---------------------------------------------------------------
-    // ANTI GAP-CLOSE — tick fallback for ongoing dashes
+    // ANTI-DASH E — any enemy dash within E range gets a push-direction
+    // flay to interrupt the engage. No threshold, no direction logic.
     // ---------------------------------------------------------------
-    void try_anti_gap_tick()
+    void try_anti_dash_e()
     {
         if (!menu::e_anti_gap) return;
         if (!is_spell_ready(SLOT_E)) return;
+
+        // Hook-aware: pause offensive abilities while any enemy is hooked.
+        if (is_q_successful()) return;
 
         auto* p = get_player();
         if (!p) return;
@@ -523,43 +530,20 @@ namespace
         const float t = now_time();
         if (t - s_last_cast_time[SLOT_E] < 0.2f) return;
 
-        const auto ppos = p->get_position();
-
         if (!sdk::target_selector) return;
         for (auto* h : sdk::target_selector->get_sorted_heroes())
         {
             if (!is_valid_enemy(h, spell_data::e_range)) continue;
             if (!h->is_dashing()) continue;
+            if (is_unstoppable(h)) continue;
 
-            auto path = h->get_path();
-            if (path.empty()) continue;
+            auto pred = predict_e(h, /*pull*/ false, pred_sdk::hitchance::medium);
+            if (!pred.is_valid || pred.hitchance < pred_sdk::hitchance::medium) continue;
 
-            const auto end_pos  = path.back();
-            const float d_dash  = dist2d(h->get_position(), end_pos);
-            if (d_dash < 100.f) continue;
-
-            const bool dashing_away = dist2d(ppos, end_pos) > dist2d(ppos, h->get_position());
-            if (dashing_away)
+            if (sdk::common && sdk::common->cast_spell(SLOT_E, pred.cast_position))
             {
-                auto pred = predict_e(h, /*pull*/ true, pred_sdk::hitchance::medium);
-                if (!pred.is_valid) continue;
-                const float pd = dist2d(ppos, pred.cast_position);
-                const auto cast_pos = extend2d(pred.cast_position, ppos, pd * 2.f);
-                if (sdk::common && sdk::common->cast_spell(SLOT_E, cast_pos))
-                {
-                    s_last_cast_time[SLOT_E] = t;
-                    return;
-                }
-            }
-            else
-            {
-                auto pred = predict_e(h, /*push*/ false, pred_sdk::hitchance::medium);
-                if (!pred.is_valid) continue;
-                if (sdk::common && sdk::common->cast_spell(SLOT_E, pred.cast_position))
-                {
-                    s_last_cast_time[SLOT_E] = t;
-                    return;
-                }
+                s_last_cast_time[SLOT_E] = t;
+                return;
             }
         }
     }
@@ -581,7 +565,7 @@ namespace
         }
 
         iterate_lantern_logic();
-        try_anti_gap_tick();
+        try_anti_dash_e();
 
         // Semi-manual keys work outside of combo mode.
         try_semi_e();
@@ -703,40 +687,12 @@ namespace
         auto path = obj->get_path();
         if (path.size() < 2) return;
 
-        const auto start_pos = path.front();
-        const auto end_pos   = path.back();
-        const float dash_dist = dist2d(start_pos, end_pos);
+        const auto end_pos    = path.back();
+        const float dash_dist = dist2d(path.front(), end_pos);
+        const auto  ppos      = p->get_position();
 
-        if (dash_dist < 250.f) return;
-
-        const float t = now_time();
-        const auto  ppos = p->get_position();
-
-        // Anti gap-close: E into the dashing enemy.
-        if (is_spell_ready(SLOT_E) && t - s_last_cast_time[SLOT_E] >= 0.2f)
-        {
-            const bool dashing_away = dist2d(ppos, end_pos) > dist2d(ppos, start_pos);
-            if (dashing_away)
-            {
-                auto pred = predict_e(obj, /*pull*/ true, pred_sdk::hitchance::medium);
-                if (pred.is_valid && pred.hitchance >= pred_sdk::hitchance::medium)
-                {
-                    const float d = dist2d(ppos, pred.cast_position);
-                    const auto cast_pos = extend2d(pred.cast_position, ppos, d * 2.f);
-                    if (sdk::common && sdk::common->cast_spell(SLOT_E, cast_pos))
-                        s_last_cast_time[SLOT_E] = t;
-                }
-            }
-            else
-            {
-                auto pred = predict_e(obj, /*push*/ false, pred_sdk::hitchance::medium);
-                if (pred.is_valid && pred.hitchance >= pred_sdk::hitchance::medium)
-                {
-                    if (sdk::common && sdk::common->cast_spell(SLOT_E, pred.cast_position))
-                        s_last_cast_time[SLOT_E] = t;
-                }
-            }
-        }
+        // Anti-dash E: immediate response (shares the tick path's logic).
+        try_anti_dash_e();
 
         // Lantern on gap-close toward a whitelisted ally.
         if (!menu::w_lantern_gapclose || !is_spell_ready(SLOT_W)) return;

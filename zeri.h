@@ -20,7 +20,7 @@ namespace zeri
     namespace spell_data
     {
         // Q — Burst Fire (Zeri's primary "auto attack" — replaces AAs)
-        constexpr float q_range              = 715.f;
+        constexpr float q_range              = 710.f;
         constexpr float q_radius             = 65.f;
         constexpr float q_speed              = 2600.f;
         constexpr float q_speed_overcharged  = 3400.f;
@@ -84,6 +84,15 @@ namespace zeri
         inline int  combo_r_mode      = R_MODE_SMART;
         inline int  combo_r_min       = 1;
         inline bool combo_w_killsteal = true;
+
+        // --- W behavior toggles ---
+        // Restrict every auto-W cast (combo / harass / clear / killsteal /
+        // poke) to lines that pierce a terrain wall — turns W into a
+        // wall-pierce-only sniper.
+        inline bool w_only_walls       = false;
+        // Auto-cast W on enemy heroes that are outside our AA range and
+        // would be executed by W damage (poke finisher).
+        inline bool w_kill_outside_aa  = true;
 
         // --- Harass ---
         inline bool harass_use_w      = true;
