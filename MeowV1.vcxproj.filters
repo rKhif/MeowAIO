@@ -90,9 +90,6 @@
     <ClInclude Include="shyvana.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="mel.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="annie.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -115,9 +112,6 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="vex.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="champs\aurora.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="kalista.h">

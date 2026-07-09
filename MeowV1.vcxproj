@@ -153,8 +153,6 @@
     <ClInclude Include="..\ts_sdk.hpp" />
     <ClInclude Include="aphelios.h" />
     <ClInclude Include="zeri.h" />
-    <ClInclude Include="champs\aurora.hpp" />
-    <ClInclude Include="mel.h" />
     <ClInclude Include="annie.h" />
     <ClInclude Include="taliyah.h" />
     <ClInclude Include="ahri.h" />
