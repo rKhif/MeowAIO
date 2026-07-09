@@ -39,6 +39,12 @@
     <ClInclude Include="math.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="utility\defensive_buffs.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="utility\helpers.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="..\native_sdk.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
