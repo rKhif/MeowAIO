@@ -93,16 +93,10 @@
     <ClInclude Include="mel.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="mel_spell_db.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="annie.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="taliyah.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="milio.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ahri.h">
@@ -123,28 +117,13 @@
     <ClInclude Include="vex.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="jax.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="champs\aurora.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="champs\milio\data.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="senna.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="kalista.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="zeri_ps.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="lulu.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="jinx.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="soraka.h">
@@ -153,28 +132,13 @@
     <ClInclude Include="thresh.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="ziggs.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="kayle.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="zyra.h">
+    <ClInclude Include="aphelios.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="zy\pch.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="zy\zyra.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="zy\framework\champion_base.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="zy\db\champions\zyra.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="zy\champions\zyra\zyra.hpp">
+    <ClInclude Include="zeri.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
@@ -203,16 +167,10 @@
     <ClCompile Include="shyvana.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="mel.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="annie.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="taliyah.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="milio.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="ahri.cpp">
@@ -230,28 +188,10 @@
     <ClCompile Include="vex.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="jax.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="champs\aurora.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="champs\milio\data.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="senna.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="kalista.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="zeri_ps.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="lulu.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="jinx.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="soraka.cpp">
@@ -266,10 +206,10 @@
     <ClCompile Include="kayle.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="zyra.cpp">
+    <ClCompile Include="aphelios.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="zy\zyra.cpp">
+    <ClCompile Include="zeri.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

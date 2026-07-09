@@ -15,7 +15,6 @@
 #include "MeowV1/katarina.h"
 #include "MeowV1/hwei.h"
 #include "MeowV1/twitch.h"
-#include "MeowV1/jinx.h"
 #include "MeowV1/soraka.h"
 #include "MeowV1/thresh.h"
 #include "MeowV1/ziggs.h"
@@ -260,19 +259,6 @@ extern "C" __declspec(dllexport) bool PluginLoad(core_sdk* sdk, void** custom_sd
             return false;
         }
     }
-    else if (champion_name == "Jinx")
-    {
-        try
-        {
-            jinx::load();
-            g_sdk->log_console("[MeowAIO] Jinx loaded MEOW!");
-        }
-        catch (...)
-        {
-            g_sdk->log_console("[MeowAIO] Failed to load Jinx MEOW!");
-            return false;
-        }
-    }
     else if (champion_name == "Soraka")
     {
         try
@@ -315,7 +301,7 @@ extern "C" __declspec(dllexport) bool PluginLoad(core_sdk* sdk, void** custom_sd
     else
     {
         g_sdk->log_console("[MeowAIO] Champion not supported >.<'' (Current: %s)", champion_name.c_str());
-        g_sdk->log_console("[MeowAIO] Supported champions: Viktor, Veigar, Zaahen, Syndra, Orianna, Shyvana, Vex, Annie, Katarina, Hwei, Twitch, Jinx, Soraka, Thresh, Ziggs");
+        g_sdk->log_console("[MeowAIO] Supported champions: Viktor, Veigar, Zaahen, Syndra, Orianna, Shyvana, Vex, Annie, Katarina, Hwei, Twitch, Soraka, Thresh, Ziggs");
         return false;
     }
 
@@ -379,11 +365,6 @@ extern "C" __declspec(dllexport) void PluginUnload()
     {
         twitch::unload();
         g_sdk->log_console("[MeowAIO] Twitch unloaded successfully!");
-    }
-    else if (s_loaded_champion == "Jinx")
-    {
-        jinx::unload();
-        g_sdk->log_console("[MeowAIO] Jinx unloaded successfully!");
     }
     else if (s_loaded_champion == "Soraka")
     {
