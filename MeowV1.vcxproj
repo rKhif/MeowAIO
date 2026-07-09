@@ -142,7 +142,7 @@
     <ClInclude Include="..\evade_sdk.hpp" />
     <ClInclude Include="..\hp_sdk.hpp" />
     <ClInclude Include="..\infotab_sdk.hpp" />
-    <ClInclude Include="..\math.hpp" />
+    <ClInclude Include="math.hpp" />
     <ClInclude Include="..\native_sdk.hpp" />
     <ClInclude Include="..\notification_sdk.hpp" />
     <ClInclude Include="..\orb_sdk.hpp" />

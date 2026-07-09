@@ -36,7 +36,7 @@
     <ClInclude Include="..\infotab_sdk.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="..\math.hpp">
+    <ClInclude Include="math.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\native_sdk.hpp">
