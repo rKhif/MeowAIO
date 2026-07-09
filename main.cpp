@@ -9,34 +9,44 @@
 #include "MeowV1/zaahen.h"
 #include "MeowV1/syndra.h"
 #include "MeowV1/orianna.h"
-#include "MeowV1/shyvana.h"
 #include "MeowV1/vex.h"
-#include "MeowV1/annie.h"
-#include "MeowV1/katarina.h"
 #include "MeowV1/hwei.h"
+#include "MeowV1/ahri.h"
+#include "MeowV1/ryze.h"
+#include "MeowV1/annie.h"
+#include "MeowV1/taliyah.h"
+#include "MeowV1/aphelios.h"
+#include "MeowV1/zeri.h"
 #include "MeowV1/twitch.h"
+#include "MeowV1/kalista.h"
+#include "MeowV1/nami.h"
+#include "MeowV1/lulu.h"
 #include "MeowV1/soraka.h"
 #include "MeowV1/thresh.h"
 #include "MeowV1/ziggs.h"
+#include "MeowV1/kayle.h"
 
 
 extern "C" __declspec(dllexport) int SDKVersion = SDK_VERSION;
+
+#define MEOWAIO_VERSION "1.0.0"
 
 static std::string s_loaded_champion;
 
 
 static const std::unordered_set<std::string> g_locked_champions = {
-    "Shyvana"
+
+
 };
 
 static const std::unordered_map<std::string, std::unordered_set<std::string>> g_user_allowlist = {
-    // Dev
     { "khif", { "*" } },
     { "losszx", { "*" } },
     { "gaspack", { "*" } },
     { "trixsterfaze", { "*" } },
-    { "xxtimexx", { "*" } },
     { "banshee", { "*" } },
+    { "echidna144a", { "*" } },
+
 
 
 
@@ -79,6 +89,10 @@ bool init_sdk_component(const char* name, bool (*init_func)(), const char* fallb
 extern "C" __declspec(dllexport) bool PluginLoad(core_sdk* sdk, void** custom_sdk)
 {
     g_sdk = sdk;
+    if (!g_sdk)
+        return false;
+
+    g_sdk->log_console("[!] [MeowAIO] v%s built %s %s", MEOWAIO_VERSION, __DATE__, __TIME__);
 
     // Initialize SDK
     init_sdk_component("Orbwalker", sdk_init::orbwalker, " (will use VEN's built-in)");
@@ -96,6 +110,12 @@ extern "C" __declspec(dllexport) bool PluginLoad(core_sdk* sdk, void** custom_sd
     g_sdk->log_console("[+] Module loaded successfully!");
 
 
+    if (!g_sdk->object_manager)
+    {
+        g_sdk->log_console("[!] Object manager not available!");
+        return false;
+    }
+
     auto player = g_sdk->object_manager->get_local_player();
     if (!player)
     {
@@ -106,11 +126,10 @@ extern "C" __declspec(dllexport) bool PluginLoad(core_sdk* sdk, void** custom_sd
     std::string champion_name = player->get_char_name();
     s_loaded_champion = champion_name;
 
-    // Username-based access control (locked champs only)
     std::string username = g_sdk->get_username();
     if (!is_user_allowed(username, champion_name))
     {
-        g_sdk->log_console("[MeowAIO] '%s' is locked >.<'' (user: %s)",
+        g_sdk->log_console("[!] [MeowAIO] '%s' is locked >.<'' (user: %s)",
             champion_name.c_str(), username.c_str());
         s_loaded_champion.clear();
         return false;
@@ -121,11 +140,11 @@ extern "C" __declspec(dllexport) bool PluginLoad(core_sdk* sdk, void** custom_sd
         try
         {
             viktor::load();
-            g_sdk->log_console("[MeowAIO] MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] MEOW!");
         }
         catch (...)
         {
-            g_sdk->log_console("[MeowAIO] Failed to load Viktor MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Viktor MEOW!");
             return false;
         }
     }
@@ -134,11 +153,11 @@ extern "C" __declspec(dllexport) bool PluginLoad(core_sdk* sdk, void** custom_sd
         try
         {
             veigar::load();
-            g_sdk->log_console("[MeowAIO] Veigar loaded MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Veigar loaded MEOW!");
         }
         catch (...)
         {
-            g_sdk->log_console("[MeowAIO] Failed to load Veigar MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Veigar MEOW!");
             return false;
         }
     }
@@ -147,11 +166,11 @@ extern "C" __declspec(dllexport) bool PluginLoad(core_sdk* sdk, void** custom_sd
         try
         {
             zaahen::load();
-            g_sdk->log_console("[MeowAIO] Zaahen loaded MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Zaahen loaded MEOW!");
         }
         catch (...)
         {
-            g_sdk->log_console("[MeowAIO] Failed to load Zaahen MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Zaahen MEOW!");
             return false;
         }
     }
@@ -160,11 +179,11 @@ extern "C" __declspec(dllexport) bool PluginLoad(core_sdk* sdk, void** custom_sd
         try
         {
             syndra::load();
-            g_sdk->log_console("[MeowAIO] Syndra loaded MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Syndra loaded MEOW!");
         }
         catch (...)
         {
-            g_sdk->log_console("[MeowAIO] Failed to load Syndra MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Syndra MEOW!");
             return false;
         }
     }
@@ -173,24 +192,11 @@ extern "C" __declspec(dllexport) bool PluginLoad(core_sdk* sdk, void** custom_sd
         try
         {
             orianna::load();
-            g_sdk->log_console("[MeowAIO] Orianna loaded MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Orianna loaded MEOW!");
         }
         catch (...)
         {
-            g_sdk->log_console("[MeowAIO] Failed to load Orianna MEOW!");
-            return false;
-        }
-    }
-    else if (champion_name == "Shyvana")
-    {
-        try
-        {
-            shyvana::load();
-            g_sdk->log_console("[MeowAIO] Shyvana loaded MEOW!");
-        }
-        catch (...)
-        {
-            g_sdk->log_console("[MeowAIO] Failed to load Shyvana MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Orianna MEOW!");
             return false;
         }
     }
@@ -199,37 +205,11 @@ extern "C" __declspec(dllexport) bool PluginLoad(core_sdk* sdk, void** custom_sd
         try
         {
             vex::load();
-            g_sdk->log_console("[MeowAIO] Vex loaded MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Vex loaded MEOW!");
         }
         catch (...)
         {
-            g_sdk->log_console("[MeowAIO] Failed to load Vex MEOW!");
-            return false;
-        }
-    }
-    else if (champion_name == "Annie")
-    {
-        try
-        {
-            annie::load();
-            g_sdk->log_console("[MeowAIO] Annie loaded MEOW!");
-        }
-        catch (...)
-        {
-            g_sdk->log_console("[MeowAIO] Failed to load Annie MEOW!");
-            return false;
-        }
-    }
-    else if (champion_name == "Katarina")
-    {
-        try
-        {
-            katarina::load();
-            g_sdk->log_console("[MeowAIO] Katarina loaded MEOW!");
-        }
-        catch (...)
-        {
-            g_sdk->log_console("[MeowAIO] Failed to load Katarina MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Vex MEOW!");
             return false;
         }
     }
@@ -238,11 +218,89 @@ extern "C" __declspec(dllexport) bool PluginLoad(core_sdk* sdk, void** custom_sd
         try
         {
             hwei::load();
-            g_sdk->log_console("[MeowAIO] Hwei loaded MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Hwei loaded MEOW!");
         }
         catch (...)
         {
-            g_sdk->log_console("[MeowAIO] Failed to load Hwei MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Hwei MEOW!");
+            return false;
+        }
+    }
+    else if (champion_name == "Ahri")
+    {
+        try
+        {
+            ahri::load();
+            g_sdk->log_console("[!] [MeowAIO] Ahri loaded MEOW!");
+        }
+        catch (...)
+        {
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Ahri MEOW!");
+            return false;
+        }
+    }
+    else if (champion_name == "Ryze")
+    {
+        try
+        {
+            ryze::load();
+            g_sdk->log_console("[!] [MeowAIO] Ryze loaded MEOW!");
+        }
+        catch (...)
+        {
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Ryze MEOW!");
+            return false;
+        }
+    }
+    else if (champion_name == "Annie")
+    {
+        try
+        {
+            annie::load();
+            g_sdk->log_console("[!] [MeowAIO] Annie loaded MEOW!");
+        }
+        catch (...)
+        {
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Annie MEOW!");
+            return false;
+        }
+    }
+    else if (champion_name == "Taliyah")
+    {
+        try
+        {
+            taliyah::load();
+            g_sdk->log_console("[!] [MeowAIO] Taliyah loaded MEOW!");
+        }
+        catch (...)
+        {
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Taliyah MEOW!");
+            return false;
+        }
+    }
+    else if (champion_name == "Aphelios")
+    {
+        try
+        {
+            aphelios::load();
+            g_sdk->log_console("[!] [MeowAIO] Aphelios loaded MEOW!");
+        }
+        catch (...)
+        {
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Aphelios MEOW!");
+            return false;
+        }
+    }
+    else if (champion_name == "Zeri")
+    {
+        try
+        {
+            zeri::load();
+            g_sdk->log_console("[!] [MeowAIO] Zeri loaded MEOW!");
+        }
+        catch (...)
+        {
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Zeri MEOW!");
             return false;
         }
     }
@@ -251,11 +309,50 @@ extern "C" __declspec(dllexport) bool PluginLoad(core_sdk* sdk, void** custom_sd
         try
         {
             twitch::load();
-            g_sdk->log_console("[MeowAIO] Twitch loaded MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Twitch loaded MEOW!");
         }
         catch (...)
         {
-            g_sdk->log_console("[MeowAIO] Failed to load Twitch MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Twitch MEOW!");
+            return false;
+        }
+    }
+    else if (champion_name == "Kalista")
+    {
+        try
+        {
+            kalista::load();
+            g_sdk->log_console("[!] [MeowAIO] Kalista loaded MEOW!");
+        }
+        catch (...)
+        {
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Kalista MEOW!");
+            return false;
+        }
+    }
+    else if (champion_name == "Nami")
+    {
+        try
+        {
+            nami::load();
+            g_sdk->log_console("[!] [MeowAIO] Nami loaded MEOW!");
+        }
+        catch (...)
+        {
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Nami MEOW!");
+            return false;
+        }
+    }
+    else if (champion_name == "Lulu")
+    {
+        try
+        {
+            lulu::load();
+            g_sdk->log_console("[!] [MeowAIO] Lulu loaded MEOW!");
+        }
+        catch (...)
+        {
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Lulu MEOW!");
             return false;
         }
     }
@@ -264,11 +361,11 @@ extern "C" __declspec(dllexport) bool PluginLoad(core_sdk* sdk, void** custom_sd
         try
         {
             soraka::load();
-            g_sdk->log_console("[MeowAIO] Soraka loaded MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Soraka loaded MEOW!");
         }
         catch (...)
         {
-            g_sdk->log_console("[MeowAIO] Failed to load Soraka MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Soraka MEOW!");
             return false;
         }
     }
@@ -277,11 +374,11 @@ extern "C" __declspec(dllexport) bool PluginLoad(core_sdk* sdk, void** custom_sd
         try
         {
             thresh::load();
-            g_sdk->log_console("[MeowAIO] Thresh loaded MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Thresh loaded MEOW!");
         }
         catch (...)
         {
-            g_sdk->log_console("[MeowAIO] Failed to load Thresh MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Thresh MEOW!");
             return false;
         }
     }
@@ -290,18 +387,31 @@ extern "C" __declspec(dllexport) bool PluginLoad(core_sdk* sdk, void** custom_sd
         try
         {
             ziggs::load();
-            g_sdk->log_console("[MeowAIO] Ziggs loaded MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Ziggs loaded MEOW!");
         }
         catch (...)
         {
-            g_sdk->log_console("[MeowAIO] Failed to load Ziggs MEOW!");
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Ziggs MEOW!");
+            return false;
+        }
+    }
+    else if (champion_name == "Kayle")
+    {
+        try
+        {
+            kayle::load();
+            g_sdk->log_console("[!] [MeowAIO] Kayle loaded MEOW!");
+        }
+        catch (...)
+        {
+            g_sdk->log_console("[!] [MeowAIO] Failed to load Kayle MEOW!");
             return false;
         }
     }
     else
     {
-        g_sdk->log_console("[MeowAIO] Champion not supported >.<'' (Current: %s)", champion_name.c_str());
-        g_sdk->log_console("[MeowAIO] Supported champions: Viktor, Veigar, Zaahen, Syndra, Orianna, Shyvana, Vex, Annie, Katarina, Hwei, Twitch, Soraka, Thresh, Ziggs");
+        g_sdk->log_console("[!] [MeowAIO] Champion not supported >.<'' (Current: %s)", champion_name.c_str());
+        g_sdk->log_console("[!] [MeowAIO] Supported champions: Viktor, Veigar, Zaahen, Syndra, Orianna, Vex, Hwei, Ahri, Ryze, Annie, Taliyah, Aphelios, Zeri, Twitch, Kalista, Nami, Lulu, Soraka, Thresh, Ziggs, Kayle");
         return false;
     }
 
@@ -310,78 +420,114 @@ extern "C" __declspec(dllexport) bool PluginLoad(core_sdk* sdk, void** custom_sd
 
 extern "C" __declspec(dllexport) void PluginUnload()
 {
+    if (!g_sdk)
+        return;
 
     if (s_loaded_champion == "Viktor")
     {
         viktor::unload();
-        g_sdk->log_console("[MeowAIO] Viktor unloaded successfully!");
+        g_sdk->log_console("[!] [MeowAIO] Viktor unloaded successfully!");
     }
     else if (s_loaded_champion == "Veigar")
     {
         veigar::unload();
-        g_sdk->log_console("[MeowAIO] Veigar unloaded successfully!");
+        g_sdk->log_console("[!] [MeowAIO] Veigar unloaded successfully!");
     }
     else if (s_loaded_champion == "Zaahen")
     {
         zaahen::unload();
-        g_sdk->log_console("[MeowAIO] Zaahen unloaded successfully!");
+        g_sdk->log_console("[!] [MeowAIO] Zaahen unloaded successfully!");
     }
     else if (s_loaded_champion == "Syndra")
     {
         syndra::unload();
-        g_sdk->log_console("[MeowAIO] Syndra unloaded successfully!");
+        g_sdk->log_console("[!] [MeowAIO] Syndra unloaded successfully!");
     }
     else if (s_loaded_champion == "Orianna")
     {
         orianna::unload();
-        g_sdk->log_console("[MeowAIO] Orianna unloaded successfully!");
-    }
-    else if (s_loaded_champion == "Shyvana")
-    {
-        shyvana::unload();
-        g_sdk->log_console("[MeowAIO] Shyvana unloaded successfully!");
+        g_sdk->log_console("[!] [MeowAIO] Orianna unloaded successfully!");
     }
     else if (s_loaded_champion == "Vex")
     {
         vex::unload();
-        g_sdk->log_console("[MeowAIO] Vex unloaded successfully!");
-    }
-    else if (s_loaded_champion == "Annie")
-    {
-        annie::unload();
-        g_sdk->log_console("[MeowAIO] Annie unloaded successfully!");
-    }
-    else if (s_loaded_champion == "Katarina")
-    {
-        katarina::unload();
-        g_sdk->log_console("[MeowAIO] Katarina unloaded successfully!");
+        g_sdk->log_console("[!] [MeowAIO] Vex unloaded successfully!");
     }
     else if (s_loaded_champion == "Hwei")
     {
         hwei::unload();
-        g_sdk->log_console("[MeowAIO] Hwei unloaded successfully!");
+        g_sdk->log_console("[!] [MeowAIO] Hwei unloaded successfully!");
+    }
+    else if (s_loaded_champion == "Ahri")
+    {
+        ahri::unload();
+        g_sdk->log_console("[!] [MeowAIO] Ahri unloaded successfully!");
+    }
+    else if (s_loaded_champion == "Ryze")
+    {
+        ryze::unload();
+        g_sdk->log_console("[!] [MeowAIO] Ryze unloaded successfully!");
+    }
+    else if (s_loaded_champion == "Annie")
+    {
+        annie::unload();
+        g_sdk->log_console("[!] [MeowAIO] Annie unloaded successfully!");
+    }
+    else if (s_loaded_champion == "Taliyah")
+    {
+        taliyah::unload();
+        g_sdk->log_console("[!] [MeowAIO] Taliyah unloaded successfully!");
+    }
+    else if (s_loaded_champion == "Aphelios")
+    {
+        aphelios::unload();
+        g_sdk->log_console("[!] [MeowAIO] Aphelios unloaded successfully!");
+    }
+    else if (s_loaded_champion == "Zeri")
+    {
+        zeri::unload();
+        g_sdk->log_console("[!] [MeowAIO] Zeri unloaded successfully!");
     }
     else if (s_loaded_champion == "Twitch")
     {
         twitch::unload();
-        g_sdk->log_console("[MeowAIO] Twitch unloaded successfully!");
+        g_sdk->log_console("[!] [MeowAIO] Twitch unloaded successfully!");
+    }
+    else if (s_loaded_champion == "Kalista")
+    {
+        kalista::unload();
+        g_sdk->log_console("[!] [MeowAIO] Kalista unloaded successfully!");
+    }
+    else if (s_loaded_champion == "Nami")
+    {
+        nami::unload();
+        g_sdk->log_console("[!] [MeowAIO] Nami unloaded successfully!");
+    }
+    else if (s_loaded_champion == "Lulu")
+    {
+        lulu::unload();
+        g_sdk->log_console("[!] [MeowAIO] Lulu unloaded successfully!");
     }
     else if (s_loaded_champion == "Soraka")
     {
         soraka::unload();
-        g_sdk->log_console("[MeowAIO] Soraka unloaded successfully!");
+        g_sdk->log_console("[!] [MeowAIO] Soraka unloaded successfully!");
     }
     else if (s_loaded_champion == "Thresh")
     {
         thresh::unload();
-        g_sdk->log_console("[MeowAIO] Thresh unloaded successfully!");
+        g_sdk->log_console("[!] [MeowAIO] Thresh unloaded successfully!");
     }
     else if (s_loaded_champion == "Ziggs")
     {
         ziggs::unload();
-        g_sdk->log_console("[MeowAIO] Ziggs unloaded successfully!");
+        g_sdk->log_console("[!] [MeowAIO] Ziggs unloaded successfully!");
     }
-
+    else if (s_loaded_champion == "Kayle")
+    {
+        kayle::unload();
+        g_sdk->log_console("[!] [MeowAIO] Kayle unloaded successfully!");
+    }
     sdk::orbwalker = nullptr;
     sdk::target_selector = nullptr;
     sdk::prediction = nullptr;

@@ -177,7 +177,7 @@
     <ClInclude Include="kayle.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="..\main.cpp" />
+    <ClCompile Include="main.cpp" />
     <ClCompile Include="aphelios.cpp" />
     <ClCompile Include="zeri.cpp" />
     <ClCompile Include="annie.cpp" />
