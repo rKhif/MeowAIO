@@ -143,6 +143,13 @@
     <ClInclude Include="..\hp_sdk.hpp" />
     <ClInclude Include="..\infotab_sdk.hpp" />
     <ClInclude Include="math.hpp" />
+    <ClInclude Include="math\geometry.hpp" />
+    <ClInclude Include="damage\calc.hpp" />
+    <ClInclude Include="db\core\enums.hpp" />
+    <ClInclude Include="db\core\structs.hpp" />
+    <ClInclude Include="db\champions\veigar.hpp" />
+    <ClInclude Include="db\champions\syndra.hpp" />
+    <ClInclude Include="db\champions\ryze.hpp" />
     <ClInclude Include="utility\defensive_buffs.hpp" />
     <ClInclude Include="utility\helpers.hpp" />
     <ClInclude Include="..\native_sdk.hpp" />
