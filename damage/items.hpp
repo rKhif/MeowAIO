@@ -52,29 +52,49 @@ namespace rune_values
 
 namespace item_id
 {
+    inline constexpr int FAERIE_CHARM           = 1004;
+    inline constexpr int BLASTING_WAND          = 1026;
+    inline constexpr int AMPLIFYING_TOME        = 1052;
     inline constexpr int DORANS_RING            = 1056;
+    inline constexpr int SEEKERS_ARMGUARD       = 2420;
+    inline constexpr int FATED_ASHES            = 2508;
+    inline constexpr int ARCHANGELS_STAFF       = 3003;
     inline constexpr int BLACKFIRE_TORCH       = 2503;
     inline constexpr int SORCERERS_SHOES       = 3020;
+    inline constexpr int SERAPHS_EMBRACE        = 3040;
     inline constexpr int MEJAIS_SOULSTEALER    = 3041;
     inline constexpr int RABADONS_DEATHCAP     = 3089;
     inline constexpr int LICH_BANE              = 3100;
     inline constexpr int BANSHEES_VEIL          = 3102;
+    inline constexpr int FIENDISH_CODEX         = 3108;
     inline constexpr int MALIGNANCE             = 3118;
     inline constexpr int VOID_STAFF             = 3135;
     inline constexpr int CRYPTBLOOM             = 3137;
+    inline constexpr int HEXTECH_ALTERNATOR     = 3145;
+    inline constexpr int HAUNTING_GUISE         = 3147;
     inline constexpr int HEXTECH_ROCKETBELT     = 3152;
     inline constexpr int ZHONYAS_HOURGLASS      = 3157;
     inline constexpr int MORELLONOMICON         = 3165;
+    inline constexpr int LOST_CHAPTER           = 3802;
     inline constexpr int HORIZON_FOCUS          = 4628;
     inline constexpr int COSMIC_DRIVE           = 4629;
     inline constexpr int SHADOWFLAME            = 4645;
+    inline constexpr int STORMSURGE             = 4646;
     inline constexpr int LIANDRYS_TORMENT       = 6653;
     inline constexpr int LUDENS_ECHO             = 6655;
+    inline constexpr int ROD_OF_AGES            = 6657;
 }
 
 namespace dorans_ring
 {
     inline constexpr float MINION_DAMAGE = 5.f;
+}
+
+namespace fated_ashes
+{
+    inline constexpr int   MAX_TICKS          = 6;
+    inline constexpr float DAMAGE_PER_TICK    = 2.5f;
+    inline constexpr float MONSTER_BONUS_TICK = 7.5f;
 }
 
 namespace blackfire_torch
@@ -89,6 +109,11 @@ namespace hextech_rocketbelt
 {
     inline constexpr float BASE_DAMAGE = 100.f;
     inline constexpr float AP_RATIO    = 0.10f;
+}
+
+namespace hextech_alternator
+{
+    inline constexpr float BASE_DAMAGE = 65.f;
 }
 
 namespace liandrys_torment
@@ -131,6 +156,13 @@ namespace horizon_focus
 {
     inline constexpr float HYPERSHOT_RANGE    = 600.f;
     inline constexpr float DAMAGE_MULTIPLIER  = 1.10f;
+}
+
+namespace stormsurge
+{
+    inline constexpr float TRIGGER_MAX_HP_RATIO = 0.25f;
+    inline constexpr float BASE_DAMAGE          = 125.f;
+    inline constexpr float AP_RATIO             = 0.10f;
 }
 
 // Backward-compatible name from the first version of this helper.
@@ -252,7 +284,8 @@ inline float liandrys_suffering_multiplier( game_object* source, game_object* ta
                                             int combat_stacks ) noexcept
 {
     if ( !source || !target || !target->is_hero()
-         || !has_item( source, item_id::LIANDRYS_TORMENT ) )
+         || ( !has_item( source, item_id::LIANDRYS_TORMENT )
+              && !has_item( source, item_id::HAUNTING_GUISE ) ) )
         return 1.f;
 
     combat_stacks = ( std::clamp )( combat_stacks, 0, liandrys_torment::MAX_SUFFERING_STACKS );
@@ -355,6 +388,75 @@ inline float dorans_ring_damage( game_object* source, game_object* target ) noex
     return sdk::damage
         ? sdk::damage->calc_damage( dmg_sdk::damage_type::physical, source, target, raw )
         : raw;
+}
+
+inline float hextech_alternator_raw_damage( game_object* source, game_object* target,
+                                            bool revved_ready = true ) noexcept
+{
+    if ( !revved_ready || !source || !target || !target->is_hero()
+         || !has_item( source, item_id::HEXTECH_ALTERNATOR ) )
+        return 0.f;
+
+    return hextech_alternator::BASE_DAMAGE;
+}
+
+inline float hextech_alternator_damage( game_object* source, game_object* target,
+                                        bool revved_ready = true,
+                                        int liandry_combat_stacks = 0,
+                                        bool horizon_focus_active = false ) noexcept
+{
+    return magic_damage( source, target,
+        hextech_alternator_raw_damage( source, target, revved_ready ),
+        liandry_combat_stacks, horizon_focus_active );
+}
+
+inline float stormsurge_trigger_damage( game_object* target ) noexcept
+{
+    return target ? target->get_max_hp() * stormsurge::TRIGGER_MAX_HP_RATIO : 0.f;
+}
+
+inline float stormsurge_raw_damage( game_object* source, game_object* target,
+                                    bool squall_triggered = true ) noexcept
+{
+    if ( !squall_triggered || !source || !target || !target->is_hero()
+         || !has_item( source, item_id::STORMSURGE ) )
+        return 0.f;
+
+    return stormsurge::BASE_DAMAGE
+        + stormsurge::AP_RATIO * source->get_ability_power();
+}
+
+inline float stormsurge_damage( game_object* source, game_object* target,
+                                bool squall_triggered = true,
+                                int liandry_combat_stacks = 0,
+                                bool horizon_focus_active = false ) noexcept
+{
+    return magic_damage( source, target,
+        stormsurge_raw_damage( source, target, squall_triggered ),
+        liandry_combat_stacks, horizon_focus_active );
+}
+
+inline float fated_ashes_raw_damage( game_object* source, game_object* target,
+                                     int ticks = fated_ashes::MAX_TICKS ) noexcept
+{
+    if ( !source || !target || !has_item( source, item_id::FATED_ASHES ) ) return 0.f;
+
+    ticks = ( std::clamp )( ticks, 0, fated_ashes::MAX_TICKS );
+    float damage_per_tick = fated_ashes::DAMAGE_PER_TICK;
+    if ( target->is_monster() )
+        damage_per_tick += fated_ashes::MONSTER_BONUS_TICK;
+
+    return damage_per_tick * static_cast< float >( ticks );
+}
+
+inline float fated_ashes_damage( game_object* source, game_object* target,
+                                 int ticks = fated_ashes::MAX_TICKS,
+                                 int liandry_combat_stacks = 0,
+                                 bool horizon_focus_active = false ) noexcept
+{
+    return magic_damage( source, target,
+        fated_ashes_raw_damage( source, target, ticks ),
+        liandry_combat_stacks, horizon_focus_active );
 }
 
 inline float blackfire_torch_raw_damage( game_object* source, game_object* target,
@@ -478,11 +580,14 @@ inline float ludens_echo_damage( game_object* source, game_object* target,
 
 struct ability_proc_context
 {
+    int fated_ashes_ticks      = fated_ashes::MAX_TICKS;
     int blackfire_ticks       = blackfire_torch::MAX_TICKS;
     int liandry_ticks         = liandrys_torment::MAX_TICKS;
     int malignance_ticks      = 0;
     int ludens_echoes_primary = 1;
     int liandry_combat_stacks = 0;
+    bool hextech_alternator_ready = true;
+    bool stormsurge_triggered = false;
     bool horizon_focus_active = false;
 };
 
@@ -494,10 +599,14 @@ inline float on_ability_damage( game_object* source, game_object* target,
     if ( !source || !target ) return 0.f;
 
     float raw = 0.f;
+    raw += fated_ashes_raw_damage( source, target, context.fated_ashes_ticks );
     raw += blackfire_torch_raw_damage( source, target, context.blackfire_ticks );
     raw += liandrys_torment_raw_damage( source, target, context.liandry_ticks );
     raw += malignance_raw_damage( source, target, context.malignance_ticks );
     raw += ludens_echo_raw_damage( source, context.ludens_echoes_primary );
+    raw += hextech_alternator_raw_damage( source, target,
+        context.hextech_alternator_ready );
+    raw += stormsurge_raw_damage( source, target, context.stormsurge_triggered );
     return magic_damage( source, target, raw, context.liandry_combat_stacks,
         context.horizon_focus_active );
 }

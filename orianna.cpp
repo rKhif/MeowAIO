@@ -1,4 +1,5 @@
 #include "orianna.h"
+#include "damage/items.hpp"
 
 #include <cstring>
 #include <cmath>
@@ -498,6 +499,39 @@ namespace orianna
         return Q_CAST_TIME + dist / spell_data::ball_q_missile_speed;
     }
 
+    static float get_ability_proc_damage(game_object* player, game_object* target,
+                                         int malignance_ticks = 0)
+    {
+        meow::item_damage::ability_proc_context item_context{};
+        item_context.malignance_ticks = malignance_ticks;
+
+        meow::item_damage::ability_rune_context rune_context{};
+        rune_context.cast_distance = player && target
+            ? player->get_position().distance(target->get_position()) : 0.f;
+
+        return meow::item_damage::on_ability_damage(player, target, item_context)
+            + meow::item_damage::on_ability_rune_damage(player, target, rune_context);
+    }
+
+    static float get_spell_damage(game_object* target, int slot, bool include_procs = true)
+    {
+        if (!target || !sdk::damage) return 0.f;
+        auto player = g_sdk->object_manager->get_local_player();
+        if (!player || !is_spell_learned(slot)) return 0.f;
+
+        float damage = meow::item_damage::apply_magic_damage_modifiers(
+            player, target, sdk::damage->get_spell_damage(player, target, slot));
+
+        const bool is_ultimate = slot == SLOT_R;
+        if (is_ultimate)
+            damage *= meow::item_damage::axiom_arcanist_multiplier(player, true, true);
+
+        if (include_procs)
+            damage += get_ability_proc_damage(player, target, is_ultimate ? 2 : 0);
+
+        return damage;
+    }
+
     static bool is_r_killable(game_object* target)
     {
         if (!target || !sdk::damage) return false;
@@ -505,7 +539,7 @@ namespace orianna
         if (!p || !is_spell_learned(SLOT_R)) return false;
         const float ehp = predicted_effective_hp(target, R_CAST_DELAY);
         if (ehp <= 0.f) return false;  // dying to in-flight damage — save R
-        const float dmg = sdk::damage->get_spell_damage(p, target, SLOT_R);
+        const float dmg = get_spell_damage(target, SLOT_R);
         return dmg >= ehp;
     }
 
@@ -516,7 +550,7 @@ namespace orianna
         if (!p || !is_spell_learned(SLOT_Q)) return false;
         const float ehp = predicted_effective_hp(target, q_impact_time(target));
         if (ehp <= 0.f) return false;  // dying to in-flight damage — save Q
-        const float dmg = sdk::damage->get_spell_damage(p, target, SLOT_Q);
+        const float dmg = get_spell_damage(target, SLOT_Q);
         return dmg >= ehp;
     }
 
@@ -1560,7 +1594,7 @@ namespace orianna
             if (h->get_team_id() == p->get_team_id()) continue;
             if (!h->is_visible()) continue;
 
-            const float dmg = sdk::damage->get_spell_damage(p, h, SLOT_R);
+            const float dmg = get_spell_damage(h, SLOT_R);
             if (dmg <= 0.f) continue;
 
             const float hp  = h->get_hp();

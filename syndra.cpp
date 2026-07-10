@@ -8,6 +8,7 @@
 #include "utility/defensive_buffs.hpp"
 #include "utility/helpers.hpp"
 #include "damage/calc.hpp"
+#include "damage/items.hpp"
 #include "db/champions/syndra.hpp"
 
 namespace syndra
@@ -318,6 +319,44 @@ namespace syndra
         };
     }
 
+    static bool horizon_focus_active(game_object* player, game_object* target)
+    {
+        return player && target
+            && player->get_position().distance(target->get_position())
+                >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+    }
+
+    static float apply_spell_item_rune_modifiers(game_object* player,
+                                                  game_object* target,
+                                                  float damage,
+                                                  bool is_ultimate = false,
+                                                  bool is_aoe = false)
+    {
+        if (!player || !target || damage <= 0.f) return 0.f;
+
+        return meow::item_damage::apply_magic_damage_modifiers(
+            player, target, damage, 0, horizon_focus_active(player, target))
+            * meow::item_damage::axiom_arcanist_multiplier(
+                player, is_ultimate, is_aoe);
+    }
+
+    static float get_ability_proc_damage(game_object* player,
+                                         game_object* target,
+                                         int malignance_ticks = 0)
+    {
+        if (!player || !target) return 0.f;
+
+        meow::item_damage::ability_proc_context item_context{};
+        item_context.malignance_ticks = malignance_ticks;
+        item_context.horizon_focus_active = horizon_focus_active(player, target);
+
+        meow::item_damage::ability_rune_context rune_context{};
+        rune_context.cast_distance = player->get_position().distance(target->get_position());
+
+        return meow::item_damage::on_ability_damage(player, target, item_context)
+            + meow::item_damage::on_ability_rune_damage(player, target, rune_context);
+    }
+
     // Returns the post-mitigation damage of one R sphere.
     static float r_damage_per_sphere(game_object* target)
     {
@@ -335,7 +374,7 @@ namespace syndra
             armor_pen, make_magic_pen(p));
     }
 
-    static float get_w_damage(game_object* target)
+    static float get_w_damage(game_object* target, bool include_procs = true)
     {
         auto p = g_sdk->object_manager->get_local_player();
         if (!p || !target) return 0.f;
@@ -356,12 +395,26 @@ namespace syndra
                               + spell_data::w_true_dmg_scale * (ap / 100.f);
             dmg += dmg * scale;
         }
+        dmg = apply_spell_item_rune_modifiers(p, target, dmg, false, true);
+        if (include_procs)
+            dmg += get_ability_proc_damage(p, target);
         return dmg;
     }
 
-    static float get_r_damage(game_object* target, int total_spheres)
+    static float get_r_damage(game_object* target, int total_spheres,
+                              bool include_procs = true)
     {
-        return r_damage_per_sphere(target) * static_cast<float>(total_spheres);
+        auto p = g_sdk->object_manager->get_local_player();
+        if (!p || !target || total_spheres <= 0) return 0.f;
+
+        float dmg = r_damage_per_sphere(target) * static_cast<float>(total_spheres);
+        dmg = apply_spell_item_rune_modifiers(p, target, dmg, true, false);
+
+        // Burns, Luden/Alternator, and ability-triggered runes are shared by
+        // the cast, so add them once rather than once per R sphere.
+        if (include_procs)
+            dmg += get_ability_proc_damage(p, target, 2);
+        return dmg;
     }
 
     static bool can_r_kill(game_object* target, int total_spheres)
