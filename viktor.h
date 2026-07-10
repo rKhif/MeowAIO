@@ -20,6 +20,7 @@ namespace viktor
         // Q: Siphon Power — targeted single-target.
         constexpr float q_range = 715.f;
         constexpr float q_cast_time = 0.25f;
+        constexpr float q_missile_speed = 2000.f;
 
         // W: Gravity Fiel.
         constexpr float w_range = 800.f;
@@ -107,8 +108,6 @@ namespace viktor
 
         // E
         inline int  e_hitchance = 65;
-        inline bool log_e_casts = false;
-
         // R
         inline bool r_only_killable = false;
         inline int  min_enemies_for_r = 1;
@@ -180,9 +179,9 @@ namespace viktor
     // enemies. Falls back to primary when only one is in range.
     game_object* get_best_e_aim_target(game_object* primary);
 
-    float get_q_damage(game_object* target);
-    float get_e_damage(game_object* target);
-    float get_r_damage(game_object* target);
+    float get_q_damage(game_object* target, bool include_items = true);
+    float get_e_damage(game_object* target, bool include_items = true);
+    float get_r_damage(game_object* target, bool include_items = true);
     // Total Viktor combo damage (every learned spell + one AA) — used to gate
     // R "is this actually killable" decisions.
     float get_combo_damage(game_object* target);

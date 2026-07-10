@@ -1,6 +1,6 @@
 #include "viktor.h"
 #include "utility/minion_manager.hpp"
-#include "math/geometry.hpp"
+#include "damage/items.hpp"
 #include <algorithm>
 #include <cfloat>
 #include <vector>
@@ -19,31 +19,10 @@ namespace viktor
     static float        last_q_harass_time = 0.f;
     static float        last_q_lasthit_time = 0.f;
     static bool         anti_gap_w_fired = false;
+    static bool         m_loaded = false;
 
     static float        m_last_spell_cast_time = 0.f;
     static constexpr float MIN_SPELL_DELAY = 0.1f;
-
-    struct e_cast_log
-    {
-        bool          armed         = false;
-        uint32_t      target_net_id = 0;
-        std::string   target_name;
-        math::vector3 fp{};
-        math::vector3 cp{};
-        float         eval_time     = 0.f;
-        float         tgt_dist_at_cast = 0.f;
-        float         tgt_speed_at_cast = 0.f;
-        const char*   branch        = "?";
-    };
-    static e_cast_log m_e_log{};
-
-    template <typename... Args>
-    static inline void log_e(const char* fmt, Args&&... args)
-    {
-        if (!menu::log_e_casts) return;
-        if (!g_sdk) return;
-        g_sdk->log_console(fmt, std::forward<Args>(args)...);
-    }
 
     // Q scheduled by on_before_attack, consumed in on_update.
     static bool         m_q_scheduled         = false;
@@ -52,6 +31,13 @@ namespace viktor
     // on_before_attack and the on_update that consumes it.
     static uint32_t     m_q_scheduled_tgt_id  = 0;
     static constexpr float Q_AA_CAST_DELAY   = 0.05f;
+
+    static void clear_scheduled_q()
+    {
+        m_q_scheduled        = false;
+        m_q_scheduled_time   = 0.f;
+        m_q_scheduled_tgt_id = 0;
+    }
 
     static constexpr float R_SEARCH_RADIUS    = 700.f;
     static constexpr float W_MIN_DIST         = 50.f;
@@ -186,6 +172,14 @@ namespace viktor
         return std::sqrt(dx * dx + dz * dz);
     }
 
+    static float q_impact_delay(game_object* player, game_object* target)
+    {
+        if (!player || !target) return spell_data::q_cast_time;
+        const float travel = player->get_position().distance(target->get_position())
+                           / spell_data::q_missile_speed;
+        return spell_data::q_cast_time + travel;
+    }
+
     static math::vector3 direction_2d(const math::vector3& from, const math::vector3& to)
     {
         const float dx = to.x - from.x;
@@ -249,12 +243,15 @@ namespace viktor
         if (dist > q_range) return false;
 
         float hp = m->get_hp();
-        const float q_dmg = get_q_damage(m);
+        // Last-hitting must use damage dealt on Q impact only. Counting full
+        // Liandry/Blackfire burns or Luden here makes Q cast on a minion the
+        // projectile itself cannot secure.
+        const float q_dmg = get_q_damage(m, false);
         if (q_dmg <= 0.f) return false;
 
         if (g_sdk->clock_facade)
         {
-            const float prediction_time = now + spell_data::q_cast_time;
+            const float prediction_time = now + q_impact_delay(player, m);
             float predicted_hp = predict_health(m, prediction_time);
             if (predicted_hp > 0.f
                 && predicted_hp <= m->get_max_hp()
@@ -265,9 +262,11 @@ namespace viktor
             }
         }
 
-        // 15% / 15-HP safety margin (Viktor's existing tuning, looser than
-        const float pct_margin   = q_dmg * 0.15f;
-        const float fixed_margin = 15.f;
+        // Health prediction already targets projectile impact. Keep only a
+        // small tolerance so Q is sent early enough instead of waiting until
+        // the minion is nearly dead.
+        const float pct_margin   = q_dmg * 0.05f;
+        const float fixed_margin = 5.f;
         const float safety       = std::max(pct_margin, fixed_margin);
         if (hp <= 0.f || hp > q_dmg - safety) return false;
 
@@ -542,11 +541,17 @@ namespace viktor
         { return; }
 
         if (g_sdk->is_chat_open() || g_sdk->is_shop_open())
+        {
+            clear_scheduled_q();
             return;
+        }
 
         auto player = g_sdk->object_manager->get_local_player();
         if (!player || player->is_dead())
+        {
+            clear_scheduled_q();
             return;
+        }
 
         // Consume scheduled Q from on_before_attack. Recheck everything in
         // case combo()/harass() already fired Q or the target became invalid.
@@ -556,59 +561,40 @@ namespace viktor
             if (now_q >= m_q_scheduled_time)
             {
                 auto* tgt = g_sdk->object_manager->get_object_by_network_id(m_q_scheduled_tgt_id);
-                if (tgt && tgt->is_valid() && !tgt->is_dead() && tgt->is_targetable()
-                    && is_spell_learned(SLOT_Q) && is_spell_ready(SLOT_Q) && has_enough_mana(SLOT_Q)
-                    && !is_discharge_ready(player))
+                const bool in_combo  = sdk::orbwalker && sdk::orbwalker->combo();
+                const bool in_harass = sdk::orbwalker && sdk::orbwalker->harass();
+
+                bool mode_ok = in_combo && menu::use_q_combo;
+                if (in_harass && menu::use_q_harass)
+                {
+                    const float max_par = player->get_max_par();
+                    const float mana_pct = max_par > 0.f
+                        ? (player->get_par() / max_par) * 100.f : 0.f;
+                    mode_ok = mana_pct >= static_cast<float>(menu::harass_mana_percent);
+                }
+
+                bool target_ok = tgt && tgt->is_hero() && tgt->is_valid()
+                              && !tgt->is_dead() && tgt->is_targetable();
+                if (target_ok)
+                {
+                    auto q = player->get_spell(SLOT_Q);
+                    const float reach = q ? q->get_cast_range()
+                        + player->get_bounding_radius() + tgt->get_bounding_radius() : 0.f;
+                    target_ok = player->get_position().distance(tgt->get_position()) <= reach;
+                }
+
+                const bool attack_ok = !sdk::orbwalker || !sdk::orbwalker->would_cancel_attack();
+                if (mode_ok && target_ok && attack_ok
+                    && is_spell_learned(SLOT_Q) && is_spell_ready(SLOT_Q)
+                    && has_enough_mana(SLOT_Q) && !is_discharge_ready(player))
                 {
                     if (cast_q(tgt))
-                        last_q_combo_time = now_q;
-                }
-                m_q_scheduled        = false;
-                m_q_scheduled_tgt_id = 0;
-            }
-        }
-
-        // E beam-end miss diagnostic — fires at beam end, logs target drift
-        // from the beam axis.
-        if (m_e_log.armed)
-        {
-            const float now_e_eval = g_sdk->clock_facade->get_game_time();
-            if (now_e_eval >= m_e_log.eval_time)
-            {
-                auto* tgt = g_sdk->object_manager->get_object_by_network_id(m_e_log.target_net_id);
-                if (tgt && tgt->is_valid() && !tgt->is_dead())
-                {
-                    const auto p   = tgt->get_position();
-                    const auto& a  = m_e_log.fp;
-                    const auto& b  = m_e_log.cp;
-                    const float dx = b.x - a.x, dz = b.z - a.z;
-                    const float len_sq = dx * dx + dz * dz;
-                    float seg_dist = 0.f;
-                    if (len_sq > 0.f)
                     {
-                        const float t = std::clamp(((p.x - a.x) * dx + (p.z - a.z) * dz) / len_sq, 0.f, 1.f);
-                        const float ex = p.x - (a.x + t * dx);
-                        const float ez = p.z - (a.z + t * dz);
-                        seg_dist = std::sqrt(ex * ex + ez * ez);
+                        if (in_combo) last_q_combo_time = now_q;
+                        else          last_q_harass_time = now_q;
                     }
-                    const float hit_r = spell_data::e_radius + venplus::unit_gameplay_radius(tgt);
-                    const float drift_from_cast = p.distance({
-                        m_e_log.fp.x + dx * 0.5f, p.y, m_e_log.fp.z + dz * 0.5f
-                    });
-                    const bool likely_hit = seg_dist <= hit_r;
-
-                    log_e("[E] %s tgt=%s d_at_cast=%.0f vel_at_cast=%.0f beam_drift=%.0f (hit_r=%.0f) center_drift=%.0f branch=%s",
-                          likely_hit ? "HIT?" : "MISS?",
-                          m_e_log.target_name.c_str(),
-                          m_e_log.tgt_dist_at_cast, m_e_log.tgt_speed_at_cast,
-                          seg_dist, hit_r, drift_from_cast, m_e_log.branch);
                 }
-                else
-                {
-                    log_e("[E] eval: target gone (died/invalid) tgt=%s",
-                          m_e_log.target_name.c_str());
-                }
-                m_e_log.armed = false;
+                clear_scheduled_q();
             }
         }
 
@@ -616,8 +602,7 @@ namespace viktor
         stasis_e();
         auto_w_on_cc();
 
-        if (!sdk::orbwalker || !sdk::orbwalker->harass() || menu::use_w_harass)
-        { anti_gap_w(); }
+        anti_gap_w();
 
         if (menu::auto_r_movement)
         { auto_r(); }
@@ -662,7 +647,6 @@ namespace viktor
                 const int q_lvl = q_spell ? std::clamp(q_spell->get_level(), 0, 5) : 0;
                 constexpr float Q_AA_BONUS_BASE[] = { 0.f, 20.f, 45.f, 70.f, 95.f, 120.f };
                 const float q_aa_bonus_magic = Q_AA_BONUS_BASE[q_lvl] + player->get_ability_power() * 0.5f;
-                const float base_ad = player->get_attack_damage();
 
                 game_object* best_aa_target = nullptr;
                 float        best_aa_score = FLT_MAX;
@@ -684,7 +668,12 @@ namespace viktor
                             hp = predicted_hp;
                     }
 
-                    float empowered_aa_dmg = base_ad;
+                    const float regular_aa_dmg = (sdk::damage
+                        ? sdk::damage->get_aa_damage(player, minion)
+                        : player->get_attack_damage())
+                        + meow::item_damage::on_basic_attack(player, minion);
+
+                    float empowered_aa_dmg = regular_aa_dmg;
                     if (sdk::damage)
                         empowered_aa_dmg += sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, minion, q_aa_bonus_magic);
                     else
@@ -693,7 +682,6 @@ namespace viktor
                     if (hp > 0.f && hp <= empowered_aa_dmg)
                     {
                         float score = hp;
-                        const float regular_aa_dmg = base_ad;
                         const bool can_lasthit_regular = hp <= regular_aa_dmg;
 
                         const float hp_percent = minion->get_max_hp() > 0.f ? hp / minion->get_max_hp() : 1.f;
@@ -701,8 +689,9 @@ namespace viktor
                         else if (hp_percent <= 0.2f) score -= 500.f;
                         else if (hp_percent <= 0.3f) score -= 200.f;
 
-                        // Prefer minions a regular AA already kills — those won't waste the empower.
-                        if (can_lasthit_regular) score -= 5000.f;
+                        // Preserve Discharge value by preferring minions that
+                        // require the empowered hit to die.
+                        if (can_lasthit_regular) score += 5000.f;
 
                         if (minion->is_lane_minion_super()) score -= 20000.f;
                         else if (minion->is_lane_minion_siege()) score -= 10000.f;
@@ -1139,7 +1128,7 @@ namespace viktor
                     const float dist_to_target = minion->get_position().distance(tpos);
                     float score = dist_to_target;
 
-                    const float q_dmg = get_q_damage(minion);
+                    const float q_dmg = get_q_damage(minion, false);
                     float hp = minion->get_hp();
                     if (g_sdk->clock_facade)
                     {
@@ -1225,7 +1214,7 @@ namespace viktor
 
         if (best)
         {
-            if (sdk::orbwalker && !sdk::orbwalker->can_spell(best, spell_data::q_cast_time))
+            if (sdk::orbwalker && !sdk::orbwalker->can_spell(best, q_impact_delay(player, best)))
                 return;
 
             if (cast_q(best))
@@ -1285,7 +1274,7 @@ namespace viktor
 
                 if (best)
                 {
-                            if (sdk::orbwalker && !sdk::orbwalker->can_spell(best, spell_data::q_cast_time))
+                            if (sdk::orbwalker && !sdk::orbwalker->can_spell(best, q_impact_delay(player, best)))
                         return;
 
                     cast_q(best);
@@ -1365,7 +1354,9 @@ namespace viktor
         auto& target_e_dmg = scratch::farm_e_dmg();
         target_e_dmg.reserve(targets.size());
         for (auto t : targets)
-            target_e_dmg.push_back(get_e_damage(t));
+            // Farm geometry needs direct E damage, not delayed item/rune procs
+            // that are shared by the whole cast and may not be ready.
+            target_e_dmg.push_back(get_e_damage(t, false));
 
         // Record the actual (fp, cp) pair — reconstructing geometry from a
         // single aim point would turn perpendicular sweeps into diagonals.
@@ -2555,7 +2546,6 @@ namespace viktor
 
         const float speed   = spell_data::e_speed;   // laser projectile speed
         const float windup  = spell_data::e_delay;    // cast windup before the laser travels
-        const float tgt_spd = std::sqrt(spd_sq);
         // Beam half-width plus the target's body: the laser only has to reach
         // the hitbox edge to connect, not the center. unit_gameplay_radius
         // matches the engine hitbox and the farm/multi-hit counters.
@@ -2588,12 +2578,10 @@ namespace viktor
 
         // ---- Resolve the aim point (where the target is when the laser hits) ----
         math::vector3 aim    = tpos;
-        const char*   branch = "still";
 
         if (immobile || nearly_still)
         {
             aim    = tpos; // not moving -> hit the live position
-            branch = immobile ? "cc" : "still";
         }
         else if (is_dash)
         {
@@ -2602,13 +2590,11 @@ namespace viktor
             if (!path.empty())
             {
                 aim    = path.back();
-                branch = "dash-end";
             }
             else
             {
                 const float t = time_to_reach(tgt_d);
                 aim    = { tpos.x + vel.x * t, tpos.y, tpos.z + vel.z * t };
-                branch = "dash-vel";
             }
         }
         else
@@ -2625,7 +2611,6 @@ namespace viktor
                 aim = next;
                 if (converged) break;
             }
-            branch = "lead";
         }
 
         // Clamp the aim into reach and reject degenerate (on-top-of-us) aims.
@@ -2633,7 +2618,6 @@ namespace viktor
             aim = ppos + direction_2d(ppos, aim) * e_reach;
         if (distance_2d(ppos, aim) < 10.f)
         {
-            log_e("[E] reject: aim too close (branch=%s)", branch);
             return false;
         }
 
@@ -2660,8 +2644,6 @@ namespace viktor
 
             if (!pred.is_valid || pred.hitchance < menu::e_hitchance)
             {
-                log_e("[E] reject: hc gate tgt=%s d=%.0f vel=%.0f",
-                      target->get_char_name().c_str(), tgt_d, tgt_spd);
                 return false;
             }
         }
@@ -2672,7 +2654,6 @@ namespace viktor
         const math::vector3 beam_dir = direction_2d(ppos, aim);
         if ((beam_dir.x * beam_dir.x + beam_dir.z * beam_dir.z) < 0.01f)
         {
-            log_e("[E] reject: zero aim dir tgt=%s", target->get_char_name().c_str());
             return false;
         }
 
@@ -2687,23 +2668,6 @@ namespace viktor
         last_cast_e            = now_e;
         m_last_spell_cast_time = now_e;
 
-        if (menu::log_e_casts)
-        {
-            const float beam_time = beam_len / speed;
-            m_e_log.armed             = true;
-            m_e_log.target_net_id     = target->get_network_id();
-            m_e_log.target_name       = target->get_char_name();
-            m_e_log.fp                = fp;
-            m_e_log.cp                = cp;
-            m_e_log.eval_time         = now_e + windup + beam_time;
-            m_e_log.tgt_dist_at_cast  = tgt_d;
-            m_e_log.tgt_speed_at_cast = tgt_spd;
-            m_e_log.branch            = branch;
-
-            log_e("[E] CAST tgt=%s d=%.0f vel=%.0f branch=%s fp_d=%.0f cp_d=%.0f",
-                  m_e_log.target_name.c_str(), tgt_d, tgt_spd,
-                  branch, fp_dist, fp_dist + beam_len);
-        }
         return true;
     }
 
@@ -2884,7 +2848,24 @@ namespace viktor
         move_r_to_pos(pred, /*score=*/1.f, /*force=*/true);
     }
 
-    float get_q_damage(game_object* target)
+    static float apply_item_magic_modifiers(game_object* player, game_object* target, float damage)
+    {
+        return meow::item_damage::apply_magic_damage_modifiers(player, target, damage);
+    }
+
+    static float get_ability_proc_damage(game_object* player, game_object* target,
+                                         int malignance_ticks = 0)
+    {
+        meow::item_damage::ability_proc_context context{};
+        context.malignance_ticks = malignance_ticks;
+        meow::item_damage::ability_rune_context rune_context{};
+        rune_context.cast_distance = player && target
+            ? player->get_position().distance(target->get_position()) : 0.f;
+        return meow::item_damage::on_ability_damage(player, target, context)
+            + meow::item_damage::on_ability_rune_damage(player, target, rune_context);
+    }
+
+    float get_q_damage(game_object* target, bool include_items)
     {
         if (!g_sdk || !g_sdk->object_manager) return 0.f;
         auto player = g_sdk->object_manager->get_local_player();
@@ -2893,10 +2874,12 @@ namespace viktor
         auto q = player->get_spell(SLOT_Q);
         if (!q || q->get_level() == 0) return 0.f;
 
-        return sdk::damage->get_spell_damage(player, target, SLOT_Q);
+        const float spell_damage = apply_item_magic_modifiers(
+            player, target, sdk::damage->get_spell_damage(player, target, SLOT_Q));
+        return spell_damage + (include_items ? get_ability_proc_damage(player, target) : 0.f);
     }
 
-    float get_e_damage(game_object* target)
+    float get_e_damage(game_object* target, bool include_items)
     {
         if (!g_sdk || !g_sdk->object_manager) return 0.f;
         auto player = g_sdk->object_manager->get_local_player();
@@ -2906,10 +2889,12 @@ namespace viktor
         if (!e || e->get_level() == 0) return 0.f;
 
         // SDK handles E aftershock internally.
-        return sdk::damage->get_spell_damage(player, target, SLOT_E);
+        const float spell_damage = apply_item_magic_modifiers(
+            player, target, sdk::damage->get_spell_damage(player, target, SLOT_E));
+        return spell_damage + (include_items ? get_ability_proc_damage(player, target) : 0.f);
     }
 
-    float get_r_damage(game_object* target)
+    float get_r_damage(game_object* target, bool include_items)
     {
         if (!g_sdk || !g_sdk->object_manager) return 0.f;
         auto player = g_sdk->object_manager->get_local_player();
@@ -2943,7 +2928,10 @@ namespace viktor
             ticks = 2;
 
         const float total_raw = initial_raw + tick_raw * static_cast<float>(ticks);
-        return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, total_raw);
+        float spell_damage = apply_item_magic_modifiers(player, target,
+            sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, total_raw));
+        spell_damage *= meow::item_damage::axiom_arcanist_multiplier(player, true, true);
+        return spell_damage + (include_items ? get_ability_proc_damage(player, target, ticks) : 0.f);
     }
 
     float get_combo_damage(game_object* target)
@@ -2959,56 +2947,59 @@ namespace viktor
                             + target->get_bounding_radius();
 
         float total = 0.f;
+        bool ability_lands = false;
+        int malignance_ticks = 0;
 
         // Only count a spell when it could actually land this combo — ready,
         // affordable, and in range. Otherwise the "only if killable" gate would
         // assume damage from spells on cooldown or out of reach.
         if (is_spell_ready(SLOT_Q) && has_enough_mana(SLOT_Q) && dist <= q_reach)
-            total += get_q_damage(target);
+        {
+            total += get_q_damage(target, false);
+            ability_lands = true;
+        }
         if (is_spell_ready(SLOT_E) && has_enough_mana(SLOT_E) && dist <= spell_data::e_range)
-            total += get_e_damage(target);
+        {
+            total += get_e_damage(target, false);
+            ability_lands = true;
+        }
         if (is_spell_ready(SLOT_R) && has_enough_mana(SLOT_R) && dist <= spell_data::r_range)
-            total += get_r_damage(target);
+        {
+            total += get_r_damage(target, false);
+            ability_lands = true;
+            malignance_ticks = 2;
+        }
+
+        if (ability_lands)
+            total += get_ability_proc_damage(player, target, malignance_ticks);
 
         // Flat AA estimate — pessimistic about Discharge empower so we don't
         // overcommit R on marginal kills.
-        total += sdk::damage->get_aa_damage(player, target);
+        total += sdk::damage->get_aa_damage(player, target)
+            * meow::item_damage::precision_damage_multiplier(player, target);
+        if (ability_lands)
+            total += meow::item_damage::on_attack_after_ability(player, target);
 
         return total;
     }
 
     void load()
     {
+        if (!g_sdk || !g_sdk->object_manager || !g_sdk->menu_manager || !g_sdk->event_manager)
+            return;
+        if (m_loaded) return;
+
         auto player = g_sdk->object_manager->get_local_player();
         if (!player || player->get_char_name() != "Viktor")
             return;
 
         g_sdk->log_console("[MeowAIO] Loading Viktor >.<");
 
-        g_sdk->event_manager->register_callback(event_manager::event::game_update,
-            reinterpret_cast<void*>(on_update));
-        g_sdk->event_manager->register_callback(event_manager::event::draw_world,
-            reinterpret_cast<void*>(on_draw));
-        g_sdk->event_manager->register_callback(event_manager::event::present,
-            reinterpret_cast<void*>(on_present));
-        g_sdk->event_manager->register_callback(event_manager::event::create_object,
-            reinterpret_cast<void*>(on_create_object));
-        g_sdk->event_manager->register_callback(event_manager::event::delete_object,
-            reinterpret_cast<void*>(on_delete_object));
-        g_sdk->event_manager->register_callback(event_manager::event::process_cast,
-            reinterpret_cast<void*>(on_process_cast));
-
-        // Drives the Q-AA empowered-Discharge chain.
-        if (sdk::orbwalker)
-        {
-            sdk::orbwalker->register_callback(orb_sdk::event_type::before_attack,
-                reinterpret_cast<void*>(on_before_attack));
-        }
-
         auto cat = g_sdk->menu_manager->add_category("viktor", "MeowAIO - Viktor");
         if (!cat) return;
 
         auto q_menu = cat->add_sub_category("q_siphon_power", "Q - Siphon Power");
+        if (!q_menu) return;
         q_menu->add_checkbox("combo", "Use in Combo", menu::use_q_combo, [](bool v) { menu::use_q_combo = v; });
         q_menu->add_checkbox("harass", "Use in Harass", menu::use_q_harass, [](bool v) { menu::use_q_harass = v; });
         q_menu->add_checkbox("flee", "Use in Flee", menu::use_q_flee, [](bool v) { menu::use_q_flee = v; });
@@ -3018,8 +3009,9 @@ namespace viktor
         q_menu->add_checkbox("draw_range", "Draw Range", menu::draw_q_range, [](bool v) { menu::draw_q_range = v; });
 
         auto w_menu = cat->add_sub_category("w_gravity_field", "W - Gravity Field");
+        if (!w_menu) return;
         w_menu->add_checkbox("combo", "Use in Combo", menu::use_w_combo, [](bool v) { menu::use_w_combo = v; });
-        w_menu->add_checkbox("flee", "Use W in Flee", menu::use_w_flee, [](bool v) { menu::use_w_flee = v; });
+        w_menu->add_checkbox("flee", "Use in Flee", menu::use_w_flee, [](bool v) { menu::use_w_flee = v; });
         w_menu->add_checkbox("harass", "Use in Harass", menu::use_w_harass, [](bool v) { menu::use_w_harass = v; });
         w_menu->add_slider_int("hitchance", "Hitchance", 0, 100, 1, menu::w_hitchance,
             [](int v) { menu::w_hitchance = v; });
@@ -3047,7 +3039,9 @@ namespace viktor
             });
 
         auto wl_menu = w_menu->add_sub_category("w_whitelist", "Whitelist");
+        if (!wl_menu) return;
         {
+            menu::w_antigap_whitelist.clear();
             auto local = g_sdk->object_manager->get_local_player();
             if (local)
             {
@@ -3072,6 +3066,7 @@ namespace viktor
         }
 
         auto e_menu = cat->add_sub_category("e_death_ray", "E - Death Ray");
+        if (!e_menu) return;
         e_menu->add_checkbox("combo", "Use in Combo", menu::use_e_combo, [](bool v) { menu::use_e_combo = v; });
         e_menu->add_checkbox("harass", "Use in Harass", menu::use_e_harass, [](bool v) { menu::use_e_harass = v; });
         e_menu->add_checkbox("farm", "Use in Clear", menu::use_e_farm, [](bool v) { menu::use_e_farm = v; });
@@ -3081,10 +3076,10 @@ namespace viktor
         e_menu->add_slider_int("hitchance", "Hitchance", 0, 100, 1, menu::e_hitchance,
             [](int v) { menu::e_hitchance = v; });
         e_menu->add_checkbox("draw_range", "Draw Range", menu::draw_e_range, [](bool v) { menu::draw_e_range = v; });
-        //e_menu->add_checkbox("log_casts", "Debug E Casts (debug)", menu::log_e_casts, [](bool v) { menu::log_e_casts = v; });
         e_menu->add_checkbox("draw_rgb", "RGB Range", menu::draw_e_rgb, [](bool v) { menu::draw_e_rgb = v; });
 
         auto r_menu = cat->add_sub_category("r_chaos_storm", "R - Chaos Storm");
+        if (!r_menu) return;
         r_menu->add_checkbox("combo", "Use in Combo", menu::use_r_combo, [](bool v) { menu::use_r_combo = v; });
         r_menu->add_checkbox("killsteal", "Killsteal", menu::ks_r, [](bool v) { menu::ks_r = v; });
         r_menu->add_checkbox("only_kill", "Only if Killable", menu::r_only_killable, [](bool v) { menu::r_only_killable = v; });
@@ -3108,10 +3103,12 @@ namespace viktor
             });
 
         auto mana_menu = cat->add_sub_category("mana", "Mana Thresholds");
+        if (!mana_menu) return;
         mana_menu->add_slider_int("harass_mana", "Harass Mana %", 0, 100, 5, menu::harass_mana_percent, [](int v) { menu::harass_mana_percent = v; });
         mana_menu->add_slider_int("farm_mana", "Farm Mana %", 0, 100, 5, menu::farm_mana_percent, [](int v) { menu::farm_mana_percent = v; });
 
         auto draw_menu = cat->add_sub_category("drawings", "Drawings");
+        if (!draw_menu) return;
         draw_menu->add_checkbox("draw_only_ready", "Only Ready Spells", menu::draw_only_ready, [](bool v) { menu::draw_only_ready = v; });
         draw_menu->add_checkbox("r_killable", "R Killable Text", menu::draw_r_killable, [](bool v) { menu::draw_r_killable = v; });
         draw_menu->add_checkbox("r_damage_indicator", "R Damage Indicator", menu::draw_r_damage_indicator, [](bool v) { menu::draw_r_damage_indicator = v; });
@@ -3122,12 +3119,35 @@ namespace viktor
         draw_menu->add_colorpicker("color_r", "R Color", menu::color_r, [](uint32_t c) { menu::color_r = c; });
         draw_menu->add_colorpicker("color_r_dmg", "R Damage Bar Color", menu::color_r_dmg, [](uint32_t c) { menu::color_r_dmg = c; });
 
+        // Register runtime callbacks only after every required menu section was
+        // created successfully, preventing a partially loaded champion module.
+        g_sdk->event_manager->register_callback(event_manager::event::game_update,
+            reinterpret_cast<void*>(on_update));
+        g_sdk->event_manager->register_callback(event_manager::event::draw_world,
+            reinterpret_cast<void*>(on_draw));
+        g_sdk->event_manager->register_callback(event_manager::event::present,
+            reinterpret_cast<void*>(on_present));
+        g_sdk->event_manager->register_callback(event_manager::event::create_object,
+            reinterpret_cast<void*>(on_create_object));
+        g_sdk->event_manager->register_callback(event_manager::event::delete_object,
+            reinterpret_cast<void*>(on_delete_object));
+        g_sdk->event_manager->register_callback(event_manager::event::process_cast,
+            reinterpret_cast<void*>(on_process_cast));
+
+        if (sdk::orbwalker)
+        {
+            sdk::orbwalker->register_callback(orb_sdk::event_type::before_attack,
+                reinterpret_cast<void*>(on_before_attack));
+        }
+
+        m_loaded = true;
+
         g_sdk->log_console("[MeowAIO] Viktor loaded successfully :3");
     }
 
     void unload()
     {
-        if (g_sdk && g_sdk->event_manager)
+        if (m_loaded && g_sdk && g_sdk->event_manager)
         {
             g_sdk->event_manager->unregister_callback(event_manager::event::game_update,
                 reinterpret_cast<void*>(on_update));
@@ -3143,7 +3163,7 @@ namespace viktor
                 reinterpret_cast<void*>(on_process_cast));
         }
 
-        if (sdk::orbwalker)
+        if (m_loaded && sdk::orbwalker)
         {
             sdk::orbwalker->unregister_callback(orb_sdk::event_type::before_attack,
                 reinterpret_cast<void*>(on_before_attack));
@@ -3174,11 +3194,11 @@ namespace viktor
         last_q_harass_time = 0.f;
         last_q_lasthit_time = 0.f;
         m_last_spell_cast_time = 0.f;
-        m_q_scheduled = false;
-        m_q_scheduled_time = 0.f;
-        m_q_scheduled_tgt_id = 0;
-        m_e_log = {};
+        clear_scheduled_q();
+        menu::w_antigap_whitelist.clear();
+        m_loaded = false;
 
-        g_sdk->log_console("[MeowAIO] Viktor unloaded successfully :3");
+        if (g_sdk)
+            g_sdk->log_console("[MeowAIO] Viktor unloaded successfully :3");
     }
 } // namespace viktor

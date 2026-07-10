@@ -2,7 +2,10 @@
 
 // All math is 2D (XZ plane) — Y is height, preserved but not used in distance/angle calculations
 
-#include "math.hpp"
+// Use the SDK's canonical math types. A plain "math.hpp" resolves to the
+// duplicate MeowV1/math.hpp from this include context and redefines vector2,
+// vector3, vector4, rect, cmpf, deg2rad, and rad2deg in the same translation unit.
+#include "../../math.hpp"
 #include <cmath>
 #include <algorithm>
 #include <limits>

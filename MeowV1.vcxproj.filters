@@ -45,6 +45,9 @@
     <ClInclude Include="damage\calc.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="damage\items.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="db\core\enums.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>

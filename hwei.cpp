@@ -231,6 +231,29 @@ namespace hwei
             return nullptr;
         }
 
+        game_object* pick_linear_target(float range)
+        {
+            if (!sdk::target_selector)
+                return nullptr;
+
+            auto in_linear_range = [range](game_object* target) {
+                if (!target)
+                    return false;
+                return is_valid_target(target, range + std::max(0.f, target->get_bounding_radius()));
+            };
+
+            if (auto* forced = sdk::target_selector->get_forced_target(); in_linear_range(forced))
+                return forced;
+
+            for (auto* hero : sdk::target_selector->get_sorted_heroes())
+            {
+                if (in_linear_range(hero))
+                    return hero;
+            }
+
+            return nullptr;
+        }
+
         // Longest remaining duration among active hard-CC buffs (0 if none).
         float hard_cc_remaining(game_object* target)
         {
@@ -783,21 +806,6 @@ namespace hwei
                 }
                 apply_subject_lockout(s_pending.info.mood);
 
-                // Wash Brush auto-recovery: if the palette is still open after a
-                // timeout, the next cast will fight against a stale subject and
-                // likely time out again. Pressing R while in a mood closes the
-                // palette for free (no CD, no mana). Only do this when the live
-                // game state confirms a mood is open, so we never accidentally
-                // fire the R ultimate.
-                if (auto* player = get_player())
-                {
-                    if (read_live_game_subject() != subject::none)
-                    {
-                        if (HWEI_DEBUG_LOGS && g_sdk)
-                            g_sdk->log_console("[MeowAIO] wash-brush recovery (palette stuck open)");
-                        player->cast_spell(SLOT_R);
-                    }
-                }
             }
             if (s_pending.active && (apply_lockout || (reason && std::strcmp(reason, "confirmed-followup") == 0)))
                 cache_selected_subject(subject::none, reason ? reason : "reset");
@@ -858,6 +866,18 @@ namespace hwei
             }
 
             s_last_observed_cast_name.clear();
+            s_pending.active = true;
+            s_pending.info = info;
+            s_pending.cast_pos = cast_pos;
+            s_pending.target = target;
+            s_pending.max_range = max_range;
+            s_pending.fire_at = now() + SUBJECT_CONFIRM_DELAY;
+            s_pending.expire_at = now() + timeout;
+            s_pending.repredict = false;
+            s_pending.repredict_spell = {};
+            s_pending.repredict_hitchance = 0;
+            s_pending.lasthit_guard = false;
+            s_pending.followup_fired = false;
 
             float fire_at;
             if (info.mood == subject::none)
@@ -870,21 +890,14 @@ namespace hwei
             }
             else
             {
-                send_hwei_selector(player, info.mood);
+                if (!send_hwei_selector(player, info.mood))
+                {
+                    clear_pending(true, "selector-send-failed");
+                    return false;
+                }
                 fire_at = now() + SUBJECT_CONFIRM_DELAY;
             }
-
-            s_pending.active   = true;
-            s_pending.info     = info;
-            s_pending.cast_pos = cast_pos;
-            s_pending.target   = target;
-            s_pending.max_range = max_range;
-            s_pending.fire_at  = fire_at;
-            s_pending.expire_at = now() + timeout;
-            s_pending.repredict = false;
-            s_pending.repredict_spell = {};
-            s_pending.repredict_hitchance = 0;
-            s_pending.lasthit_guard = false;
+            s_pending.fire_at = fire_at;
 
             if (HWEI_DEBUG_LOGS && g_sdk)
             {
@@ -962,25 +975,43 @@ namespace hwei
             if (s_pending.repredict
                 && s_pending.target
                 && s_pending.info.cast_type == ability_cast::position
-                && sdk::prediction
-                && is_valid_target(s_pending.target, FLT_MAX))
+                )
             {
+                if (!sdk::prediction || !is_valid_target(s_pending.target, FLT_MAX))
+                {
+                    clear_pending(true, "repredict-target-invalid");
+                    return false;
+                }
+
                 s_pending.repredict_spell.source = player;
                 s_pending.repredict_spell.source_position = player->get_position();
                 s_pending.repredict_spell.expected_hitchance = s_pending.repredict_hitchance;
 
                 auto fresh = sdk::prediction->predict(s_pending.target, s_pending.repredict_spell);
-                if (fresh.is_valid && fresh.hitchance >= s_pending.repredict_hitchance)
+                if (!fresh.is_valid || fresh.hitchance < s_pending.repredict_hitchance)
                 {
-                    const float fresh_dist = player->get_position().distance(fresh.cast_position);
-                    const bool in_range = s_pending.max_range >= FLT_MAX
-                        || fresh_dist <= s_pending.max_range;
-                    const bool blocked = s_pending.info.mood == subject::disaster
-                        && s_pending.info.slot == SLOT_Q
-                        && line_blocked_by_enemy_minion(fresh.cast_position, s_pending.repredict_spell.radius, s_pending.target);
-                    if (in_range && !blocked)
-                        s_pending.cast_pos = fresh.cast_position;
+                    clear_pending(true, "repredict-failed");
+                    return false;
                 }
+
+                const float fresh_dist = player->get_position().distance(fresh.cast_position);
+                const bool in_range = s_pending.max_range >= FLT_MAX
+                    || fresh_dist <= s_pending.max_range;
+                const bool blocked = s_pending.info.mood == subject::disaster
+                    && s_pending.info.slot == SLOT_Q
+                    && line_blocked_by_enemy_minion(fresh.cast_position, s_pending.repredict_spell.radius, s_pending.target);
+                if (!in_range)
+                {
+                    clear_pending(true, "repredict-out-of-range");
+                    return false;
+                }
+                if (blocked)
+                {
+                    clear_pending(true, "repredict-collision");
+                    return false;
+                }
+
+                s_pending.cast_pos = fresh.cast_position;
             }
 
             // If the aim point is out of range, retrying just blocks the engine
@@ -993,7 +1024,7 @@ namespace hwei
                 && player->get_position().distance(s_pending.cast_pos) > s_pending.max_range
                 && t > s_pending.fire_at + 0.30f)
             {
-                clear_pending(false, "followup-out-of-range");
+                clear_pending(true, "followup-out-of-range");
                 return false;
             }
 
@@ -1038,8 +1069,13 @@ namespace hwei
             auto* player = get_player();
             if (!player) return false;
 
-            auto* target = forced_target ? forced_target : pick_target(base_spell.range);
-            if (!is_valid_target(target, base_spell.range))
+            auto* target = forced_target ? forced_target : pick_linear_target(base_spell.range);
+            if (!target)
+                return false;
+
+            const float target_radius = std::max(0.f, target->get_bounding_radius());
+            const float effective_range = base_spell.range + target_radius;
+            if (!is_valid_target(target, effective_range))
                 return false;
 
             base_spell.source = player;
@@ -1053,26 +1089,26 @@ namespace hwei
                 pred_result = "invalid";
             else if (prediction.hitchance < hitchance)
                 pred_result = "low-hitchance";
-            else if (cast_dist > base_spell.range)
+            else if (cast_dist > effective_range)
                 pred_result = "out-of-range";
             else if (info.mood == subject::disaster
                 && info.slot == SLOT_Q
                 && line_blocked_by_enemy_minion(prediction.cast_position, base_spell.radius, target))
                 pred_result = "collision";
 
-            log_prediction_result(expected_followup_name(info), target, prediction, hitchance, cast_dist, base_spell.range, pred_result);
+            log_prediction_result(expected_followup_name(info), target, prediction, hitchance, cast_dist, effective_range, pred_result);
 
             if (!prediction.is_valid || prediction.hitchance < hitchance)
                 return false;
 
             // Prevent forced walk-in: never cast if predicted point is out of range.
-            if (cast_dist > base_spell.range)
+            if (cast_dist > effective_range)
                 return false;
 
             if (std::strcmp(pred_result, "collision") == 0)
                 return false;
 
-            if (!start_cast(info, prediction.cast_position, target, base_spell.range))
+            if (!start_cast(info, prediction.cast_position, target, effective_range))
                 return false;
             if (!s_pending.repredict)
             {
@@ -2293,6 +2329,9 @@ namespace hwei
             if (mana_percent() < static_cast<float>(menu::harass_mana_pct))
                 return;
 
+            if (menu::harass_use_qq && cast_or_busy(try_cast_linear(ABILITY_QQ, s_pred_qq, menu::combo_qq_hitchance)))
+                return;
+
             if (menu::harass_use_eq && cast_or_busy(try_cast_eq(menu::combo_eq_hitchance)))
                 return;
 
@@ -2300,9 +2339,6 @@ namespace hwei
                 return;
 
             if (menu::harass_use_qw && cast_or_busy(try_cast_circular(ABILITY_QW, s_pred_qw, menu::combo_qw_hitchance)))
-                return;
-
-            if (menu::harass_use_qq && cast_or_busy(try_cast_linear(ABILITY_QQ, s_pred_qq, menu::combo_qq_hitchance)))
                 return;
         }
 
@@ -2391,6 +2427,9 @@ namespace hwei
 
         void lane_lasthit()
         {
+            if (!sdk::orbwalker || !sdk::orbwalker->is_spell_farm_lasthit_enabled())
+                return;
+
             if (consume_cast_engine_busy())
                 return;
 
@@ -2744,6 +2783,18 @@ namespace hwei
 
         setup_prediction_templates();
         HWEI_DEBUG_LOGS = menu::debug_logs;
+        clear_pending();
+        s_last_cast_time = 0.f;
+        s_ee_qq_followup_until = 0.f;
+        s_ew_qw_followup_ready_at = 0.f;
+        s_ew_qw_followup_until = 0.f;
+        s_subject_lockout_until[0] = 0.f;
+        s_subject_lockout_until[1] = 0.f;
+        s_subject_lockout_until[2] = 0.f;
+        s_r_wait_started_at = 0.f;
+        s_r_last_pred_acceptable_at = 0.f;
+        s_combo_mode_was_pressed = false;
+        clear_all_mode_binds();
         s_cached_subject = subject::none;
         s_subject_cache_authoritative = false;
 
@@ -3360,7 +3411,17 @@ namespace hwei
             {
                 cache_selected_subject(selected_subject, "selector-process-cast");
 
-                if (s_pending.active && s_pending.info.mood == selected_subject)
+                if (s_pending.active && s_pending.followup_fired)
+                {
+                    if (HWEI_DEBUG_LOGS && g_sdk)
+                    {
+                        g_sdk->log_console("[MeowAIO] selector during followup expected=%s got=%s",
+                            expected_followup_name(s_pending.info) ? expected_followup_name(s_pending.info) : "unknown",
+                            cast_name ? cast_name : "unknown");
+                    }
+                    clear_pending(true, "selector-during-followup");
+                }
+                else if (s_pending.active && s_pending.info.mood == selected_subject)
                 {
                     // Game confirmed the selector — fast-forward so follow-up fires
                     // after SUBJECT_CONFIRM_FAST_DELAY instead of the full SUBJECT_CONFIRM_DELAY.
@@ -3373,6 +3434,7 @@ namespace hwei
                     g_sdk->log_console("[MeowAIO] selector observed but mood mismatch expected=%s got=%s",
                         expected_followup_name(s_pending.info) ? expected_followup_name(s_pending.info) : "unknown",
                         cast_name ? cast_name : "unknown");
+                    clear_pending(true, "selector-mismatch");
                 }
                 return;
             }
