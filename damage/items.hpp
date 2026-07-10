@@ -58,10 +58,15 @@ namespace item_id
     inline constexpr int MEJAIS_SOULSTEALER    = 3041;
     inline constexpr int RABADONS_DEATHCAP     = 3089;
     inline constexpr int LICH_BANE              = 3100;
+    inline constexpr int BANSHEES_VEIL          = 3102;
     inline constexpr int MALIGNANCE             = 3118;
+    inline constexpr int VOID_STAFF             = 3135;
+    inline constexpr int CRYPTBLOOM             = 3137;
     inline constexpr int HEXTECH_ROCKETBELT     = 3152;
     inline constexpr int ZHONYAS_HOURGLASS      = 3157;
     inline constexpr int MORELLONOMICON         = 3165;
+    inline constexpr int HORIZON_FOCUS          = 4628;
+    inline constexpr int COSMIC_DRIVE           = 4629;
     inline constexpr int SHADOWFLAME            = 4645;
     inline constexpr int LIANDRYS_TORMENT       = 6653;
     inline constexpr int LUDENS_ECHO             = 6655;
@@ -120,6 +125,12 @@ namespace shadowflame
 {
     inline constexpr float HP_THRESHOLD     = 0.40f;
     inline constexpr float DAMAGE_MULTIPLIER = 1.20f;
+}
+
+namespace horizon_focus
+{
+    inline constexpr float HYPERSHOT_RANGE    = 600.f;
+    inline constexpr float DAMAGE_MULTIPLIER  = 1.10f;
 }
 
 // Backward-compatible name from the first version of this helper.
@@ -198,7 +209,8 @@ struct ability_rune_context
 };
 
 inline float magic_damage( game_object* source, game_object* target, float raw,
-                           int liandry_combat_stacks = 0 ) noexcept;
+                           int liandry_combat_stacks = 0,
+                           bool horizon_focus_active = false ) noexcept;
 
 // Damage procs caused by one ability hit. Availability flags let callers that
 // track cooldowns/Aery travel suppress a proc; the default is an optimistic
@@ -257,10 +269,22 @@ inline float shadowflame_multiplier( game_object* source, game_object* target ) 
         : 1.f;
 }
 
+inline float horizon_focus_multiplier( game_object* source, game_object* target,
+                                       bool hypershot_active ) noexcept
+{
+    if ( !hypershot_active || !source || !target || !target->is_hero()
+         || !has_item( source, item_id::HORIZON_FOCUS ) )
+        return 1.f;
+
+    return horizon_focus::DAMAGE_MULTIPLIER;
+}
+
 // Converts raw magic damage and then applies item damage amplifiers. Sorcerer's
-// Shoes penetration is already represented in the source stats used by VEN.Damage.
+// Shoes, Void Staff, and Cryptbloom penetration are already represented in the
+// source stats used by VEN.Damage.
 inline float magic_damage( game_object* source, game_object* target, float raw,
-                           int liandry_combat_stacks ) noexcept
+                           int liandry_combat_stacks,
+                           bool horizon_focus_active ) noexcept
 {
     if ( !source || !target || raw <= 0.f ) return 0.f;
 
@@ -271,6 +295,7 @@ inline float magic_damage( game_object* source, game_object* target, float raw,
     result *= liandrys_suffering_multiplier( source, target, liandry_combat_stacks );
     result *= shadowflame_multiplier( source, target );
     result *= precision_damage_multiplier( source, target );
+    result *= horizon_focus_multiplier( source, target, horizon_focus_active );
     return result;
 }
 
@@ -278,22 +303,39 @@ inline float magic_damage( game_object* source, game_object* target, float raw,
 // damage helper does not account for Shadowflame or Liandry's Suffering.
 inline float apply_magic_damage_modifiers( game_object* source, game_object* target,
                                            float post_mitigation_damage,
-                                           int liandry_combat_stacks = 0 ) noexcept
+                                           int liandry_combat_stacks = 0,
+                                           bool horizon_focus_active = false ) noexcept
 {
     if ( post_mitigation_damage <= 0.f ) return 0.f;
 
     return post_mitigation_damage
         * liandrys_suffering_multiplier( source, target, liandry_combat_stacks )
         * shadowflame_multiplier( source, target )
-        * precision_damage_multiplier( source, target );
+        * precision_damage_multiplier( source, target )
+        * horizon_focus_multiplier( source, target, horizon_focus_active );
 }
 
 inline float apply_true_damage_modifiers( game_object* source, game_object* target,
-                                          float true_damage ) noexcept
+                                          float true_damage,
+                                          bool horizon_focus_active = false ) noexcept
 {
     if ( true_damage <= 0.f ) return 0.f;
     return true_damage * shadowflame_multiplier( source, target )
-        * precision_damage_multiplier( source, target );
+        * precision_damage_multiplier( source, target )
+        * horizon_focus_multiplier( source, target, horizon_focus_active );
+}
+
+inline float apply_physical_damage_modifiers( game_object* source, game_object* target,
+                                              float post_mitigation_damage,
+                                              int liandry_combat_stacks = 0,
+                                              bool horizon_focus_active = false ) noexcept
+{
+    if ( post_mitigation_damage <= 0.f ) return 0.f;
+
+    return post_mitigation_damage
+        * liandrys_suffering_multiplier( source, target, liandry_combat_stacks )
+        * precision_damage_multiplier( source, target )
+        * horizon_focus_multiplier( source, target, horizon_focus_active );
 }
 
 inline float dorans_ring_raw_damage( game_object* source, game_object* target ) noexcept
@@ -441,6 +483,7 @@ struct ability_proc_context
     int malignance_ticks      = 0;
     int ludens_echoes_primary = 1;
     int liandry_combat_stacks = 0;
+    bool horizon_focus_active = false;
 };
 
 // Item damage caused by one ability hit. Burn refreshes should only be counted
@@ -455,7 +498,8 @@ inline float on_ability_damage( game_object* source, game_object* target,
     raw += liandrys_torment_raw_damage( source, target, context.liandry_ticks );
     raw += malignance_raw_damage( source, target, context.malignance_ticks );
     raw += ludens_echo_raw_damage( source, context.ludens_echoes_primary );
-    return magic_damage( source, target, raw, context.liandry_combat_stacks );
+    return magic_damage( source, target, raw, context.liandry_combat_stacks,
+        context.horizon_focus_active );
 }
 
 inline float on_attack_after_ability( game_object* source, game_object* target,

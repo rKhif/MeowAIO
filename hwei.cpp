@@ -1,4 +1,5 @@
 #include "hwei.h"
+#include "damage/items.hpp"
 
 #include <algorithm>
 #include <cfloat>
@@ -1807,6 +1808,45 @@ namespace hwei
             return tick_pending();
         }
 
+        float apply_spell_item_rune_modifiers(game_object* target, float damage,
+                                               bool is_ultimate = false,
+                                               bool is_aoe = false)
+        {
+            auto* player = get_player();
+            if (!player || !target || damage <= 0.f)
+                return 0.f;
+
+            const bool horizon_focus = player->get_position().distance(target->get_position())
+                >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+            return meow::item_damage::apply_magic_damage_modifiers(
+                player, target, damage, 0, horizon_focus)
+                * meow::item_damage::axiom_arcanist_multiplier(player, is_ultimate, is_aoe);
+        }
+
+        float get_ability_proc_damage(game_object* target, int malignance_ticks = 0,
+                                      bool full_duration = true)
+        {
+            auto* player = get_player();
+            if (!player || !target)
+                return 0.f;
+
+            meow::item_damage::ability_proc_context item_context{};
+            item_context.malignance_ticks = malignance_ticks;
+            if (!full_duration)
+            {
+                item_context.blackfire_ticks = 1;
+                item_context.liandry_ticks = 1;
+            }
+            item_context.horizon_focus_active = player->get_position().distance(
+                target->get_position()) >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+
+            meow::item_damage::ability_rune_context rune_context{};
+            rune_context.cast_distance = player->get_position().distance(target->get_position());
+
+            return meow::item_damage::on_ability_damage(player, target, item_context)
+                + meow::item_damage::on_ability_rune_damage(player, target, rune_context);
+        }
+
         float get_r_damage(game_object* target)
         {
             auto* player = get_player();
@@ -1825,7 +1865,9 @@ namespace hwei
             const float ap = player->get_ability_power();
             const float raw = BASE[level] + AP_RATIO * ap;
 
-            return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw);
+            return apply_spell_item_rune_modifiers(target,
+                sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw),
+                true, true);
         }
 
         // Signature of the Visionary: if the target carries our mark, the next
@@ -1857,7 +1899,8 @@ namespace hwei
             const int lvl = std::clamp(player->get_level(), 1, 18);
             const float base = 40.f + (313.82f - 40.f) * static_cast<float>(lvl - 1) / 17.f;
             const float raw = base + 0.35f * player->get_ability_power();
-            return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw);
+            return apply_spell_item_rune_modifiers(target,
+                sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw));
         }
 
         float get_qw_damage(game_object* target)
@@ -1890,7 +1933,8 @@ namespace hwei
                 }
             }
 
-            return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw);
+            return apply_spell_item_rune_modifiers(target,
+                sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw));
         }
 
         float get_qq_damage(game_object* target)
@@ -1911,7 +1955,8 @@ namespace hwei
             const float raw = BASE[idx]
                 + HP_PCT[idx] * target->get_max_hp() / 100.f
                 + AP_RATIO * player->get_ability_power();
-            return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw);
+            return apply_spell_item_rune_modifiers(target,
+                sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw));
         }
 
         float get_qe_damage(game_object* target)
@@ -1929,7 +1974,8 @@ namespace hwei
             constexpr float AP_RATIO = 0.30f;
 
             const float raw = BASE[idx] + AP_RATIO * player->get_ability_power();
-            return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw);
+            return apply_spell_item_rune_modifiers(target,
+                sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw));
         }
 
         float get_eq_damage(game_object* target)
@@ -1947,7 +1993,8 @@ namespace hwei
             constexpr float AP_RATIO = 0.65f;
 
             const float raw = BASE[idx] + AP_RATIO * player->get_ability_power();
-            return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw);
+            return apply_spell_item_rune_modifiers(target,
+                sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw));
         }
 
         // EE (Crushing Maw) and EW (Gaze of the Abyss) share the same formula as EQ
@@ -1993,6 +2040,13 @@ namespace hwei
             default:
                 break;
             }
+
+            // Count item burns and one set of ability-triggered runes for the
+            // sequence. They are shared procs, so adding them per spell would
+            // overstate the indicator and killsteal thresholds.
+            if (total > 0.f)
+                total += get_ability_proc_damage(target, r_ready ? 2 : 0);
+
             // Multi-hit combos always detonate an existing Signature mark.
             if (total > 0.f)
                 total += get_passive_mark_damage(target);
@@ -2037,7 +2091,9 @@ namespace hwei
                     continue;
 
                 const float hp = get_magic_effective_hp(hero, hit_delay + 0.05f);
-                const float damage = damage_fn(hero) + get_passive_mark_damage(hero);
+                const float damage = damage_fn(hero)
+                    + get_ability_proc_damage(hero, 0, false)
+                    + get_passive_mark_damage(hero);
                 if (hp <= 0.f || hp > damage)
                     continue;
 
