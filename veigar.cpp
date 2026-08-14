@@ -4,6 +4,7 @@
 #include "utility/minion_manager.hpp"
 #include "math/geometry.hpp"
 #include "damage/calc.hpp"               // raw_spell_damage, final_spell_damage, effective_resist
+#include "damage/items.hpp"
 #include "db/champions/veigar.hpp"       // canonical VEIGAR damage entries per slot
 
 #include <algorithm>
@@ -2239,11 +2240,20 @@ namespace veigar
 
 		const auto& dmg = venplus::db::champions::VEIGAR.spells[SLOT_Q].damage;
 		const int rank = std::clamp(q->get_level() - 1, 0, 4);
-		return venplus::damage::final_spell_damage(
+		const float base = venplus::damage::final_spell_damage(
 			dmg, rank,
 			make_caster_stats(player),
 			make_target_info(target),
 			{}, make_magic_pen(player));
+		const float distance = player->get_position().distance(target->get_position());
+		const bool horizon = distance >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+		meow::item_damage::ability_proc_context items{};
+		items.horizon_focus_active = horizon;
+		meow::item_damage::ability_rune_context runes{};
+		runes.cast_distance = distance;
+		return meow::item_damage::apply_magic_damage_modifiers(player, target, base, 0, horizon)
+			+ meow::item_damage::on_ability_damage(player, target, items)
+			+ meow::item_damage::on_ability_rune_damage(player, target, runes);
 	}
 
 	float get_w_damage(game_object* target)
@@ -2257,11 +2267,20 @@ namespace veigar
 
 		const auto& dmg = venplus::db::champions::VEIGAR.spells[SLOT_W].damage;
 		const int rank = std::clamp(w->get_level() - 1, 0, 4);
-		return venplus::damage::final_spell_damage(
+		const float base = venplus::damage::final_spell_damage(
 			dmg, rank,
 			make_caster_stats(player),
 			make_target_info(target),
 			{}, make_magic_pen(player));
+		const float distance = player->get_position().distance(target->get_position());
+		const bool horizon = distance >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+		meow::item_damage::ability_proc_context items{};
+		items.horizon_focus_active = horizon;
+		meow::item_damage::ability_rune_context runes{};
+		runes.cast_distance = distance;
+		return meow::item_damage::apply_magic_damage_modifiers(player, target, base, 0, horizon)
+			+ meow::item_damage::on_ability_damage(player, target, items)
+			+ meow::item_damage::on_ability_rune_damage(player, target, runes);
 	}
 
 	float get_r_damage(game_object* target)
@@ -2290,7 +2309,16 @@ namespace veigar
 
 		const float raw_total = venplus::damage::raw_spell_damage(dmg_entry, rank, caster) * (1.f + bonus);
 		const float eff_mr    = venplus::damage::effective_resist(target_info.mr, target_info.bonus_mr, magic_pen);
-		return raw_total * venplus::damage::resist_multiplier(eff_mr);
+		const float base = raw_total * venplus::damage::resist_multiplier(eff_mr);
+		const float distance = player->get_position().distance(target->get_position());
+		const bool horizon = distance >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+		meow::item_damage::ability_proc_context items{};
+		items.horizon_focus_active = horizon;
+		meow::item_damage::ability_rune_context runes{};
+		runes.cast_distance = distance;
+		return meow::item_damage::apply_magic_damage_modifiers(player, target, base, 0, horizon)
+			+ meow::item_damage::on_ability_damage(player, target, items)
+			+ meow::item_damage::on_ability_rune_damage(player, target, runes);
 	}
 
 	// Base R damage ( missing- bonus) — used for the conservative HP-bar indicator.
@@ -2305,11 +2333,14 @@ namespace veigar
 
 		const auto& dmg = venplus::db::champions::VEIGAR.spells[SLOT_R].damage;
 		const int rank = std::clamp(r->get_level() - 1, 0, 2);
-		return venplus::damage::final_spell_damage(
+		const float base = venplus::damage::final_spell_damage(
 			dmg, rank,
 			make_caster_stats(player),
 			make_target_info(target),
 			{}, make_magic_pen(player));
+		const bool horizon = player->get_position().distance(target->get_position())
+			>= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+		return meow::item_damage::apply_magic_damage_modifiers(player, target, base, 0, horizon);
 	}
 
 	void cast_q_after_w()

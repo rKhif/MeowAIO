@@ -1,4 +1,5 @@
 #include "ziggs.h"
+#include "damage/items.hpp"
 
 #include "orb_sdk.hpp"
 #include "pred_sdk.hpp"
@@ -218,7 +219,7 @@ namespace
     constexpr float W_AP = 0.50f;
     constexpr float R_AP = 1.10f;
 
-    float get_spell_dmg(int slot, game_object* target)
+    float get_spell_dmg(int slot, game_object* target, bool include_procs = true)
     {
         auto* p = player();
         if (!p || !target || !sdk::damage) return 0.f;
@@ -237,14 +238,26 @@ namespace
         default:     return 0.f;
         }
 
-        return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, p, target, raw);
+        const float distance = p->get_position().distance(target->get_position());
+        const bool horizon = distance >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+        float damage = meow::item_damage::apply_magic_damage_modifiers(
+            p, target, sdk::damage->calc_damage(dmg_sdk::damage_type::magical, p, target, raw),
+            0, horizon);
+        if (!include_procs) return damage;
+
+        meow::item_damage::ability_proc_context items{};
+        items.horizon_focus_active = horizon;
+        meow::item_damage::ability_rune_context runes{};
+        runes.cast_distance = distance;
+        return damage + meow::item_damage::on_ability_damage(p, target, items)
+            + meow::item_damage::on_ability_rune_damage(p, target, runes);
     }
 
     bool killable_q(game_object* t)      { return t && get_spell_dmg(SLOT_Q, t) > t->get_hp() + 10.f; }
     bool killable_w(game_object* t)      { return t && get_spell_dmg(SLOT_W, t) > t->get_hp() -  5.f; }
     bool killable_r(game_object* t)      { return t && get_spell_dmg(SLOT_R, t) > t->get_hp() + 10.f; }
     bool killable_r_auto(game_object* t, float extra) { return t && get_spell_dmg(SLOT_R, t) > t->get_hp() + extra; }
-    bool killable_wr(game_object* t)     { return t && (get_spell_dmg(SLOT_W, t) + get_spell_dmg(SLOT_R, t)) > t->get_hp() + 10.f; }
+    bool killable_wr(game_object* t)     { return t && (get_spell_dmg(SLOT_W, t) + get_spell_dmg(SLOT_R, t, false)) > t->get_hp() + 10.f; }
 
     // =========================================================
     //  Prediction helpers

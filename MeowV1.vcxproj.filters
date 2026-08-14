@@ -45,6 +45,9 @@
     <ClInclude Include="damage\calc.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="damage\item_ids.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="damage\items.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>

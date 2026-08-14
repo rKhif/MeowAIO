@@ -1,4 +1,5 @@
 #include "annie.h"
+#include "damage/items.hpp"
 
 #include "evade_sdk.hpp"
 #include "infotab_sdk.hpp"
@@ -230,11 +231,22 @@ namespace
         return 0;
     }
 
-    float spell_damage(int slot, game_object* target)
+    float spell_damage(int slot, game_object* target, bool include_procs = true)
     {
         auto* p = player();
         if (!p || !target || !sdk::damage) return 0.f;
-        return sdk::damage->get_spell_damage(p, target, slot);
+        const bool horizon = p->get_position().distance(target->get_position())
+            >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+        float damage = meow::item_damage::apply_magic_damage_modifiers(
+            p, target, sdk::damage->get_spell_damage(p, target, slot), 0, horizon);
+        if (!include_procs) return damage;
+
+        meow::item_damage::ability_proc_context items{};
+        items.horizon_focus_active = horizon;
+        meow::item_damage::ability_rune_context runes{};
+        runes.cast_distance = p->get_position().distance(target->get_position());
+        return damage + meow::item_damage::on_ability_damage(p, target, items)
+            + meow::item_damage::on_ability_rune_damage(p, target, runes);
     }
 
     float effective_hp(game_object* target)
@@ -388,9 +400,10 @@ namespace
     {
         if (!target_obj) return 0.f;
         float total = 0.f;
-        if (spell_ready(SLOT_Q)) total += spell_damage(SLOT_Q, target_obj);
-        if (spell_ready(SLOT_W)) total += spell_damage(SLOT_W, target_obj);
-        if (spell_ready(SLOT_R)) total += spell_damage(SLOT_R, target_obj);
+        bool procs_added = false;
+        if (spell_ready(SLOT_Q)) { total += spell_damage(SLOT_Q, target_obj, !procs_added); procs_added = true; }
+        if (spell_ready(SLOT_W)) { total += spell_damage(SLOT_W, target_obj, !procs_added); procs_added = true; }
+        if (spell_ready(SLOT_R)) { total += spell_damage(SLOT_R, target_obj, !procs_added); }
         return total;
     }
 

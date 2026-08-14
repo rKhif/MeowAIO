@@ -1,4 +1,5 @@
 #include "ahri.h"
+#include "damage/items.hpp"
 
 #include <cstdio>
 #include <cmath>
@@ -335,11 +336,6 @@ namespace ahri
         auto pred = predict_q(target, hitchance);
         if (!pred.is_valid || pred.hitchance < hitchance) return false;
 
-        if (!passes_reach_check(target, pred.cast_position, spell_data::q_radius,
-                                spell_data::q_delay, Q_REACH_SPEED,
-                                cover_for_hitchance(hitchance)))
-            return false;
-
         bool ok = sdk::common->cast_spell(SLOT_Q, pred.cast_position);
         if (ok) {
             const float now = g_sdk->clock_facade->get_game_time();
@@ -387,11 +383,6 @@ namespace ahri
         auto pred = predict_e(target, hitchance);
         if (!pred.is_valid || pred.hitchance < hitchance) return false;
 
-        if (!passes_reach_check(target, pred.cast_position, spell_data::e_radius,
-                                spell_data::e_delay, spell_data::e_speed,
-                                cover_for_hitchance(hitchance)))
-            return false;
-
         if (target->is_hero() && e_blocked_by_minion(pred.cast_position))
             return false;
 
@@ -426,6 +417,33 @@ namespace ahri
         return ok;
     }
 
+    static float apply_spell_damage_modifiers(game_object* player, game_object* target,
+                                              float damage, bool is_ultimate = false)
+    {
+        if (!player || !target || damage <= 0.f) return 0.f;
+        const bool horizon_focus = player->get_position().distance(target->get_position())
+            >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+        return meow::item_damage::apply_magic_damage_modifiers(
+            player, target, damage, 0, horizon_focus)
+            * meow::item_damage::axiom_arcanist_multiplier(
+                player, is_ultimate, is_ultimate);
+    }
+
+    static float get_ability_proc_damage(game_object* player, game_object* target,
+                                         int malignance_ticks = 0)
+    {
+        if (!player || !target) return 0.f;
+        meow::item_damage::ability_proc_context item_context{};
+        item_context.malignance_ticks = malignance_ticks;
+        item_context.horizon_focus_active = player->get_position().distance(target->get_position())
+            >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+
+        meow::item_damage::ability_rune_context rune_context{};
+        rune_context.cast_distance = player->get_position().distance(target->get_position());
+        return meow::item_damage::on_ability_damage(player, target, item_context)
+            + meow::item_damage::on_ability_rune_damage(player, target, rune_context);
+    }
+
     // ============================================================================
     // KILLSTEAL
     // ============================================================================
@@ -439,7 +457,9 @@ namespace ahri
             if (!is_valid_target(h, spell_data::q_range)) continue;
             if (venplus::utility::has_anti_burst_buff(h)) continue;
             // Q hits twice (out + return) — assume both connect for KS calc
-            const float dmg = sdk::damage->get_spell_damage(p, h, SLOT_Q) * 2.f;
+            const float dmg = apply_spell_damage_modifiers(
+                p, h, sdk::damage->get_spell_damage(p, h, SLOT_Q) * 2.f)
+                + get_ability_proc_damage(p, h);
             const float ehp = h->get_hp() + h->get_all_shield();
             if (dmg >= ehp && try_q(h, pred_sdk::hitchance::medium)) return;
         }
@@ -624,7 +644,10 @@ namespace ahri
 
         if (menu::combo_e_first) {
             // E first mode: land charm, then W/Q follow up
-            if (menu::combo_use_e && try_e(target, menu::combo_e_hitchance)) return;
+            if (menu::combo_use_e && is_spell_ready(SLOT_E) && has_enough_mana(SLOT_E)) {
+                try_e(target, menu::combo_e_hitchance);
+                return;
+            }
             if (menu::combo_use_w && try_w(target)) return;
             if (menu::combo_use_q && try_q(target, menu::combo_q_hitchance)) return;
             return;
@@ -648,7 +671,13 @@ namespace ahri
         const float now = g_sdk->clock_facade->get_game_time();
         if (now - last_spell_cast_time < MIN_SPELL_DELAY) return;
 
-        auto* target = pick_hero_target(spell_data::e_range);
+        float search_range = 0.f;
+        if (menu::harass_use_q) search_range = std::max(search_range, spell_data::q_range);
+        if (menu::harass_use_e) search_range = std::max(search_range, spell_data::e_range);
+        if (menu::harass_use_w) search_range = std::max(search_range, spell_data::w_range);
+        if (search_range <= 0.f) return;
+
+        auto* target = pick_hero_target(search_range);
         if (!target) return;
 
         if (menu::harass_use_e && try_e(target, menu::combo_e_hitchance)) return;
@@ -806,20 +835,28 @@ namespace ahri
         float dmg = 0.f;
         // Q hits out + return = 2× spell damage approximation
         if (is_spell_ready(SLOT_Q))
-            dmg += sdk::damage->get_spell_damage(p, target, SLOT_Q) * 2.f;
+            dmg += apply_spell_damage_modifiers(
+                p, target, sdk::damage->get_spell_damage(p, target, SLOT_Q) * 2.f);
         // W fires 3 flames; subsequent flames deal 40% (model as 1.0 + 0.4 + 0.4 = 1.8x)
         if (is_spell_ready(SLOT_W))
-            dmg += sdk::damage->get_spell_damage(p, target, SLOT_W)
-                 * (1.f + spell_data::w_subseq_dmg_pct * 2.f);
+            dmg += apply_spell_damage_modifiers(p, target,
+                sdk::damage->get_spell_damage(p, target, SLOT_W)
+                * (1.f + spell_data::w_subseq_dmg_pct * 2.f));
         if (is_spell_ready(SLOT_E))
-            dmg += sdk::damage->get_spell_damage(p, target, SLOT_E);
+            dmg += apply_spell_damage_modifiers(
+                p, target, sdk::damage->get_spell_damage(p, target, SLOT_E));
         // R: 3 dashes worth of bolt damage when fully charged
         if (is_spell_ready(SLOT_R))
-            dmg += sdk::damage->get_spell_damage(p, target, SLOT_R) * 3.f;
+            dmg += apply_spell_damage_modifiers(
+                p, target, sdk::damage->get_spell_damage(p, target, SLOT_R) * 3.f, true);
+        if (dmg > 0.f)
+            dmg += get_ability_proc_damage(p, target, is_spell_ready(SLOT_R) ? 2 : 0);
         // 2 AAs worth of follow-up
         const float aa = sdk::damage->calc_damage(dmg_sdk::damage_type::physical, p, target,
                                                   p->get_attack_damage());
-        dmg += aa * 2.f;
+        dmg += aa * 2.f * meow::item_damage::precision_damage_multiplier(p, target);
+        if (dmg > 0.f)
+            dmg += meow::item_damage::on_attack_after_ability(p, target);
         return dmg;
     }
 
@@ -879,7 +916,9 @@ namespace ahri
             for (auto* h : g_sdk->object_manager->get_heroes()) {
                 if (!is_valid_target(h)) continue;
                 if (r_learned) {
-                    const float r_dmg = sdk::damage->get_spell_damage(p, h, SLOT_R);
+                    const float r_dmg = apply_spell_damage_modifiers(
+                        p, h, sdk::damage->get_spell_damage(p, h, SLOT_R), true)
+                        + get_ability_proc_damage(p, h, 1);
                     const float hp = h->get_hp(), mhp = h->get_max_hp();
                     if (r_dmg > 0.f && mhp > 0.f && hp > 0.f) {
                         const auto hbar = h->get_health_bar_position();

@@ -1,4 +1,5 @@
 #include "twitch.h"
+#include "damage/items.hpp"
 
 #include "utility/defensive_buffs.hpp"
 #include "utility/helpers.hpp"
@@ -244,7 +245,15 @@ static float get_e_damage( game_object* target, int stacks )
 
     float phys_mitigated  = sdk::damage->calc_damage( dmg_sdk::damage_type::physical, p, target, phys );
     float magic_mitigated = sdk::damage->calc_damage( dmg_sdk::damage_type::magical,  p, target, magic );
-    return phys_mitigated + magic_mitigated;
+    phys_mitigated = meow::item_damage::apply_physical_damage_modifiers(p, target, phys_mitigated);
+    magic_mitigated = meow::item_damage::apply_magic_damage_modifiers(p, target, magic_mitigated);
+
+    meow::item_damage::ability_proc_context items{};
+    meow::item_damage::ability_rune_context runes{};
+    runes.cast_distance = p->get_position().distance(target->get_position());
+    return phys_mitigated + magic_mitigated
+        + meow::item_damage::on_ability_damage(p, target, items)
+        + meow::item_damage::on_ability_rune_damage(p, target, runes);
 }
 
 static float get_venom_dps( int stacks )

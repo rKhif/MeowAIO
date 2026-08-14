@@ -111,6 +111,7 @@ namespace viktor
         // R
         inline bool r_only_killable = false;
         inline int  min_enemies_for_r = 1;
+        inline bool auto_r_aoe = false;
         inline bool auto_r_movement = true;
 
         // Semi-manual keys
@@ -162,6 +163,7 @@ namespace viktor
     void clear();
     void killsteal();
     void auto_r();
+    void auto_r_aoe();
 
     bool cast_q(game_object* target);
     bool cast_w(game_object* target, bool force = false);

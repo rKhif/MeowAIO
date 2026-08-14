@@ -145,6 +145,7 @@
     <ClInclude Include="math.hpp" />
     <ClInclude Include="math\geometry.hpp" />
     <ClInclude Include="damage\calc.hpp" />
+    <ClInclude Include="damage\item_ids.hpp" />
     <ClInclude Include="damage\items.hpp" />
     <ClInclude Include="db\core\enums.hpp" />
     <ClInclude Include="db\core\structs.hpp" />

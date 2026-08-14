@@ -1,4 +1,5 @@
 #include "zeri.h"
+#include "damage/items.hpp"
 
 #include <cstdio>
 #include <cmath>
@@ -16,6 +17,26 @@
 namespace zeri
 {
     static menu_category* s_menu = nullptr;
+
+    static float spell_damage_with_items(game_object* source, game_object* target,
+                                         int slot, bool include_procs = true)
+    {
+        if (!source || !target || !sdk::damage) return 0.f;
+        const float distance = source->get_position().distance(target->get_position());
+        const bool horizon = distance >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+        const float base = sdk::damage->get_spell_damage(source, target, slot);
+        float damage = slot == SLOT_R
+            ? meow::item_damage::apply_magic_damage_modifiers(source, target, base, 0, horizon)
+            : meow::item_damage::apply_physical_damage_modifiers(source, target, base, 0, horizon);
+        if (!include_procs || slot == SLOT_Q) return damage;
+
+        meow::item_damage::ability_proc_context items{};
+        items.horizon_focus_active = horizon;
+        meow::item_damage::ability_rune_context runes{};
+        runes.cast_distance = distance;
+        return damage + meow::item_damage::on_ability_damage(source, target, items)
+            + meow::item_damage::on_ability_rune_damage(source, target, runes);
+    }
 
     // ============================================================================
     // WALL JUMP SPOTS (Summoner's Rift) — Zeri's E dashes through these walls
@@ -1010,7 +1031,7 @@ namespace zeri
             if (distance_to(h) > spell_data::w_range_pulse) continue;
             const float ehp = h->get_hp() + h->get_all_shield();
             if (ehp >= best_ehp) continue;
-            const float dmg = sdk::damage->get_spell_damage(p, h, SLOT_W);
+            const float dmg = spell_damage_with_items(p, h, SLOT_W);
             if (dmg >= ehp) { best_ehp = ehp; best = h; }
         }
         if (best) try_w(best, menu::w_hitchance);
@@ -1042,7 +1063,7 @@ namespace zeri
             if (d <= aa_reach || d > spell_data::w_range_pulse) continue;
             const float ehp = h->get_hp() + h->get_all_shield();
             if (ehp >= best_ehp) continue;
-            const float dmg = sdk::damage->get_spell_damage(p, h, SLOT_W);
+            const float dmg = spell_damage_with_items(p, h, SLOT_W);
             if (dmg >= ehp) { best_ehp = ehp; best = h; }
         }
         if (best) try_w(best, menu::w_hitchance);
@@ -1822,9 +1843,10 @@ namespace zeri
         auto p = g_sdk->object_manager->get_local_player();
         if (!p || !target || !sdk::damage) return 0.f;
         float dmg = 0.f;
-        if (is_spell_ready(SLOT_Q)) dmg += sdk::damage->get_spell_damage(p, target, SLOT_Q);
-        if (is_spell_ready(SLOT_W)) dmg += sdk::damage->get_spell_damage(p, target, SLOT_W);
-        if (is_spell_ready(SLOT_R)) dmg += sdk::damage->get_spell_damage(p, target, SLOT_R);
+        bool procs_added = false;
+        if (is_spell_ready(SLOT_Q)) dmg += spell_damage_with_items(p, target, SLOT_Q, false);
+        if (is_spell_ready(SLOT_W)) { dmg += spell_damage_with_items(p, target, SLOT_W, !procs_added); procs_added = true; }
+        if (is_spell_ready(SLOT_R)) { dmg += spell_damage_with_items(p, target, SLOT_R, !procs_added); }
         const float aa = sdk::damage->calc_damage(dmg_sdk::damage_type::physical, p, target,
                                                   p->get_attack_damage());
         dmg += aa * 3.f;

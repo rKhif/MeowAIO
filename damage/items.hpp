@@ -1,5 +1,6 @@
 #pragma once
 
+#include "item_ids.hpp"
 #include "sdk.hpp"
 
 #include <algorithm>
@@ -48,41 +49,6 @@ namespace rune_values
     inline constexpr float LAST_STAND_MAX_HP       = 0.30f;
     inline constexpr float AXIOM_ARCANIST_AMP      = 0.12f;
     inline constexpr float AXIOM_ARCANIST_AOE_AMP  = 0.08f;
-}
-
-namespace item_id
-{
-    inline constexpr int FAERIE_CHARM           = 1004;
-    inline constexpr int BLASTING_WAND          = 1026;
-    inline constexpr int AMPLIFYING_TOME        = 1052;
-    inline constexpr int DORANS_RING            = 1056;
-    inline constexpr int SEEKERS_ARMGUARD       = 2420;
-    inline constexpr int FATED_ASHES            = 2508;
-    inline constexpr int ARCHANGELS_STAFF       = 3003;
-    inline constexpr int BLACKFIRE_TORCH       = 2503;
-    inline constexpr int SORCERERS_SHOES       = 3020;
-    inline constexpr int SERAPHS_EMBRACE        = 3040;
-    inline constexpr int MEJAIS_SOULSTEALER    = 3041;
-    inline constexpr int RABADONS_DEATHCAP     = 3089;
-    inline constexpr int LICH_BANE              = 3100;
-    inline constexpr int BANSHEES_VEIL          = 3102;
-    inline constexpr int FIENDISH_CODEX         = 3108;
-    inline constexpr int MALIGNANCE             = 3118;
-    inline constexpr int VOID_STAFF             = 3135;
-    inline constexpr int CRYPTBLOOM             = 3137;
-    inline constexpr int HEXTECH_ALTERNATOR     = 3145;
-    inline constexpr int HAUNTING_GUISE         = 3147;
-    inline constexpr int HEXTECH_ROCKETBELT     = 3152;
-    inline constexpr int ZHONYAS_HOURGLASS      = 3157;
-    inline constexpr int MORELLONOMICON         = 3165;
-    inline constexpr int LOST_CHAPTER           = 3802;
-    inline constexpr int HORIZON_FOCUS          = 4628;
-    inline constexpr int COSMIC_DRIVE           = 4629;
-    inline constexpr int SHADOWFLAME            = 4645;
-    inline constexpr int STORMSURGE             = 4646;
-    inline constexpr int LIANDRYS_TORMENT       = 6653;
-    inline constexpr int LUDENS_ECHO             = 6655;
-    inline constexpr int ROD_OF_AGES            = 6657;
 }
 
 namespace dorans_ring

@@ -1,4 +1,5 @@
 #include "kayle.h"
+#include "damage/items.hpp"
 
 #include "orb_sdk.hpp"
 #include "pred_sdk.hpp"
@@ -179,7 +180,8 @@ namespace
         const int lvl = spell_level(SLOT_Q);
         if (lvl <= 0) return 0.f;
         const float raw = Q_BASE[std::clamp(lvl - 1, 0, 4)] + Q_AP * p->get_ability_power();
-        return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, p, target, raw);
+        const float damage = sdk::damage->calc_damage(dmg_sdk::damage_type::magical, p, target, raw);
+        return meow::item_damage::apply_magic_damage_modifiers(p, target, damage);
     }
 
     float calc_e_active_damage(game_object* target)
@@ -192,7 +194,8 @@ namespace
         const float raw = E_ACTIVE_BASE[idx]
             + E_ACTIVE_AP * p->get_ability_power()
             + E_ACTIVE_PCTMHP[idx] * missing_hp(target);
-        return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, p, target, raw);
+        const float damage = sdk::damage->calc_damage(dmg_sdk::damage_type::magical, p, target, raw);
+        return meow::item_damage::apply_magic_damage_modifiers(p, target, damage);
     }
 
     float calc_e_passive_damage(game_object* target)
@@ -206,8 +209,10 @@ namespace
             + E_PASSIVE_AP_FLAT * ap
             + E_PASSIVE_PCTMHP * missing_hp(target);
         // True damage at level 16+ Transcendent form. Approximate by skipping mitigation.
-        if (p->get_level() >= 16) return raw;
-        return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, p, target, raw);
+        if (p->get_level() >= 16)
+            return meow::item_damage::apply_true_damage_modifiers(p, target, raw);
+        const float damage = sdk::damage->calc_damage(dmg_sdk::damage_type::magical, p, target, raw);
+        return meow::item_damage::apply_magic_damage_modifiers(p, target, damage);
     }
 
     float calc_r_damage(game_object* target)
@@ -217,7 +222,8 @@ namespace
         const int lvl = spell_level(SLOT_R);
         if (lvl <= 0) return 0.f;
         const float raw = R_BASE[std::clamp(lvl - 1, 0, 2)] + R_AP * p->get_ability_power();
-        return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, p, target, raw);
+        const float damage = sdk::damage->calc_damage(dmg_sdk::damage_type::magical, p, target, raw);
+        return meow::item_damage::apply_magic_damage_modifiers(p, target, damage);
     }
 
     float aa_damage(game_object* target)
@@ -227,10 +233,22 @@ namespace
         return sdk::damage->get_aa_damage(p, target, true);
     }
 
-    bool q_kills(game_object* t)   { return t && calc_q_damage(t)               > t->get_hp() + 5.f; }
+    float ability_item_damage(game_object* target)
+    {
+        auto* p = player();
+        if (!p || !target) return 0.f;
+        meow::item_damage::ability_proc_context items{};
+        meow::item_damage::ability_rune_context runes{};
+        runes.cast_distance = p->get_position().distance(target->get_position());
+        return meow::item_damage::on_ability_damage(p, target, items)
+            + meow::item_damage::on_ability_rune_damage(p, target, runes);
+    }
+
+    bool q_kills(game_object* t)   { return t && calc_q_damage(t) + ability_item_damage(t) > t->get_hp() + 5.f; }
     bool e_act_kills(game_object* t)
     {
-        return t && (aa_damage(t) + calc_e_active_damage(t) + calc_e_passive_damage(t))
+        return t && (aa_damage(t) + calc_e_active_damage(t) + calc_e_passive_damage(t)
+            + ability_item_damage(t) + meow::item_damage::on_attack_after_ability(player(), t))
             > t->get_hp() + 5.f;
     }
 
@@ -650,6 +668,8 @@ namespace
         float total = aa_damage(t) + calc_e_passive_damage(t);
         if (spell_ready(SLOT_E)) total += calc_e_active_damage(t);
         if (spell_ready(SLOT_Q)) total += calc_q_damage(t);
+        if (spell_ready(SLOT_E) || spell_ready(SLOT_Q)) total += ability_item_damage(t);
+        if (spell_ready(SLOT_E)) total += meow::item_damage::on_attack_after_ability(player(), t);
         return total;
     }
 

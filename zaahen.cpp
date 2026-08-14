@@ -5,6 +5,7 @@
 #include <deque>
 
 #include "evade_sdk.hpp"
+#include "damage/items.hpp"
 
 // Shared utilities live under ..\meow_shared\ (added to AdditionalIncludeDirectories).
 #include "utility/defensive_buffs.hpp"
@@ -781,7 +782,16 @@ namespace zaahen
                 return false;
             }
 
-            const float dmg = sdk::damage->get_spell_damage(p, target, SLOT_R);
+            const float distance = p->get_position().distance(target->get_position());
+            const bool horizon = distance >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+            meow::item_damage::ability_proc_context items{};
+            items.horizon_focus_active = horizon;
+            meow::item_damage::ability_rune_context runes{};
+            runes.cast_distance = distance;
+            const float dmg = meow::item_damage::apply_physical_damage_modifiers(
+                p, target, sdk::damage->get_spell_damage(p, target, SLOT_R), 0, horizon)
+                + meow::item_damage::on_ability_damage(p, target, items)
+                + meow::item_damage::on_ability_rune_damage(p, target, runes);
             const float hit_time = g_sdk->clock_facade->get_game_time()
                                  + spell_data::r_cast_time + spell_data::r_slam_delay;
             const float hp = sdk::health_prediction->get_predicted_health(target, hit_time)
@@ -1457,7 +1467,16 @@ namespace zaahen
                     if (venplus::utility::has_anti_burst_buff(h)) continue;
                     if (h->has_buff_of_type(buff_type::spell_shield)) continue;
 
-                    const float dmg = sdk::damage->get_spell_damage(player, h, SLOT_R);
+                    const float distance = player->get_position().distance(h->get_position());
+                    const bool horizon = distance >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+                    meow::item_damage::ability_proc_context items{};
+                    items.horizon_focus_active = horizon;
+                    meow::item_damage::ability_rune_context runes{};
+                    runes.cast_distance = distance;
+                    const float dmg = meow::item_damage::apply_physical_damage_modifiers(
+                        player, h, sdk::damage->get_spell_damage(player, h, SLOT_R), 0, horizon)
+                        + meow::item_damage::on_ability_damage(player, h, items)
+                        + meow::item_damage::on_ability_rune_damage(player, h, runes);
                     const float hp  = sdk::health_prediction->get_predicted_health(h, hit_time)
                                     + h->get_all_shield();
                     if (hp <= 0.f || hp > dmg) continue;
@@ -1508,7 +1527,16 @@ namespace zaahen
             if (h->get_team_id() == player->get_team_id()) continue;
             if (!h->is_visible()) continue;
 
-            const float r_dmg = sdk::damage->get_spell_damage(player, h, SLOT_R);
+            const float distance = player->get_position().distance(h->get_position());
+            const bool horizon = distance >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+            meow::item_damage::ability_proc_context items{};
+            items.horizon_focus_active = horizon;
+            meow::item_damage::ability_rune_context runes{};
+            runes.cast_distance = distance;
+            const float r_dmg = meow::item_damage::apply_physical_damage_modifiers(
+                player, h, sdk::damage->get_spell_damage(player, h, SLOT_R), 0, horizon)
+                + meow::item_damage::on_ability_damage(player, h, items)
+                + meow::item_damage::on_ability_rune_damage(player, h, runes);
             if (r_dmg <= 0.f) continue;
 
             const float hp = h->get_hp(), mhp = h->get_max_hp();

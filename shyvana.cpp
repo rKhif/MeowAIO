@@ -1,4 +1,5 @@
 #include "shyvana.h"
+#include "damage/items.hpp"
 
 #include <cstdio>
 #include <cmath>
@@ -590,6 +591,17 @@ namespace shyvana
         if (is_spell_ready(SLOT_E)) total += sdk::damage->get_spell_damage(p, target, SLOT_E);
         if (is_spell_ready(SLOT_R) && !is_dragon)
             total += sdk::damage->get_spell_damage(p, target, SLOT_R);
+        if (total > 0.f)
+        {
+            const float distance = p->get_position().distance(target->get_position());
+            meow::item_damage::ability_proc_context items{};
+            items.horizon_focus_active = distance
+                >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+            meow::item_damage::ability_rune_context runes{};
+            runes.cast_distance = distance;
+            total += meow::item_damage::on_ability_damage(p, target, items)
+                + meow::item_damage::on_ability_rune_damage(p, target, runes);
+        }
         return total;
     }
 

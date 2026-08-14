@@ -1,6 +1,7 @@
 #include "vex.h"
 
 #include "db/champions/vex.hpp"
+#include "damage/items.hpp"
 #include "evade_sdk.hpp"
 #include "infotab_sdk.hpp"
 
@@ -276,11 +277,22 @@ namespace
         return sdk::damage->calc_damage(dmg_sdk::damage_type::physical, player, target, raw);
     }
 
-    float get_spell_damage(int slot, game_object* target)
+    float get_spell_damage(int slot, game_object* target, bool include_procs = true)
     {
         auto* player = get_player();
         if (!player || !target || !sdk::damage) return 0.f;
-        return sdk::damage->get_spell_damage(player, target, slot);
+        const float distance = player->get_position().distance(target->get_position());
+        const bool horizon = distance >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+        float damage = meow::item_damage::apply_magic_damage_modifiers(
+            player, target, sdk::damage->get_spell_damage(player, target, slot), 0, horizon);
+        if (!include_procs) return damage;
+
+        meow::item_damage::ability_proc_context items{};
+        items.horizon_focus_active = horizon;
+        meow::item_damage::ability_rune_context runes{};
+        runes.cast_distance = distance;
+        return damage + meow::item_damage::on_ability_damage(player, target, items)
+            + meow::item_damage::on_ability_rune_damage(player, target, runes);
     }
 
     float get_gloom_damage(game_object* target)
@@ -291,7 +303,10 @@ namespace
         const float base = data::GLOOM_BASE_MIN
             + (data::GLOOM_BASE_MAX - data::GLOOM_BASE_MIN) * static_cast<float>(level - 1) / 17.f;
         const float raw = base + data::GLOOM_AP_RATIO * player->get_ability_power();
-        return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw);
+        const float damage = sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, raw);
+        const bool horizon = player->get_position().distance(target->get_position())
+            >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+        return meow::item_damage::apply_magic_damage_modifiers(player, target, damage, 0, horizon);
     }
 
     int count_enemies_near(const math::vector3& pos, float radius)
@@ -327,8 +342,12 @@ namespace
         const float ap = player->get_ability_power();
 
         float total = 0.f;
+        bool procs_added = false;
         const float r2_raw = data::R2_BASE[ r_idx ] + data::R2_AP_RATIO * ap;
-        total += sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, r2_raw);
+        const bool horizon = player->get_position().distance(target->get_position())
+            >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+        total += meow::item_damage::apply_magic_damage_modifiers(player, target,
+            sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, r2_raw), 0, horizon);
 
         auto will_be_ready = [&](int slot) -> bool
         {
@@ -338,9 +357,19 @@ namespace
             return sdk::awareness->get_spell_cooldown(player, slot) <= time_offset;
         };
 
-        if (will_be_ready(SLOT_Q)) total += get_spell_damage(SLOT_Q, target);
-        if (will_be_ready(SLOT_W)) total += get_spell_damage(SLOT_W, target);
-        if (will_be_ready(SLOT_E)) total += get_spell_damage(SLOT_E, target);
+        if (will_be_ready(SLOT_Q)) { total += get_spell_damage(SLOT_Q, target, !procs_added); procs_added = true; }
+        if (will_be_ready(SLOT_W)) { total += get_spell_damage(SLOT_W, target, !procs_added); procs_added = true; }
+        if (will_be_ready(SLOT_E)) { total += get_spell_damage(SLOT_E, target, !procs_added); procs_added = true; }
+
+        if (!procs_added)
+        {
+            meow::item_damage::ability_proc_context items{};
+            items.horizon_focus_active = horizon;
+            meow::item_damage::ability_rune_context runes{};
+            runes.cast_distance = player->get_position().distance(target->get_position());
+            total += meow::item_damage::on_ability_damage(player, target, items)
+                + meow::item_damage::on_ability_rune_damage(player, target, runes);
+        }
 
         total += get_gloom_damage(target);
         total += get_aa_damage(target);
@@ -351,18 +380,20 @@ namespace
     {
         if (!target) return 0.f;
         float dmg = 0.f;
+        bool procs_added = false;
 
         if (is_spell_learned(SLOT_Q) && is_spell_ready(SLOT_Q))
-            dmg += get_spell_damage(SLOT_Q, target);
+        { dmg += get_spell_damage(SLOT_Q, target, !procs_added); procs_added = true; }
         if (is_spell_learned(SLOT_W) && is_spell_ready(SLOT_W))
-            dmg += get_spell_damage(SLOT_W, target);
+        { dmg += get_spell_damage(SLOT_W, target, !procs_added); procs_added = true; }
         if (is_spell_learned(SLOT_E) && is_spell_ready(SLOT_E))
-            dmg += get_spell_damage(SLOT_E, target);
+        { dmg += get_spell_damage(SLOT_E, target, !procs_added); procs_added = true; }
 
         auto* player = get_player();
         if (player && is_spell_learned(SLOT_R) && is_spell_ready(SLOT_R))
         {
-            dmg += get_spell_damage(SLOT_R, target);
+            dmg += get_spell_damage(SLOT_R, target, !procs_added);
+            procs_added = true;
             auto* r_entry = player->get_spell(SLOT_R);
             const int r_level = r_entry ? r_entry->get_level() : 0;
             if (r_level > 0)
@@ -370,7 +401,10 @@ namespace
                 const int idx = std::clamp(r_level - 1, 0, 2);
                 const float ap = player->get_ability_power();
                 const float r2_raw = data::R2_BASE[ idx ] + data::R2_AP_RATIO * ap;
-                dmg += sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, r2_raw);
+                const bool horizon = player->get_position().distance(target->get_position())
+                    >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+                dmg += meow::item_damage::apply_magic_damage_modifiers(player, target,
+                    sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, r2_raw), 0, horizon);
             }
         }
 
@@ -392,15 +426,29 @@ namespace
         const float r2_raw = data::R2_BASE[ level_idx ] + data::R2_AP_RATIO * ap;
 
         float total = 0.f;
+        const float distance = player->get_position().distance(target->get_position());
+        const bool horizon = distance >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
 
         if (has_r_recast())
         {
-            total += sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, r2_raw);
+            total += meow::item_damage::apply_magic_damage_modifiers(player, target,
+                sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, r2_raw), 0, horizon);
         }
         else if (is_spell_ready(SLOT_R))
         {
-            total += sdk::damage->get_spell_damage(player, target, SLOT_R);
-            total += sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, r2_raw);
+            total += get_spell_damage(SLOT_R, target, false);
+            total += meow::item_damage::apply_magic_damage_modifiers(player, target,
+                sdk::damage->calc_damage(dmg_sdk::damage_type::magical, player, target, r2_raw), 0, horizon);
+        }
+
+        if (total > 0.f)
+        {
+            meow::item_damage::ability_proc_context items{};
+            items.horizon_focus_active = horizon;
+            meow::item_damage::ability_rune_context runes{};
+            runes.cast_distance = distance;
+            total += meow::item_damage::on_ability_damage(player, target, items)
+                + meow::item_damage::on_ability_rune_damage(player, target, runes);
         }
 
         return total;

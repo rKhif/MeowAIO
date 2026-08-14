@@ -604,6 +604,9 @@ namespace viktor
 
         anti_gap_w();
 
+        if (menu::auto_r_aoe)
+        { auto_r_aoe(); }
+
         if (menu::auto_r_movement)
         { auto_r(); }
 
@@ -1782,6 +1785,59 @@ namespace viktor
             last_r_move_score = current_score_at_last;
 
         move_r_to_pos(best_pos, best_score, /*force=*/false);
+    }
+
+    void auto_r_aoe()
+    {
+        if (!menu::auto_r_aoe) return;
+        if (!g_sdk || !g_sdk->object_manager || !g_sdk->clock_facade) return;
+
+        auto player = g_sdk->object_manager->get_local_player();
+        if (!player || player->is_dead() || r_storm_active) return;
+        if (!is_spell_learned(SLOT_R) || !is_spell_ready(SLOT_R) || !has_enough_mana(SLOT_R)) return;
+        if (is_casting()) return;
+        if (sdk::orbwalker && sdk::orbwalker->would_cancel_attack()) return;
+
+        const auto ppos = player->get_position();
+        game_object* best_target = nullptr;
+        int best_count = 0;
+        float best_hp = FLT_MAX;
+
+        for (auto candidate : g_sdk->object_manager->get_heroes())
+        {
+            if (!is_valid_target(candidate, spell_data::r_range)) continue;
+
+            math::vector3 cast_pos = predict_position(candidate, spell_data::r_cast_time);
+            const float cast_dist = ppos.distance(cast_pos);
+            if (cast_dist > spell_data::r_range)
+            {
+                if (cast_dist < 1.f) continue;
+                cast_pos = ppos + (cast_pos - ppos).to_direction() * spell_data::r_range;
+            }
+
+            int count = 0;
+            for (auto enemy : g_sdk->object_manager->get_heroes())
+            {
+                if (!is_valid_target(enemy)) continue;
+                const auto predicted = predict_position(enemy, spell_data::r_cast_time);
+                if (cast_pos.distance(predicted) <= spell_data::r_radius
+                    + enemy->get_bounding_radius())
+                {
+                    ++count;
+                }
+            }
+
+            const float hp = effective_hp(candidate);
+            if (count > best_count || (count == best_count && hp < best_hp))
+            {
+                best_count = count;
+                best_hp = hp;
+                best_target = candidate;
+            }
+        }
+
+        if (best_target && best_count >= menu::min_enemies_for_r)
+            cast_r(best_target, true);
     }
 
     void auto_w_on_cc()
@@ -3083,7 +3139,8 @@ namespace viktor
         r_menu->add_checkbox("combo", "Use in Combo", menu::use_r_combo, [](bool v) { menu::use_r_combo = v; });
         r_menu->add_checkbox("killsteal", "Killsteal", menu::ks_r, [](bool v) { menu::ks_r = v; });
         r_menu->add_checkbox("only_kill", "Only if Killable", menu::r_only_killable, [](bool v) { menu::r_only_killable = v; });
-        r_menu->add_slider_int("min_enemies", "Min Enemies", 1, 5, 1, menu::min_enemies_for_r, [](int v) { menu::min_enemies_for_r = v; });
+        r_menu->add_checkbox("auto_aoe", "Auto Use R on AoE", menu::auto_r_aoe, [](bool v) { menu::auto_r_aoe = v; });
+        r_menu->add_slider_int("min_enemies", "Auto/Combo Min Enemies", 1, 5, 1, menu::min_enemies_for_r, [](int v) { menu::min_enemies_for_r = v; });
         r_menu->add_checkbox("auto_move", "Auto Move", menu::auto_r_movement, [](bool v) { menu::auto_r_movement = v; });
         r_menu->add_checkbox("draw_range", "Draw Range", menu::draw_r_range, [](bool v) { menu::draw_r_range = v; });
         r_menu->add_hotkey("semi_r", "Semi-Manual R", 'Y', false, false,

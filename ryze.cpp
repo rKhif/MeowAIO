@@ -1,6 +1,7 @@
 #include "ryze.h"
 
 #include "damage/calc.hpp"
+#include "damage/items.hpp"
 #include "db/champions/ryze.hpp"
 
 #include <algorithm>
@@ -593,7 +594,10 @@ namespace ryze
             }
 
             const float eff_mr = venplus::damage::effective_resist(info.mr, info.bonus_mr, pen);
-            return raw * venplus::damage::resist_multiplier(eff_mr);
+            const float damage = raw * venplus::damage::resist_multiplier(eff_mr);
+            const bool horizon = p->get_position().distance(target->get_position())
+                >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+            return meow::item_damage::apply_magic_damage_modifiers(p, target, damage, 0, horizon);
         }
 
         static float get_w_damage(game_object* target)
@@ -611,7 +615,11 @@ namespace ryze
             dmg_entry.base[rank - 1] += sc::W_BONUS_MANA_RATIO * get_bonus_mana();
 
             venplus::damage::pen_stats armor_pen{};
-            return venplus::damage::final_spell_damage(dmg_entry, rank - 1, caster, info, armor_pen, pen);
+            const float damage = venplus::damage::final_spell_damage(
+                dmg_entry, rank - 1, caster, info, armor_pen, pen);
+            const bool horizon = p->get_position().distance(target->get_position())
+                >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+            return meow::item_damage::apply_magic_damage_modifiers(p, target, damage, 0, horizon);
         }
 
         static float get_e_damage(game_object* target)
@@ -629,7 +637,11 @@ namespace ryze
             dmg_entry.base[rank - 1] += sc::E_BONUS_MANA_RATIO * get_bonus_mana();
 
             venplus::damage::pen_stats armor_pen{};
-            return venplus::damage::final_spell_damage(dmg_entry, rank - 1, caster, info, armor_pen, pen);
+            const float damage = venplus::damage::final_spell_damage(
+                dmg_entry, rank - 1, caster, info, armor_pen, pen);
+            const bool horizon = p->get_position().distance(target->get_position())
+                >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+            return meow::item_damage::apply_magic_damage_modifiers(p, target, damage, 0, horizon);
         }
 
         static float get_combo_damage(game_object* target)
@@ -658,6 +670,19 @@ namespace ryze
 
                 for (int i = 0; i < q_casts; ++i)
                     total += get_q_damage(target, target_fluxed);
+            }
+
+            if (total > 0.f)
+            {
+                auto* p = player();
+                const float distance = p->get_position().distance(target->get_position());
+                meow::item_damage::ability_proc_context items{};
+                items.horizon_focus_active = distance
+                    >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+                meow::item_damage::ability_rune_context runes{};
+                runes.cast_distance = distance;
+                total += meow::item_damage::on_ability_damage(p, target, items)
+                    + meow::item_damage::on_ability_rune_damage(p, target, runes);
             }
 
             return total;

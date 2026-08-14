@@ -3,6 +3,7 @@
 #include "orb_sdk.hpp"
 #include "pred_sdk.hpp"
 #include "dmg_sdk.hpp"
+#include "damage/items.hpp"
 
 #include <algorithm>
 #include <array>
@@ -416,7 +417,18 @@ namespace
         const int lvl = std::clamp(spell_level(SLOT_E), 0, 6);
         const float raw = E_DAMAGE_BASE[lvl] + E_DAMAGE_RATIO * p->get_ability_power();
         if (sdk::damage)
-            return sdk::damage->calc_damage(dmg_sdk::damage_type::magical, p, target, raw);
+        {
+            const float distance = p->get_position().distance(target->get_position());
+            const bool horizon = distance >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+            meow::item_damage::ability_proc_context items{};
+            items.horizon_focus_active = horizon;
+            meow::item_damage::ability_rune_context runes{};
+            runes.cast_distance = distance;
+            const float base = sdk::damage->calc_damage(dmg_sdk::damage_type::magical, p, target, raw);
+            return meow::item_damage::apply_magic_damage_modifiers(p, target, base, 0, horizon)
+                + meow::item_damage::on_ability_damage(p, target, items)
+                + meow::item_damage::on_ability_rune_damage(p, target, runes);
+        }
         return raw;
     }
 

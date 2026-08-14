@@ -1,4 +1,5 @@
 #include "kalista.h"
+#include "damage/items.hpp"
 
 #include "orb_sdk.hpp"
 #include "pred_sdk.hpp"
@@ -244,6 +245,18 @@ static float get_combo_damage( game_object* target )
 
     if ( q_ready )
         dmg += sdk::damage->get_spell_damage( p, target, SLOT_Q );
+
+    if ( q_ready || is_spell_learned( SLOT_E ) )
+    {
+        const float distance = p->get_position().distance( target->get_position() );
+        meow::item_damage::ability_proc_context items{};
+        items.horizon_focus_active = distance
+            >= meow::item_damage::horizon_focus::HYPERSHOT_RANGE;
+        meow::item_damage::ability_rune_context runes{};
+        runes.cast_distance = distance;
+        dmg += meow::item_damage::on_ability_damage( p, target, items )
+            + meow::item_damage::on_ability_rune_damage( p, target, runes );
+    }
 
     dmg += sdk::damage->get_aa_damage( p, target ) * 3.f;
     return dmg;
